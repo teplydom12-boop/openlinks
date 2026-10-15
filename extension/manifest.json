@@ -1,0 +1,18 @@
+{
+  "manifest_version": 3,
+  "name": "OpenLinks — поставщики",
+  "version": "0.1.0",
+  "description": "Очередь обращений к поставщикам, ограничения частоты, подтверждение отправки и журнал.",
+  "permissions": ["storage", "alarms", "webNavigation"],
+  "host_permissions": ["https://*.1688.com/*", "https://*.alibaba.com/*", "https://*.made-in-china.com/*"],
+  "background": {"service_worker": "background.js", "type": "module"},
+  "action": {"default_title": "Открыть OpenLinks"},
+  "icons": {"128": "icons/icon128.png"},
+  "content_scripts": [{
+    "matches": ["https://*.1688.com/*", "https://*.alibaba.com/*", "https://*.made-in-china.com/*"],
+    "js": ["content.js"],
+    "run_at": "document_idle",
+    "all_frames": true
+  }],
+  "content_security_policy": {"extension_pages": "script-src 'self'; object-src 'none'"}
+}

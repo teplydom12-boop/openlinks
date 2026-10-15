@@ -1,0 +1,37 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>OpenLinks · Поставщики</title><link rel="stylesheet" href="dashboard.css">
+</head>
+<body>
+  <aside class="sidebar">
+    <a class="brand" href="#"><span class="brand-icon">↗</span> OpenLinks<span class="beta">0.1</span></a>
+    <p class="sidebar-label">РАБОЧЕЕ ПРОСТРАНСТВО</p>
+    <nav><button class="nav active" data-view="queue">▤ <span>Очередь поставщиков</span><span id="nav-count" class="pill">0</span></button>
+      <button class="nav" data-view="settings">⚙ <span>Сообщение и настройки</span></button>
+      <button class="nav" data-view="report">◷ <span>Журнал работы</span></button></nav>
+    <div class="sidebar-bottom"><span class="live-dot"></span> Данные хранятся в Chrome<p>Работает с вашей авторизованной сессией. Не обходите проверки сайта.</p></div>
+  </aside>
+  <main>
+    <header><div><div class="eyebrow">КОММУНИКАЦИЯ С ПОСТАВЩИКАМИ</div><h1 id="view-title">Очередь поставщиков</h1></div><div id="run-state" class="state">На паузе</div></header>
+    <div id="toast" role="status" hidden></div>
+    <section id="queue-view" class="view">
+      <div class="intro"><p>Один текст. Все поставщики.<br><span>Очередь учитывает лимиты и останавливается, если нужна ваша помощь.</span></p><div class="actions"><button id="pause" class="button secondary">Пауза</button><button id="start" class="button primary">▶ Запустить очередь</button></div></div>
+      <div id="platform-cards" class="platform-cards"></div>
+      <div class="notice">Лимиты — скользящее окно 20 минут, отдельно для посещений и отправок. Они не гарантируют отсутствие блокировки; каждая страница сама делает дополнительные сетевые запросы.</div>
+      <section id="active-card" class="panel active-card" hidden><div class="panel-heading"><h2>Текущий поставщик</h2><button id="open-tab" class="link-button">Открыть вкладку ↗</button></div><a id="active-url" target="_blank" rel="noreferrer"></a><p id="active-reason"></p><pre id="active-message"></pre><div class="actions"><button id="approve" class="button primary" hidden>Подтвердить и отправить</button><button id="recheck" class="button primary" hidden>Проверить снова</button><button id="mark-sent" class="button secondary" hidden>Проверил: сообщение отправлено</button><button id="skip-active" class="button secondary">Пропустить поставщика</button></div></section>
+      <div class="columns"><section class="panel import-panel"><div class="panel-heading"><h2>Добавить поставщиков</h2><button id="examples" class="link-button">Ваши примеры</button></div><label for="supplier-input">Одна HTTPS-ссылка на строку</label><textarea id="supplier-input" rows="5" spellcheck="false" placeholder="https://shop.en.alibaba.com/&#10;https://shop.en.made-in-china.com/&#10;https://shop.1688.com/"></textarea><p class="hint">Можно указать время: <code>2026-11-01T09:00:00+08:00 https://…</code></p><div class="actions"><button id="add" class="button secondary">Добавить в очередь</button><label class="file-button">Импорт .txt<input id="import-file" type="file" accept=".txt,text/plain" hidden></label></div><pre id="import-result" class="hint" role="status"></pre></section>
+      <section class="panel file-panel"><div class="panel-heading"><h2>Файлы и отчёты</h2><span class="tiny-tag">TXT</span></div><p>Выберите отдельную папку: в ней будут обновляться <code>schedule.txt</code> и <code>report.txt</code>.</p><button id="connect-folder" class="button secondary">Выбрать папку для автозаписи</button><p id="folder-status" class="hint">Автозапись работает, пока это окно открыто.</p><div class="file-links"><button id="export-schedule" class="link-button">↓ Расписание .txt</button><button id="export-report" class="link-button">↓ Отчёт .txt</button><button id="export-json" class="link-button">↓ Снимок данных .json</button></div></section></div>
+      <section class="panel queue-panel"><div class="panel-heading"><h2>Список обращений <span id="queue-count" class="muted">0</span></h2><button id="clear-pending" class="link-button danger">Удалить ожидающих</button></div><div class="table-wrap"><table><thead><tr><th>Поставщик</th><th>Площадка</th><th>План / посещение</th><th>Статус</th><th></th></tr></thead><tbody id="queue-body"></tbody></table></div><div id="empty" class="empty"><div>↗</div><h3>Начните со списка магазинов</h3><p>Добавьте ссылки и сохраните текст сообщения в настройках.</p></div><p class="hint table-note">Время показано в часовом поясе компьютера. План приблизительный: подтверждения и капчи сдвигают очередь.</p></section>
+    </section>
+    <section id="settings-view" class="view" hidden><form id="settings-form">
+      <section class="panel"><div class="panel-heading"><h2>Сообщение поставщику</h2><span class="tiny-tag">ОБЩИЙ ТЕКСТ</span></div><label for="message">Укажите товар и ваш WeChat, чтобы продавец мог ответить</label><textarea id="message" rows="8" maxlength="10000" placeholder="Hello! We are interested in your products. Could you contact me on WeChat: …"></textarea><label class="check"><input id="review" type="checkbox" checked> Подтверждать каждую отправку</label><p class="hint">Рекомендуется для первых обращений. Автоматический режим доступен только с заданными селекторами контакта, сообщения, отправки и подтверждения успеха для каждой используемой площадки.</p></section>
+      <section class="panel"><h2>Интервалы между обращениями</h2><p class="hint">Минимум 30 секунд. Лимиты 1688 и Alibaba действуют независимо от выбранного интервала. Made-in-China: без заданного числового лимита, но с паузами и остановкой при проверке сайта.</p><div id="interval-fields" class="interval-fields"></div></section>
+      <section class="panel"><h2>Адаптация к интерфейсу сайта</h2><p class="hint">Без селекторов используется поиск по смысловым названиям. При неоднозначности очередь остановится. Укажите точные CSS-селекторы, если поиск не справляется. Каждый селектор должен находить ровно один видимый элемент; селектор успеха — новое подтверждение после отправки.</p><div id="profile-fields"></div></section>
+      <div class="settings-footer"><button class="button primary" type="submit">Сохранить настройки</button><p class="hint">Текущую задачу нужно завершить или пропустить перед изменением настроек.</p></div>
+    </form></section>
+    <section id="report-view" class="view" hidden><section class="panel"><div class="panel-heading"><h2>Журнал событий</h2><button id="report-download" class="button secondary">Скачать .txt</button></div><p class="hint">«Отправлено» означает, что сайт показал новое подтверждение, или вы проверили отправку вручную. Это не подтверждение доставки или прочтения.</p><div class="table-wrap"><table><thead><tr><th>Время</th><th>Событие</th><th>Поставщик / подробности</th></tr></thead><tbody id="report-body"></tbody></table></div></section></section>
+    <footer>OpenLinks · Контактируйте с релевантными поставщиками и соблюдайте правила площадок.</footer>
+  </main><script src="dashboard.js" type="module"></script>
+</body></html>

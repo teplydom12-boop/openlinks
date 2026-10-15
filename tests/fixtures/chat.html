@@ -1,0 +1,14 @@
+<!doctype html><html><head><meta charset="utf-8"><title>Fixture chat</title></head><body>
+<h1>Conversation with Test supplier</h1><div id="history"></div>
+<form id="inquiry"><label>Message<textarea id="message" required></textarea></label><button type="submit" id="send" disabled>Send</button></form>
+<script>
+let clicks=0;
+const editor=document.querySelector('#message'),send=document.querySelector('#send');
+editor.addEventListener('input',()=>send.disabled=!editor.value.trim());
+document.querySelector('form').addEventListener('submit',event=>{
+  event.preventDefault();clicks++;
+  const outgoing=document.createElement('p');outgoing.className='message-outgoing';outgoing.textContent=editor.value;
+  document.querySelector('#history').append(outgoing);editor.value='';send.disabled=true;
+  const success=document.createElement('div');success.setAttribute('role','status');success.textContent='Message sent';document.body.append(success);
+});
+</script></body></html>
