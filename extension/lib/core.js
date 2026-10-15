@@ -1,3 +1,5 @@
+import '../rules-shared.js';
+const {upgradeRule}=globalThis.OpenLinksRules;
 export const WINDOW_MS = 20 * 60 * 1000;
 export const PLATFORMS = {
   '1688': {label: '1688', domain: '1688.com', limit: 7, interval: 180},
@@ -6,7 +8,7 @@ export const PLATFORMS = {
 };
 export const FINAL = new Set(['sent', 'attempted', 'attempt_unknown', 'skipped', 'failed']);
 export const STATUS = {
-  pending: 'В очереди', visiting: 'Открытие магазина', contacting: 'Открытие чата',
+  pending: 'В очереди', deferred_send:'Отложено до обновления лимита', visiting: 'Открытие магазина', contacting: 'Открытие чата',
   drafting: 'Подготовка сообщения', review: 'Ждёт подтверждения', sending: 'Нажимаю «Отправить»',
   attempted:'Кнопка отправки нажата', attempt_unknown:'Попытка без ответа вкладки',
   sent: 'Отправлено', uncertain: 'Отправка не подтверждена', blocked: 'Нужно вмешательство',
@@ -31,7 +33,7 @@ export function classify(raw) {
 }
 export function initialState() {
   return {
-    version: 3, running: false, activeId: null, waiting: null, activity: null, learning:null, rules:[], chatRoutes:{}, queue: [], events: [], slots: [],
+    version: 4, running: false, activeId: null, waiting: null, activity: null, learning:null, rules:[], chatRoutes:{}, queue: [], events: [], slots: [],
     settings: {message: '', review: true, intervals: { '1688': 180, alibaba: 420, mic: 60 },
       profiles: Object.fromEntries(Object.keys(PLATFORMS).map(key => [key, {
         chat: '', contact: '', editor: '', send: '', success: '',
@@ -40,20 +42,21 @@ export function initialState() {
 }
 export function migrateState(saved) {
   if (!saved) return initialState();
-  if (saved.version === 3) return saved;
+  if (saved.version === 4) return saved;
   const state = structuredClone(saved);
-  state.version = 3; state.running = false; state.waiting = null; state.activity = null; state.learning=null; state.rules||=[];state.chatRoutes||={};
+  state.version = 4; state.running = false; state.waiting = null; state.activity = null; state.learning=null; state.rules=(state.rules || []).map(upgradeRule);state.chatRoutes||={};
   state.settings.review = true;
   for (const profile of Object.values(state.settings.profiles)) profile.chat ||= '';
   const active = state.queue.find(job => job.id === state.activeId);
+  for(const job of state.queue) if(job.profile) job.profile.rules=state.rules.filter(rule=>rule.platform===job.platform);
   if (active) {
     const started=active.status==='sending' || active.status==='uncertain';
     active.status = started ? 'attempt_unknown' : 'blocked';
     if(started){active.finishedAt=Date.now();state.activeId=null;}
-    active.reason = 'Расширение обновлено. Обновите вкладки и продолжите задачу. Проверка успеха/прочтения больше не выполняется.';
+    active.reason = 'Расширение обновлено. Обновите вкладки и продолжите задачу; обучение и лимиты сохранены.';
     active.approved = false;
   }
-  state.events.push({id:crypto.randomUUID(),at:Date.now(),type:'upgrade',level:'decision',detail:'Добавлено обучение по клику. Результат отправки не проверяется; история и лимиты сохранены.'});
+  state.events.push({id:crypto.randomUUID(),at:Date.now(),type:'upgrade',level:'decision',detail:`Правила магазинов перенесены между поддоменами (${state.rules.length} сохранено). Добавлен обход исчерпанной квоты; история и лимиты сохранены.`});
   return state;
 }
 export function validateSettings(value) {
@@ -83,7 +86,7 @@ export function validateSettings(value) {
 export function eligibility(state, platform, kind, now) {
   const slots = state.slots.filter(s => s.platform === platform && s.kind === kind)
     .map(s => s.at).sort((a,b) => a-b);
-  let next = now;
+  let next = now,quotaUntil=now;
   const reasons = [];
   const last = state.slots.filter(slot => slot.kind === 'visit').at(-1);
   if (kind === 'visit' && last?.platform === platform) {
@@ -95,20 +98,21 @@ export function eligibility(state, platform, kind, now) {
   const limit = PLATFORMS[platform].limit;
   if (limit && slots.length >= limit) {
     const quotaAt = slots.at(-limit) + WINDOW_MS + 1000;
-    if (quotaAt > now) { next = Math.max(next, quotaAt); reasons.push(`Лимит ${PLATFORMS[platform].label}: ${limit} за 20 минут (${kind === 'visit' ? 'посещения' : 'отправки'})`); }
+    if (quotaAt > now) { quotaUntil=quotaAt;next = Math.max(next, quotaAt); reasons.push(`Лимит ${PLATFORMS[platform].label}: ${limit} за 20 минут (${kind === 'visit' ? 'посещения' : 'отправки'})`); }
   }
-  return {at: next, reasons, previousPlatform:last?.platform || null};
+  return {at: next, quotaUntil, reasons, previousPlatform:last?.platform || null};
 }
 export const nextAllowed = (state, platform, kind, now) => eligibility(state, platform, kind, now).at;
 export function makePlan(state, now = Date.now()) {
   const virtual = {...state, slots: [...state.slots]};
   const dates = new Map();
-  let remaining = state.queue.filter(job => job.status === 'pending');
+  let remaining = state.queue.filter(job => ['pending','deferred_send'].includes(job.status));
   let cursor = now;
   while (remaining.length) {
     const {job, at} = dueJob({...virtual, queue: remaining}, cursor);
     dates.set(job.id, at);
-    virtual.slots.push({platform: job.platform, kind: 'visit', at});
+    if(job.status==='pending')virtual.slots.push({platform: job.platform, kind: 'visit', at});
+    virtual.slots.push({platform: job.platform, kind: 'send', at});
     remaining = remaining.filter(item => item.id !== job.id);
     cursor = at + 1;
   }
@@ -116,12 +120,27 @@ export function makePlan(state, now = Date.now()) {
   return state.queue.map(job => ({...job, plannedAt: dates.get(job.id) ?? job.visitAt ?? null}));
 }
 export function dueJob(state, now) {
-  const job = state.queue.find(job => job.status === 'pending');
-  if (!job) return undefined;
-  const allowed = eligibility(state, job.platform, 'visit', now);
-  const reasons = [...allowed.reasons];
-  if (job.requestedAt > now) reasons.push('Заданное время посещения ещё не наступило');
-  return {job, at: Math.max(allowed.at, job.requestedAt || 0), reasons};
+  const candidates=state.queue.filter(job=>['pending','deferred_send'].includes(job.status));
+  const blocked=[],seen=new Set();
+  for(const job of candidates) {
+    if(seen.has(job.platform))continue;
+    seen.add(job.platform);
+    const send=eligibility(state,job.platform,'send',now);
+    const visit=job.status==='pending'?eligibility(state,job.platform,'visit',now):send;
+    const reasons=[...new Set([...visit.reasons,...send.reasons])];
+    if(job.requestedAt>now)reasons.push('Заданное время посещения ещё не наступило');
+    const due={job,at:Math.max(visit.at,send.at,job.requestedAt || 0),reasons,quotaUntil:Math.max(visit.quotaUntil,send.quotaUntil)};
+    if(due.quotaUntil>now) {blocked.push(due);continue;}
+    // Only a hard quota permits overtaking. An interval or explicit date on the
+    // first eligible platform keeps its place; wake sooner if an earlier quota clears.
+    const selected=[...blocked,due].reduce((best,item)=>item.at<best.at?item:best);
+    return {...selected,deferred:blocked.filter(item=>item.job!==selected.job)};
+  }
+  if(blocked.length) {
+    const selected=blocked.reduce((best,item)=>item.at<best.at?item:best);
+    return {...selected,deferred:blocked.filter(item=>item.job!==selected.job)};
+  }
+  return undefined;
 }
 export function parseList(text, existing = [], now = Date.now()) {
   const seen = new Set(existing.map(job => job.url));
@@ -168,6 +187,7 @@ export const EVENT_LABELS = {
   chat_tab:'Новая вкладка чата',remove_pending:'Удаление ожидающих задач',upgrade:'Обновление расширения',...STATUS,
   learning:'Жду обучающего клика',learned:'Правило сохранено',learning_cancel:'Обучение отменено',rule_removed:'Правило удалено',
   challenge_close:'Закрываю окно проверки',direct_chat:'Прямой переход в чат',chat_route:'Адрес чата сохранён',
+  quota_deferred:'Площадка отложена из-за лимита',quota_resume:'Возврат к отложенной задаче',
 };
 export function activityText(state) {
   return '# OpenLinks — activity.log\n# Наблюдаемые действия, результаты проверок и причины решений. Время UTC.\n' +

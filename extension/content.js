@@ -18,6 +18,7 @@
   };
   const sentOps = new Set();
   let picker=null;
+  let challenge=null;
   const norm = value => String(value || '').replace(/\r\n/g,'\n').trim();
   function visible(node) {
     if (!(node instanceof Element)) return false;
@@ -71,6 +72,12 @@
     const close=[...panels[0].children].filter(node=>visible(node) && (node.matches('button[aria-label="Close"],button[aria-label="关闭"],[role="button"][aria-label="Close"]') || (node.tagName==='IMG' && getComputedStyle(node).cursor==='pointer' && node.getBoundingClientRect().width<=40 && node.getBoundingClientRect().height<=40)));
     return close.length===1?close[0]:null;
   }
+  function dismissal() {
+    const control=closeControl();
+    if(!control){challenge=null;return null;}
+    if(challenge?.control!==control)challenge={control,key:crypto.randomUUID()};
+    return challenge;
+  }
   function obstacle() {
     const challenges = all('#nc_1_wrapper,.nc-container,.geetest_panel,[id*="captcha" i],[class*="captcha" i],iframe[src*="captcha" i],iframe[src*="recaptcha" i],iframe[src*="hcaptcha" i],iframe[src*="_____tmd_____/punish"],#baxia-dialog-content');
     if(challenges.length) return 'Обнаружена проверка CAPTCHA. Пройдите её вручную и нажмите «Проверить снова».';
@@ -84,14 +91,14 @@
     const blocked=obstacle();
     if(blocked) return {kind:'obstacle',obstacle:blocked};
     const chatFrames=all('iframe.webtm-lite-iframe,iframe.weblite-iframe,iframe.layout-iframe[src*="def_cbu_web_im_core"]').length;
-    const diagnostics={adapter:site,page:location.origin+location.pathname,editors:0,sends:0,chatRoots:0,contacts:0,chatFrames,inquiriesIgnored:0};
+    const diagnostics={adapter:site,page:location.origin+location.pathname,editors:0,sends:0,chatRoots:0,contacts:0,chatFrames,inquiriesIgnored:0,learning:profile._learning};
     // A custom selector cannot turn an inquiry page into a live conversation.
     if(INQUIRY.test(location.pathname)) return {kind:'inquiry',reason:'Открыта страница запроса/Inquiry. Нужен чат продавца; запрос отправляться не будет.',diagnostics};
     const editors=all(profile.editor || EDITORS).filter(node=>!node.disabled && !node.readOnly && !node.closest('[role="search"]') && !/search|搜索|查找/i.test([node.name,node.id,node.getAttribute('placeholder'),node.getAttribute('aria-label')].join(' ')));
     // A valid form may initially have a disabled Send button until text is entered.
     const rawSends=candidates(profile.send,ACTIONS,SEND);
     const sends=rawSends.filter(node=>!isInquiry(node));
-    const roots=all(profile.chat || (site==='alibaba' ? CHAT_ROOT+',.send-box-container' : CHAT_ROOT));
+    const roots=profile._root?[profile._root]:all(profile.chat || (site==='alibaba' ? CHAT_ROOT+',.send-box-container' : CHAT_ROOT));
     const pairs=[];
     for(const editor of editors) for(const send of sends) {
       const root=commonChat(editor,send,roots);
@@ -157,16 +164,27 @@
     return {ok:true,pageUrl:location.href};
   }
   function effectiveProfile(raw={}) {
-    const profile={...raw},seen=new Set();
+    const profile={...raw},seen=new Set(),resolved={};
+    const learning={saved:(raw.rules || []).length,scoped:0,applied:[],rejected:[]};
     for(const rule of [...(raw.rules || [])].reverse()) {
-      if(seen.has(rule.field) || !globalThis.OpenLinksRules?.matches(rule,location.href)) continue;
+      if(!globalThis.OpenLinksRules?.matches(rule,location.href))continue;
+      learning.scoped++;
+      if(seen.has(rule.field))continue;
       try {
         const nodes=all(rule.selector);
         if(nodes.length===1 && (!rule.tag || nodes[0].localName===rule.tag) && (!rule.label || norm(nodes[0].getAttribute('aria-label') || nodes[0].innerText).toLowerCase()===rule.label.toLowerCase())) {
-          profile[rule.field]=rule.selector;seen.add(rule.field);
-        }
-      } catch { /* Stale selectors do not become executable code. */ }
+          profile[rule.field]=rule.selector;seen.add(rule.field);resolved[rule.field]=nodes[0];learning.applied.push(rule.field+': '+rule.selector);
+        } else learning.rejected.push(rule.field+': '+rule.selector+' — '+(nodes.length!==1?`видимых совпадений ${nodes.length}`:'изменился тип или текст элемента'));
+      } catch {learning.rejected.push(rule.field+': некорректный селектор');}
     }
+    // A positional root learned on one template can shift on the next shop.
+    // Derive it from two independently validated, learned endpoints instead.
+    if(resolved.editor && resolved.send && !isInquiry(resolved.editor) && !isInquiry(resolved.send)) {
+      let root=resolved.editor.parentElement;
+      while(root && !root.contains(resolved.send))root=root.parentElement;
+      if(root && !root.matches('body,html')) {profile._root=root;learning.derivedRoot=true;}
+    }
+    profile._learning=learning;
     return profile;
   }
   function selectorFor(node) {
@@ -238,11 +256,21 @@
     const profile=request.profile || {};
     if(request.type==='PROBE') {
       const found=inspect(profile);
-      return {kind:found.kind,obstacle:found.obstacle,canDismiss:!!closeControl(),reason:found.reason,href:found.href,key:found.key,diagnostics:found.diagnostics};
+      const close=dismissal();
+      return {kind:found.kind,obstacle:found.obstacle,canDismiss:!!close,dismissKey:close?.key,reason:found.reason,href:found.href,key:found.key,diagnostics:found.diagnostics};
     }
     if(request.type==='PICK_START')return startPicker(request);
     if(request.type==='PICK_STOP'){stopPicker();return {ok:true};}
-    if(request.type==='DISMISS_CHALLENGE'){const close=closeControl();if(!close)return {clicked:false};close.click();return {clicked:true};}
+    if(request.type==='DISMISS_CHALLENGE')return (async()=>{
+      const current=dismissal();
+      if(!current || (request.dismissKey && current.key!==request.dismissKey))return {clicked:false};
+      current.control.click();
+      if(!visible(current.control) || !current.control.isConnected)challenge=null;
+      await new Promise(resolve=>setTimeout(resolve,150));
+      const closed=closeControl()!==current.control;
+      if(closed)challenge=null;
+      return {clicked:true,closed,key:current.key};
+    })();
     if(request.type==='CONTACT') {
       const found=inspect(profile);
       if(found.kind!=='contact') return {ok:false,reason:found.reason || found.obstacle || 'Контакт изменился'};

@@ -2,6 +2,11 @@
 (() => {
   const domains={alibaba:'alibaba.com','1688':'1688.com',mic:'made-in-china.com'};
   const fields=new Set(['contact','editor','send','chat']);
+  const infrastructure1688=new Set(['www','air','login','passport','my','buyer','seller','workbench','detail','offer','h5api','m','xstore','security','auth','trade','order','cart','search','s','sale','show','club','service','member','help','cbu','marketing','im','message','accounts','account','app','api','open']);
+  function is1688Storefront(host) {
+    const match=host.match(/^([a-z0-9-]+)\.1688\.com$/i);
+    return !!match && !infrastructure1688.has(match[1].toLowerCase());
+  }
   function platform(url) {
     const u=new URL(url);
     if(u.protocol!=='https:' || u.username || u.password || u.port) throw new Error('Недопустимый адрес страницы');
@@ -11,7 +16,7 @@
     const u=new URL(url),p=platform(url);
     if(!p) throw new Error('Площадка не поддерживается');
     const suffix=p==='alibaba'?'.en.alibaba.com':p==='mic'?'.en.made-in-china.com':null;
-    const storefront=(suffix && u.hostname.endsWith(suffix)) || (p==='1688' && /^\d+\.1688\.com$/.test(u.hostname));
+    const storefront=(suffix && u.hostname.endsWith(suffix)) || (p==='1688' && is1688Storefront(u.hostname));
     return {host:storefront?(suffix?'*'+suffix:'*.shop.1688.com'):u.hostname,
       path:storefront?'/':u.pathname.slice(0,u.pathname.lastIndexOf('/')+1)||'/'};
   }
@@ -20,9 +25,22 @@
       const u=new URL(url);
       if(platform(url)!==rule.platform) return false;
       const host=rule.scope.host;
-      const hostOk=host==='*.shop.1688.com'?/^\d+\.1688\.com$/.test(u.hostname):host.startsWith('*.')?u.hostname.endsWith(host.slice(1)):u.hostname===host;
+      const hostOk=host==='*.shop.1688.com'?is1688Storefront(u.hostname):host.startsWith('*.')?u.hostname.endsWith(host.slice(1)):u.hostname===host;
       return hostOk && u.pathname.startsWith(rule.scope.path);
     } catch {return false;}
+  }
+  function upgradeRule(rule) {
+    // v3 tied named storefronts to individual suppliers. Keep the original ID,
+    // selector and path while sharing that template across storefront subdomains.
+    if(!rule?.scope?.host || rule.scope.host.includes('*')) return rule;
+    try {
+      const scope=scopeFor('https://'+rule.scope.host+rule.scope.path);
+      if(platform('https://'+rule.scope.host)!==rule.platform) return rule;
+      return scope.host.startsWith('*.')?{...rule,scope:{...rule.scope,host:scope.host}}:rule;
+    } catch {return rule;}
+  }
+  function mergeRule(rules,rule) {
+    return [...rules.filter(old=>!(old.platform===rule.platform && old.field===rule.field && old.selector===rule.selector && old.tag===rule.tag && old.label===rule.label && old.scope.host===rule.scope.host && old.scope.path===rule.scope.path)),rule];
   }
   function makeRule(data,url,expectedPlatform) {
     const p=platform(url);
@@ -39,9 +57,15 @@
       // Never retain a buyer UID, session token, challenge or authentication query.
       const permitted=new Set(['touid','chatId','siteid','status','spmid','spm']);
       if([...u.searchParams.keys()].some(key=>!permitted.has(key))) return null;
-      for(const key of [...u.searchParams.keys()]) if(!['touid','chatId','siteid'].includes(key)) u.searchParams.delete(key);
-      u.hash='';return u.href;
+      for(const key of [...u.searchParams.keys()]) if(!['touid','chatId','siteid','status'].includes(key)) u.searchParams.delete(key);
+      u.hash=u.hash.startsWith('#/')?'/':'';return u.href;
     } catch {return null;}
   }
-  globalThis.OpenLinksRules={platform,scopeFor,matches,makeRule,direct1688};
+  const known1688Chats={
+    'keyangjixie.1688.com':direct1688('https://air.1688.com/app/ocms-fusion-components-1688/def_cbu_web_im/index.html?touid=cnalichn%E5%B1%B1%E4%B8%9C%E7%A7%91%E9%98%B3%E9%87%8D%E5%B7%A5%E6%9C%BA%E6%A2%B0&siteid=cnalichn&status=1#/'),
+  };
+  function known1688Chat(store) {
+    try {const u=new URL(store);return platform(store)==='1688'?known1688Chats[u.hostname] || null:null;}catch{return null;}
+  }
+  globalThis.OpenLinksRules={platform,scopeFor,matches,makeRule,upgradeRule,mergeRule,direct1688,known1688Chat};
 })();

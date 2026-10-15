@@ -67,14 +67,53 @@ test('same-platform interval is measured from the last actual visit even after a
   assert.equal(dueJob(state,now+1000).at,now+420000);
   assert.equal(dueJob(state,now+500000).at,now+500000);
 });
-test('hard quota blocks later platforms even after a different platform visit',()=>{
+test('hard quota permits another platform then returns to the first deferred row',()=>{
   const state=initialState(),now=1000000;
   state.slots=[0,1,2].map(i=>({platform:'alibaba',kind:'visit',at:now+i}));
-  state.slots.push({platform:'1688',kind:'visit',at:now+3});
-  state.queue=parseList('https://a.alibaba.com/\nhttps://b.1688.com/',[],now).jobs;
+  state.queue=parseList('https://a.alibaba.com/\nhttps://c.alibaba.com/\nhttps://b.1688.com/\nhttps://d.en.made-in-china.com/',[],now).jobs;
   const due=dueJob(state,now+4);
-  assert.equal(due.job.platform,'alibaba');assert.equal(due.at,now+WINDOW_MS+1000);
-  assert.match(due.reasons.join(' '),/Лимит/);
+  assert.equal(due.job.platform,'1688');assert.equal(due.at,now+4);
+  assert.match(due.deferred[0].reasons.join(' '),/Лимит/);
+  state.queue[2].status='attempted';state.queue[3].status='attempted';
+  assert.equal(dueJob(state,now+WINDOW_MS+1001).job.id,state.queue[0].id);
+  const plan=makePlan({...state,queue:state.queue.map(job=>({...job,status:'pending'}))},now+4);
+  assert.ok(plan[2].plannedAt<plan[0].plannedAt);assert.ok(plan[3].plannedAt<plan[0].plannedAt);assert.ok(plan[0].plannedAt<plan[1].plannedAt);
+});
+test('all exhausted platforms wake at the earliest eligible quota, preserving per-platform order',()=>{
+ const state=initialState(),now=3000000;
+ state.slots=[...Array.from({length:3},(_,i)=>({platform:'alibaba',kind:'visit',at:now-1000+i})),...Array.from({length:7},(_,i)=>({platform:'1688',kind:'visit',at:now-100000+i}))];
+ state.queue=parseList('https://a.alibaba.com/\nhttps://b.1688.com/\nhttps://c.1688.com/',[],now).jobs;
+ const due=dueJob(state,now);assert.equal(due.job.id,state.queue[1].id);assert.equal(due.at,now-100000+WINDOW_MS+1000);
+ assert.equal(dueJob(state,due.at).job.id,state.queue[1].id);
+});
+test('send quota also defers new visits and previously prepared conversations',()=>{
+ const state=initialState(),now=3000000;
+ state.slots=[0,1,2].map(i=>({platform:'alibaba',kind:'send',at:now-1000+i}));
+ state.queue=parseList('https://a.alibaba.com/\nhttps://b.1688.com/',[],now).jobs;
+ assert.equal(dueJob(state,now).job.platform,'1688');
+ state.queue[0].status='deferred_send';
+ assert.equal(dueJob(state,now).job.platform,'1688');
+ state.queue[1].status='attempted';assert.equal(dueJob(state,now+WINDOW_MS).job.status,'deferred_send');
+});
+test('mixed-platform plan respects rolling quotas for visits and sends through repeated bypasses',()=>{
+ const state=initialState(),now=3000000;
+ state.queue=Array.from({length:60},(_,i)=>({id:String(i),platform:['alibaba','alibaba','1688','mic'][i%4],status:'pending',requestedAt:now}));
+ const plan=makePlan(state,now);
+ for(const [platform,limit] of [['alibaba',3],['1688',7]]) {
+   const same=plan.filter(job=>job.platform===platform);
+   for(const job of same)assert.ok(same.filter(other=>other.plannedAt>job.plannedAt-WINDOW_MS && other.plannedAt<=job.plannedAt).length<=limit);
+   assert.deepEqual([...same].sort((a,b)=>a.plannedAt-b.plannedAt).map(j=>j.id),same.map(j=>j.id));
+ }
+ assert.ok(plan[6].plannedAt<plan[5].plannedAt);
+});
+test('v3 migration keeps persisted lessons, chat routes and reservations and broadens named 1688 shops',()=>{
+ const state=initialState();state.version=3;
+ state.rules=[{id:'retained',platform:'1688',field:'contact',selector:'.service',scope:{host:'keyangjixie.1688.com',path:'/'}}];
+ state.chatRoutes={'https://shop.1688.com/':{url:'saved'}};state.slots=[{platform:'1688',kind:'visit',at:123}];
+ const upgraded=migrateState(JSON.parse(JSON.stringify(state)));
+ assert.equal(upgraded.version,4);assert.equal(upgraded.rules[0].id,'retained');assert.equal(upgraded.rules[0].scope.host,'*.shop.1688.com');
+ assert.deepEqual(upgraded.chatRoutes,state.chatRoutes);assert.deepEqual(upgraded.slots,state.slots);
+ assert.deepEqual(migrateState(upgraded),upgraded);
 });
 test('explicit future time never allows later links to overtake',()=>{
   const state=initialState();

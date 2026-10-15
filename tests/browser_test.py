@@ -110,12 +110,13 @@ try:
         context.route('https://test.en.alibaba.com/**', lambda route: route.fulfill(
             body=(ROOT/'tests/fixtures'/('chat.html' if '/chat' in route.request.url else 'store.html')).read_text(), content_type='text/html'))
         supplier = context.new_page()
-        supplier.add_init_script("""
+        adapter_transport="""
           let listener;
           window.lessonMessages=[];
           window.chrome={runtime:{id:'adapter-test',onMessage:{addListener(fn){listener=fn}},sendMessage:async message=>{if(message.type==='LEARN_PICK')lessonMessages.push(message);return {ok:true};}}};
           window.adapter=(type,extra={})=>new Promise(resolve=>listener({type,jobId:'test-job',profile:{},message:'Hello, WeChat: demo',...extra},{id:'adapter-test'},resolve));
-        """)
+        """
+        supplier.add_init_script(adapter_transport)
         supplier.goto('https://test.en.alibaba.com/')
         supplier.add_script_tag(path=str(ROOT/'extension/rules-shared.js'))
         supplier.add_script_tag(path=str(ROOT/'extension/content.js'))
@@ -227,11 +228,21 @@ try:
         assert 'CAPTCHA' in supplier.evaluate("adapter('PROBE')")['obstacle']
         assert not supplier.evaluate("adapter('CONTACT')")['ok']
         assert supplier.evaluate('contactClicks')==0
-        assert supplier.evaluate("adapter('PROBE')")['canDismiss']
-        assert supplier.evaluate("adapter('DISMISS_CHALLENGE')")['clicked']
+        initial_overlay=supplier.evaluate("adapter('PROBE')")
+        assert initial_overlay['canDismiss']
+        supplier.evaluate("window.savedModal=document.querySelector('.J_MIDDLEWARE_FRAME_WIDGET')")
+        assert supplier.evaluate("key=>adapter('DISMISS_CHALLENGE',{dismissKey:key})",initial_overlay['dismissKey'])['closed']
         assert supplier.evaluate("adapter('CONTACT')")['ok']
         assert supplier.evaluate('contactClicks')==1
         passed('1688 native close control dismisses the known overlay before customer-service click')
+        for appearance in range(3):
+            supplier.evaluate('document.body.append(savedModal)')
+            repeated=supplier.evaluate("adapter('PROBE')")
+            assert repeated['canDismiss'] and repeated['dismissKey']!=initial_overlay['dismissKey']
+            assert not supplier.evaluate("key=>adapter('DISMISS_CHALLENGE',{dismissKey:key})",initial_overlay['dismissKey'])['clicked']
+            assert supplier.evaluate("key=>adapter('DISMISS_CHALLENGE',{dismissKey:key})",repeated['dismissKey'])['closed']
+            assert not supplier.evaluate("adapter('PROBE')").get('obstacle')
+        passed('reused 1688 modal closes on every reappearance and rejects stale close commands')
         supplier.evaluate("document.body.innerHTML='<div id=application><div class=service-entry><span>客服</span></div></div>';window.serviceClicks=0;document.querySelector('.service-entry').addEventListener('click',()=>serviceClicks++)")
         assert supplier.evaluate("adapter('CONTACT')")['ok']
         assert supplier.evaluate('serviceClicks')==1
@@ -273,6 +284,43 @@ try:
         assert supplier.evaluate("document.querySelector('[data-openlinks-picker]')===null")
         assert supplier.evaluate('lessonMessages.length')==2
         passed('cancel teaching removes the overlay and records no unrelated click')
+        persisted_rules=supplier.evaluate('JSON.stringify(lessonRules)')
+        fresh=browser.new_context()
+        fresh.on('page',lambda page:page.on('pageerror',lambda error:errors.append(str(error))))
+        # A new browser context has no picker or page globals from the lesson.
+        # Restore serialized rules to a different supplier and changed root layout.
+        fresh.route('**/*',lambda route:route.fulfill(body='<div class=new-wrapper><section><textarea class=dm-draft></textarea></section><button class=dm-submit>Deliver</button></div><script>window.replayed=0;document.querySelector("button").onclick=()=>replayed++;</script>',content_type='text/html'))
+        restored=fresh.new_page()
+        restored.add_init_script(adapter_transport)
+        restored.goto('https://second.en.alibaba.com/')
+        restored.add_script_tag(path=str(ROOT/'extension/rules-shared.js'))
+        restored.add_script_tag(path=str(ROOT/'extension/content.js'))
+        restored.evaluate("rules=>{window.restoredRules=JSON.parse(rules);restoredRules.push(OpenLinksRules.makeRule({field:'send',selector:'.missing-template'},location.href,'alibaba'));}",persisted_rules)
+        replay=restored.evaluate("adapter('PROBE',{profile:{rules:restoredRules}})")
+        assert replay['kind']=='chat' and replay['diagnostics']['learning']['derivedRoot']
+        assert any('.missing-template' in reason for reason in replay['diagnostics']['learning']['rejected'])
+        assert restored.evaluate("adapter('PREPARE',{profile:{rules:restoredRules}})")['ok']
+        assert restored.evaluate("adapter('SEND',{expectedUrl:location.href,profile:{rules:restoredRules}})")['clicked']
+        assert restored.evaluate('replayed')==1
+        passed('serialized lessons work in a fresh context on another Alibaba shop with changed chat wrapper and alternative templates')
+        fresh.close()
+        supplier.goto('https://first-named.1688.com/')
+        supplier.add_script_tag(path=str(ROOT/'extension/rules-shared.js'))
+        supplier.add_script_tag(path=str(ROOT/'extension/content.js'))
+        supplier.evaluate("document.body.innerHTML='<button class=vendor-contact>Talk to our team</button>'")
+        assert supplier.evaluate("adapter('PICK_START',{field:'contact',token:'named-shop'})")['ok']
+        supplier.locator('.vendor-contact').click()
+        supplier.wait_for_function('lessonMessages.length===1')
+        named_rule=supplier.evaluate("JSON.stringify(OpenLinksRules.makeRule(lessonMessages[0],location.href,'1688'))")
+        supplier.goto('https://second-named.1688.com/')
+        supplier.add_script_tag(path=str(ROOT/'extension/rules-shared.js'))
+        supplier.add_script_tag(path=str(ROOT/'extension/content.js'))
+        supplier.evaluate("rule=>{window.namedRule=JSON.parse(rule);document.body.innerHTML='<button class=vendor-contact>Talk to our team</button>';window.namedClicks=0;document.querySelector('button').onclick=()=>namedClicks++;}",named_rule)
+        result=supplier.evaluate("adapter('PROBE',{profile:{rules:[namedRule]}})")
+        assert result['kind']=='contact' and result['diagnostics']['learning']['applied']
+        assert supplier.evaluate("adapter('CONTACT',{profile:{rules:[namedRule]}})")['ok']
+        assert supplier.evaluate('namedClicks')==1
+        passed('trusted 1688 contact lesson transfers between different named subdomains after page reload')
         assert not errors, errors
         passed('no browser JavaScript errors')
         browser.close()

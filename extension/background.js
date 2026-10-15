@@ -1,6 +1,6 @@
 import {migrateState, validateSettings, classify, parseList, dueJob, eligibility, PLATFORMS, FINAL} from './lib/core.js';
 import './rules-shared.js';
-const {makeRule,direct1688}=globalThis.OpenLinksRules;
+const {makeRule,mergeRule,direct1688,known1688Chat}=globalThis.OpenLinksRules;
 
 const KEY = 'openlinksState';
 let serial = Promise.resolve();
@@ -17,12 +17,17 @@ function event(state, type, job, detail = '', level = 'action') {
   state.activity=entry;
 }
 async function waitFor(state,job,at,reasons,kind) {
-  const detail=`${reasons.join('; ')}. Продолжение не ранее ${new Date(at).toISOString()}. Следующие ссылки не обгоняют текущую.`;
+  const detail=`${reasons.join('; ')}. Продолжение не ранее ${new Date(at).toISOString()}. Обход очереди разрешён только для площадок с исчерпанной квотой.`;
   if(state.waiting?.jobId!==job.id || state.waiting?.until!==at || state.waiting?.kind!==kind) {
     state.waiting={jobId:job.id,until:at,kind,detail};
     event(state,'wait',job,detail,'wait'); await save(state);
   }
   await alarm(at);
+}
+function deferQuota(state,job,at,reasons) {
+  const detail=`${reasons.join('; ')}. Возврат не ранее ${new Date(at).toISOString()}; проверяю доступность других площадок.`;
+  if(job.quotaDeferredUntil!==at)event(state,'quota_deferred',job,detail,'decision');
+  job.quotaDeferredUntil=at;job.reason=detail;
 }
 function halt(state, job, reason, status = 'blocked') {
   state.running = false;
@@ -87,7 +92,13 @@ async function finish(state, job, status, detail) {
 async function performSend(state, job) {
   const now = Date.now();
   const allowed = eligibility(state, job.platform, 'send', now);
-  if (allowed.at > now) { await waitFor(state,job,allowed.at,allowed.reasons,'send'); return; }
+  if (allowed.at > now) {
+    if(allowed.quotaUntil>now) {
+      deferQuota(state,job,allowed.at,allowed.reasons);job.status='deferred_send';state.activeId=null;state.waiting=null;
+      await save(state);await alarm(Date.now()+1000);
+    } else await waitFor(state,job,allowed.at,allowed.reasons,'send');
+    return;
+  }
   state.waiting = null;
   const reply = await call(job, job.frameId, 'PREPARE');
   if(!reply.ok){await askForHelp(state,job,reply.reason || 'Редактор или кнопка изменились','send');return;}
@@ -122,10 +133,26 @@ async function tick() {
     if (!due) { state.running = false; event(state, 'complete', null, 'Очередь завершена'); await save(state); return; }
     if (due.at > Date.now()) { await waitFor(state,due.job,due.at,due.reasons,'visit'); return; }
     job = due.job;
+    for(const deferred of due.deferred || [])deferQuota(state,deferred.job,deferred.at,deferred.reasons);
+    if(job.quotaDeferredUntil) {
+      event(state,'quota_resume',job,'Лимит снова позволяет обработку. Возвращаюсь к первой отложенной строке этой площадки.','decision');
+      delete job.quotaDeferredUntil;job.reason='';
+    }
+    if(job.status==='deferred_send') {
+      state.activeId=job.id;state.waiting=null;
+      if(job.needsTabCheck) {
+        halt(state,job,'Chrome или расширение перезапущены. Выберите и привяжите вкладку нужного чата перед продолжением.');
+        await save(state);return;
+      }
+      job.status='review';
+      job.profile.rules=state.rules.filter(rule=>rule.platform===job.platform);
+      event(state,'decision',job,'Возвращаюсь к подготовленному чату в существующей вкладке. Перед отправкой повторно проверю получателя и текст.','decision');
+      await save(state);await alarm(Date.now()+1000);return;
+    }
     const previous=state.slots.filter(slot=>slot.kind==='visit').at(-1);
     const transition=previous ? (previous.platform===job.platform ? 'Та же площадка; настроенный интервал выдержан.' : `Смена ${PLATFORMS[previous.platform].label} → ${PLATFORMS[job.platform].label}: дополнительная пауза не нужна.`) : 'Первое посещение.';
     state.waiting = null;
-    event(state,'decision',job,`Выбрана первая ожидающая ссылка №${state.queue.indexOf(job)+1}, строго по списку. ${transition} Лимит за 20 минут проверен.`,'decision');
+    event(state,'decision',job,`Выбрана ссылка №${state.queue.indexOf(job)+1}${due.deferred?.length?' после временного пропуска площадок с исчерпанной квотой':' по порядку списка'}. ${transition} Лимиты посещений и отправок за 20 минут проверены.`,'decision');
     job.status = 'visiting'; job.visitAt = Date.now(); job.stepAt = Date.now();
     job.message = state.settings.message.trim(); job.profile = {...structuredClone(state.settings.profiles[job.platform]),rules:state.rules.filter(rule=>rule.platform===job.platform)};
     state.slots.push({platform:job.platform, kind:'visit', at:job.visitAt, jobId:job.id});
@@ -133,17 +160,13 @@ async function tick() {
     event(state, 'visit', job, 'Открытие страницы; зарезервирован лимит посещения');
     await save(state);
     try {
-      const cached=job.platform==='1688'?direct1688(state.chatRoutes[job.url]?.url):null;
-      if(cached)event(state,'direct_chat',job,'Открываю ранее наблюдавшийся адрес чата именно этого магазина.');
+      const cached=job.platform==='1688'?(direct1688(state.chatRoutes[job.url]?.url) || known1688Chat(job.url)):null;
+      if(cached)event(state,'direct_chat',job,'Открываю сохранённый или предоставленный пользователем адрес чата именно этого магазина.');
       const tab = await chrome.tabs.create({url:cached || job.url, active:true});
       job.tabId = tab.id;job.supplierTabId=tab.id;if(cached)job.status='contacting';
       event(state,'page_opened',job,`Вкладка ${tab.id} создана. Жду загрузки и ищу веб-чат продавца.`);
       await save(state);
     } catch (error) { halt(state, job, 'Не удалось открыть вкладку: '+error.message); await save(state); }
-    return;
-  }
-  if (job.status === 'review') {
-    if (job.approved) await performSend(state, job);
     return;
   }
   if(job.status==='sending') {await finish(state,job,'attempt_unknown','Возобновление после прерывания попытки. Результат не проверяется, повтор не выполняется.');return;}
@@ -157,17 +180,27 @@ async function tick() {
     job.probeSignature=signature;
     const findings=results.map(result=>{
       const d=result.diagnostics;
-      return `Фрейм ${result.frameId}: ${result.kind}${d ? `; адаптер ${d.adapter || 'общий'}, полей ${d.editors}, кнопок отправки ${d.sends}, областей чата ${d.chatRoots}, кнопок чата ${d.contacts}, встроенных чатов ${d.chatFrames || 0}, исключено запросов ${d.inquiriesIgnored}` : ''}${result.reason ? '; '+result.reason : ''}`;
+      return `Фрейм ${result.frameId}: ${result.kind}${d ? `; адаптер ${d.adapter || 'общий'}, полей ${d.editors}, кнопок отправки ${d.sends}, областей чата ${d.chatRoots}, кнопок чата ${d.contacts}, встроенных чатов ${d.chatFrames || 0}, исключено запросов ${d.inquiriesIgnored}${d.learning?`; обучение: сохранено ${d.learning.saved}, область совпала ${d.learning.scoped}, применено ${d.learning.applied.join(', ') || 'нет'}${d.learning.derivedRoot?'; контейнер найден по изученным полю и кнопке':''}${d.learning.rejected.length?'; не подошли: '+d.learning.rejected.join(', '):''}`:''}` : ''}${result.reason ? '; '+result.reason : ''}`;
     }).join(' | ') || 'Страница ещё не отвечает: жду загрузки контентного скрипта.';
     event(state,'dom_scan',job,findings,'observation'); await save(state);
   }
   if (obstacle) {
-    if(job.platform==='1688' && obstacle.canDismiss && !job.dismissedChallenge) {
-      job.dismissedChallenge=true;event(state,'challenge_close',job,'Нажимаю штатный крестик известного окна 1688 один раз. Затем повторно проверю страницу; элементы проверки не удаляются.');
-      await save(state);await call(job,obstacle.frameId,'DISMISS_CHALLENGE');await alarm(Date.now()+1000);return;
+    const key=obstacle.frameId+':'+(obstacle.dismissKey || 'current');
+    if(job.platform==='1688' && obstacle.canDismiss && (job.challengeAttempt?.key!==key || job.challengeAttempt.count<2)) {
+      job.challengeAttempt={key,count:job.challengeAttempt?.key===key?job.challengeAttempt.count+1:1};
+      event(state,'challenge_close',job,'Нажимаю штатный крестик известного окна 1688. Каждое повторное появление закрывается отдельно; затем повторно проверяю страницу.');
+      await save(state);
+      const reply=await call(job,obstacle.frameId,'DISMISS_CHALLENGE',{dismissKey:obstacle.dismissKey});
+      if(reply.closed)delete job.challengeAttempt;
+      await save(state);await alarm(Date.now()+1000);return;
     }
     halt(state, job, obstacle.obstacle, job.status === 'sending' ? 'uncertain' : 'blocked');
     await save(state); return;
+  }
+  delete job.challengeAttempt;
+  if (job.status === 'review') {
+    if (job.approved) await performSend(state, job);
+    return;
   }
   const forms = results.filter(result => result.kind === 'chat');
   if (forms.length > 1) { await askForHelp(state,job,'Несколько редакторов в разных фреймах. Укажите нужное поле.','editor'); return; }
@@ -228,14 +261,14 @@ async function dispatch(message, sender) {
     if(message.type==='LEARN_CANCEL'){await stopLearning(state,job);event(state,'learning_cancel',job,'Обучение отменено; задача остаётся на паузе.');await save(state);return {ok:true};}
     if(message.field!==learning.field)throw new Error('Этап обучения изменился');
     const rule=makeRule(message,sender.url,job.platform);
-    const same=(a,b)=>a.field===b.field && JSON.stringify(a.scope)===JSON.stringify(b.scope);
-    state.rules=state.rules.filter(old=>!same(old,rule));state.rules.push(rule);
+    state.rules=mergeRule(state.rules,rule);
     if(message.chatSelector) {
       const root=makeRule({field:'chat',selector:message.chatSelector},sender.url,job.platform);
-      state.rules=state.rules.filter(old=>!same(old,root));state.rules.push(root);
+      state.rules=mergeRule(state.rules,root);
     }
-    state.rules=state.rules.slice(-100);job.profile.rules=state.rules.filter(r=>r.platform===job.platform);
-    await stopLearning(state,job);event(state,'learned',job,`Сохранён ${rule.field}: ${rule.selector}; область ${rule.scope.host}${rule.scope.path}. Значения полей и переписка не записывались.`,'decision');
+    if(state.rules.length>500)throw new Error('Сохранено 500 вариантов обучения. Удалите ненужные правила в настройках; прежние правила сохранены.');
+    job.profile.rules=state.rules.filter(r=>r.platform===job.platform);
+    await stopLearning(state,job);event(state,'learned',job,`Сохранён ${rule.field}: ${rule.selector}; область ${rule.scope.host}${rule.scope.path}. Всего вариантов: ${state.rules.length}. Другие шаблоны сохранены; значения полей и переписка не записывались.`,'decision');
     state.running=true;job.stepAt=Date.now();job.reason='';job.status='contacting';
     if(rule.field==='send')job.manualSend=true;
     await save(state);
@@ -274,14 +307,14 @@ async function dispatch(message, sender) {
       await save(state); await alarm(); return {ok:true, added:parsed.jobs.length, errors:parsed.errors};
     }
     case 'SETTINGS':
-      if (state.activeId) throw new Error('Завершите или пропустите текущую задачу перед изменением настроек');
+      if (state.activeId || state.queue.some(item=>item.status==='deferred_send')) throw new Error('Завершите или пропустите подготовленные задачи перед изменением настроек');
       state.settings = validateSettings(message.settings);
-      event(state,'settings',null,`Сообщение ${state.settings.message.length} символов; подтверждение ${state.settings.review ? 'включено' : 'выключено'}. Режим: только чат; порядок списка строгий.`);
+      event(state,'settings',null,`Сообщение ${state.settings.message.length} символов; подтверждение ${state.settings.review ? 'включено' : 'выключено'}. Режим: только чат; обход очереди только при исчерпании квоты.`);
       await save(state); return {ok:true};
     case 'START':
       if (!state.settings.message.trim()) throw new Error('Сначала сохраните текст сообщения');
       if (job && ['blocked','uncertain'].includes(job.status)) throw new Error('Сначала разрешите ситуацию с текущим поставщиком');
-      state.running=true; event(state,'start',null,'Строгая очередь запущена: только чат; интервал только между соседними магазинами одной площадки; лимиты 7/20 и 3/20 сохраняются.'); await save(state); await alarm(Date.now()+1000); return {ok:true};
+      state.running=true; event(state,'start',null,'Очередь запущена: только чат; интервал между соседними магазинами одной площадки. При исчерпании квоты перехожу к доступной площадке и затем возвращаюсь; лимиты 7/20 и 3/20 сохраняются.'); await save(state); await alarm(Date.now()+1000); return {ok:true};
     case 'PAUSE':
       await stopLearning(state,job);
       state.running=false; state.waiting=null; event(state,'pause',null,'Пауза пользователя; уже начатое нажатие не отменяется'); await save(state); return {ok:true};
@@ -290,6 +323,7 @@ async function dispatch(message, sender) {
       job.approved=true; state.running=true; event(state,'approved',job,'Пользователь подтвердил получателя и текст. Перед отправкой повторно проверю чат и лимит.','decision'); await save(state); await alarm(Date.now()+1000); return {ok:true};
     case 'RECHECK':
       if (!job || job.status !== 'blocked') throw new Error('Нет заблокированной задачи');
+      if(job.needsTabCheck)throw new Error('Сначала выберите и привяжите вкладку чата: её старый номер мог измениться после перезапуска');
       await stopLearning(state,job);
       job.status=job.resumeStatus==='visiting'?'visiting':'contacting'; job.stepAt=Date.now(); job.reason=''; state.running=true;
       event(state,'recheck',job,'Повторная проверка существующей вкладки без нового посещения');
@@ -313,6 +347,7 @@ async function dispatch(message, sender) {
       const tab=await chrome.tabs.get(Number(message.tabId));
       if(classify(tab.url).platform!==job.platform)throw new Error('Вкладка другой площадки');
       await stopLearning(state,job);job.tabId=tab.id;job.status='contacting';job.stepAt=Date.now();job.reason='';state.running=true;
+      delete job.needsTabCheck;
       rememberChat(state,job,tab.url);event(state,'chat_tab',job,'Вкладка явно выбрана пользователем. Проверьте получателя.');await save(state);await alarm(Date.now()+1000);return {ok:true};
     }
     case 'MARK_SENT':
@@ -375,8 +410,10 @@ chrome.tabs.onCreated.addListener(tab=>{
 });
 chrome.runtime.onStartup.addListener(()=>exclusive(async()=>{
   const state=await load();
+  const deferred=state.queue.filter(job=>job.status==='deferred_send');
+  for(const job of deferred){job.approved=false;job.needsTabCheck=true;}
   // Existing tab IDs and account state cannot be assumed to survive a browser restart.
-  if(state.running || state.activeId) {
+  if(state.running || state.activeId || deferred.length) {
     const job=state.queue.find(j=>j.id===state.activeId);
     state.learning=null;
     if(job?.status==='sending'){state.running=false;await finish(state,job,'attempt_unknown','Chrome перезапущен во время попытки. Результат не проверяется; повтор отключён.');return;}
@@ -388,6 +425,7 @@ chrome.runtime.onInstalled.addListener((details={})=>exclusive(async()=>{
   const state=await load();
   if(details.reason==='update') {
     state.settings.review=true;
+    for(const deferred of state.queue.filter(item=>item.status==='deferred_send')){deferred.approved=false;deferred.needsTabCheck=true;}
     const job=state.queue.find(item=>item.id===state.activeId);
     await stopLearning(state,job);
     if(job?.status==='sending'){state.running=false;await finish(state,job,'attempt_unknown','Расширение обновлено во время попытки. Результат не проверяется; повтор отключён.');return;}

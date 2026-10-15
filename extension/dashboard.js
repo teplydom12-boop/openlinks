@@ -71,7 +71,7 @@ function render() {
     const quota=element('div',String(sends),'quota'); quota.append(element('span',p.limit ? ` / ${p.limit} за 20 мин` : ' отправок за 20 мин'));
     const meter=element('div',undefined,'meter'),fill=element('div',undefined,'meter-fill');
     fill.style.width=(p.limit?Math.min(100,sends/p.limit*100):0)+'%'; meter.append(fill);
-    const next=nextAllowed(state,key,'visit',now);
+    const next=Math.max(nextAllowed(state,key,'visit',now),nextAllowed(state,key,'send',now));
     card.append(head,quota,meter,element('p',`Посещений: ${visits}${p.limit?' / '+p.limit:''} · соседние: ${state.settings.intervals[key]} с`),element('p',next>now?'Ограничение площадки до '+time(next):'Интервал / лимит площадки не задерживает'));
     cards.append(card);
   }
@@ -86,6 +86,7 @@ function render() {
     $('#cancel-teach').hidden=!state.learning;
   }
   const learned=$('#learned-rules');learned.replaceChildren();
+  if(state.rules?.length)learned.append(element('p',`Сохранено вариантов: ${state.rules.length}. Применение и причины несовпадения видны в журнале.`, 'hint'));
   const fieldNames={contact:'Открыть чат',editor:'Поле сообщения',send:'Отправить',chat:'Область диалога'};
   for(const rule of state.rules || []) {
     const item=element('p'),remove=element('button','Забыть','link-button');
@@ -97,9 +98,11 @@ function render() {
   for(const [index,job] of makePlan(state,now).entries()) {
     const row=element('tr'), urlCell=element('td'),link=element('a',new URL(job.url).hostname);
     link.href=job.url; link.target='_blank'; link.rel='noreferrer'; link.title=job.url; urlCell.append(link);
-    const status=element('td'); status.append(element('span',STATUS[job.status] || job.status,'badge '+job.status));
+    const status=element('td');status.title=job.reason || '';
+    const deferred=job.quotaDeferredUntil>now;
+    status.append(element('span',deferred?'Отложено до '+time(job.quotaDeferredUntil):STATUS[job.status] || job.status,'badge '+(deferred?'deferred_send':job.status)));
     const action=element('td');
-    if(job.status==='pending') {
+    if(['pending','deferred_send'].includes(job.status)) {
       const skip=element('button','Пропустить','link-button');
       skip.addEventListener('click',()=>command('SKIP',{id:job.id}).catch(e=>toast(e.message,true))); action.append(skip);
     }
