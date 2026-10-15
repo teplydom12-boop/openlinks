@@ -4,7 +4,7 @@ import {readFileSync} from 'node:fs';
 import {initialState} from '../extension/lib/core.js';
 const listener=()=>{const list=[];return {list,addListener(fn){list.push(fn);}};};
 let stored,clicks,contactClicks,commands,requests,beforeClick,probeKind,sendResult,frameUrl,tabCount,opened,missing,obstacle,prepareOk,lookupPages,fetches,probeRoute,updated,probeKey,listedTabs,frameList,tabReplies,frameProbes,deliveries;
-let scheduled,removed,canClose,nativeRequired,debuggerFailure,debuggerCalls;
+let scheduled,removed,canClose,nativeRequired,debuggerFailure,debuggerCalls,nativeFailure;
 const metadataFixture=readFileSync(new URL('./fixtures/1688-metadata.html',import.meta.url),'utf8');
 globalThis.fetch=async(url,options)=>{fetches.push({url,credentials:options.credentials});const html=lookupPages.get(url);if(html===undefined)throw new Error('No local metadata fixture');return new Response(html,{headers:{'content-type':'text/html'}});};
 const runtime={onMessage:listener(),onStartup:listener(),onInstalled:listener(),getURL:path=>'chrome-extension://test/'+path};
@@ -18,6 +18,7 @@ globalThis.chrome={runtime,alarms,storage:{local:{get:async()=>({openlinksState:
   requests.push(structuredClone(data));
   if(data.type==='PROBE')return {engine:frameUrl.includes('1688.com')?undefined:'supplier-chat-v2',kind:probeKind,key:probeKey,chatRoute:probeRoute,obstacle:obstacle?.text,canDismiss:obstacle?.dismiss,dismissKey:obstacle?.key,reason:probeKind==='inquiry'?'Форма запроса, нужен чат':undefined,...frameProbes.get(options.frameId)};
   if(data.type==='PREPARE')return {ok:prepareOk && !nativeRequired,needsNativeInput:nativeRequired,pageUrl:frameList?.find(frame=>frame.frameId===options.frameId)?.url || frameUrl,reason:prepareOk?undefined:'Редактор изменился'};
+  if(data.type==='NATIVE_INPUT' && nativeFailure?.stage===data.stage)return {ok:false,reason:nativeFailure.reason};
   if(data.type==='NATIVE_INPUT' && data.stage==='done')nativeRequired=false;
   if(data.type==='CAN_CLOSE')return {ok:canClose};
   if(data.type==='SEND'){clicks++;beforeClick=structuredClone(stored);if(sendResult==='disconnect')throw new Error('Disconnected');if(sendResult==='malformed')return {ok:false};return {clicked:sendResult!==false,accepted:sendResult===true,reason:'Кнопка изменилась'};}
@@ -34,7 +35,7 @@ chrome.debugger={
 const ui={id:'test',url:'chrome-extension://test/dashboard.html'};
 const message=(type,extra={},sender=ui)=>new Promise(resolve=>runtime.onMessage.list[0]({type,...extra},sender,resolve));
 async function tick(){alarms.onAlarm.list[0]({name:'openlinks-tick'});await message('GET');}
-function reset(){stored=initialState();stored.settings.message='Hello';clicks=0;contactClicks=0;commands=[];requests=[];beforeClick=null;probeKind='chat';sendResult=true;frameUrl='https://a.en.alibaba.com/chat';tabCount=0;opened=[];missing=false;obstacle=null;prepareOk=true;lookupPages=new Map();fetches=[];probeRoute=null;updated=[];probeKey='#contact';listedTabs=[];frameList=null;tabReplies=new Map();frameProbes=new Map();deliveries=[];scheduled=[];removed=[];canClose=true;nativeRequired=false;debuggerFailure=null;debuggerCalls=[];}
+function reset(){stored=initialState();stored.settings.message='Hello';clicks=0;contactClicks=0;commands=[];requests=[];beforeClick=null;probeKind='chat';sendResult=true;frameUrl='https://a.en.alibaba.com/chat';tabCount=0;opened=[];missing=false;obstacle=null;prepareOk=true;lookupPages=new Map();fetches=[];probeRoute=null;updated=[];probeKey='#contact';listedTabs=[];frameList=null;tabReplies=new Map();frameProbes=new Map();deliveries=[];scheduled=[];removed=[];canClose=true;nativeRequired=false;debuggerFailure=null;debuggerCalls=[];nativeFailure=null;}
 async function review(url='https://a.en.alibaba.com/'){await message('IMPORT',{text:url});await message('START');await tick();await tick();}
 async function openingTimedOut(){stored.queue[0].chatOpening.at=Date.now()-21000;await tick();}
 
@@ -98,6 +99,14 @@ test('debugger attach failure pauses without clicking, reserving quota or teachi
  assert.equal(stored.running,false);assert.equal(stored.queue[0].status,'blocked');assert.match(stored.queue[0].reason,/DevTools/);
  assert.equal(clicks,0);assert.equal(stored.learning,null);assert.equal(stored.slots.filter(s=>s.kind==='send').length,0);
  assert.equal(debuggerCalls.length,1);
+});
+test('changed draft reports the keyboard stage without misleading DevTools advice or a send attempt',async()=>{
+ reset();frameUrl='https://a.1688.com/chat';nativeRequired=true;nativeFailure={stage:'space',reason:'Текст изменился при вводе клавиш'};
+ await review('https://a.1688.com/');
+ assert.equal(stored.running,false);assert.equal(stored.queue[0].status,'blocked');
+ assert.match(stored.queue[0].reason,/после пробела/);assert.doesNotMatch(stored.queue[0].reason,/DevTools|разрешение debugger/);
+ assert.equal(clicks,0);assert.equal(stored.learning,null);assert.equal(stored.slots.filter(s=>s.kind==='send').length,0);
+ assert.equal(debuggerCalls.at(-1).type,'detach');assert.ok(!debuggerCalls.some(c=>c.params?.key==='Backspace'));
 });
 test('embedded chat closure guards both the frame and its containing document',async t=>{
  reset();frameList=[{frameId:0,url:frameUrl},{frameId:6,parentFrameId:0,url:'https://message.alibaba.com/chat'}];

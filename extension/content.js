@@ -139,23 +139,28 @@
     if(inquiryButtons.length || editors.some(isInquiry)) return {kind:'inquiry',reason:'Найдена форма запроса, а не чат. Откройте Chat now / веб-чат в этой вкладке и повторите проверку.',diagnostics};
     return {kind:'waiting',diagnostics};
   }
-  function textOf(node) { return norm('value' in node ? node.value : node.innerText); }
+  // Chromium can represent an ordinary typed space as NBSP in contenteditable
+  // (seen in the supplied 1688 pre.edit). Keep every space and newline; only
+  // equate these two representations. Do not collapse whitespace or strip ZWJ.
+  const editorSpaces = value => String(value ?? '').replace(/\u00a0/g,' ');
+  function draftText(value) {return norm(site==='1688'?editorSpaces(value):value);}
+  function textOf(node) { return draftText('value' in node ? node.value : node.innerText); }
   function rawText(node) {return 'value' in node ? node.value : node.innerText;}
   function nativeEdit(request) {
     if(site!=='1688' || location.href!==request.expectedUrl)return {ok:false,reason:'Адрес чата изменился'};
     const found=inspect(request.profile),editor=found.editor;
-    if(found.kind!=='chat' || textOf(editor)!==norm(request.message))return {ok:false,reason:'Редактор или черновик изменился'};
+    if(found.kind!=='chat' || textOf(editor)!==draftText(request.message))return {ok:false,reason:'Редактор или черновик изменился'};
     if(request.stage==='focus') {
       editor.focus();
       if('selectionStart' in editor)editor.setSelectionRange(editor.value.length,editor.value.length);
       else {const range=document.createRange();range.selectNodeContents(editor);range.collapse(false);const selection=getSelection();selection.removeAllRanges();selection.addRange(range);}
-      nativeInput={token:request.token,editor,text:rawText(editor)};
+      nativeInput={token:request.token,editor,text:editorSpaces(rawText(editor))};
     }
     const operation=nativeInput;
     let active=document.activeElement;while(active?.shadowRoot?.activeElement)active=active.shadowRoot.activeElement;
     if(!operation || operation.token!==request.token || editor!==operation.editor || active!==editor)return {ok:false,reason:'Фокус ушёл из редактора чата'};
     const expected=operation.text+(request.stage==='space'?' ':'');
-    if(rawText(editor)!==expected)return {ok:false,reason:'Текст изменился при вводе клавиш; проверьте черновик'};
+    if(editorSpaces(rawText(editor))!==expected)return {ok:false,reason:'Текст изменился при вводе клавиш; проверьте черновик'};
     // Do not delete a character after the user moved the caret or selected text.
     if('selectionStart' in editor) {
       if(editor.selectionStart!==editor.value.length || editor.selectionEnd!==editor.value.length)return {ok:false,reason:'Курсор перемещён'};
@@ -166,7 +171,7 @@
       if(tail.toString())return {ok:false,reason:'Курсор перемещён'};
     }
     if(request.stage==='done') {
-      preparedEditors.set(editor,{text:norm(request.message),method:'chrome-keyboard',native:true});nativeInput=null;
+      preparedEditors.set(editor,{text:draftText(request.message),method:'chrome-keyboard',native:true});nativeInput=null;
     }
     return {ok:true};
   }
@@ -191,7 +196,7 @@
     // Some legacy composers recalculate availability on keyup. Never synthesize
     // Enter or another shortcut that could submit the draft.
     editor.dispatchEvent(new KeyboardEvent('keyup',{bubbles:true,composed:true,key:'Unidentified'}));
-    preparedEditors.set(editor,{text:norm(message),method});
+    preparedEditors.set(editor,{text:draftText(message),method});
     return method;
   }
   function validation(send) {
@@ -203,15 +208,15 @@
     const found=inspect(request.profile);
     if(found.kind!=='chat') return {ok:false,reason:found.obstacle || found.reason || 'Не найден однозначный редактор внутри чата. Форма запроса не используется.'};
     const current=textOf(found.editor);
-    if(current && current!==norm(request.message)) return {ok:false,reason:'В поле уже есть другой текст. Расширение не перезаписывает чужой черновик.'};
+    if(current && current!==draftText(request.message)) return {ok:false,reason:'В поле уже есть другой текст. Расширение не перезаписывает чужой черновик.'};
     let inputMethod=preparedEditors.get(found.editor)?.method || 'existing-draft';
     // Repair an equal draft left by an older version, without touching other text.
-    if(!current || (site==='1688' && preparedEditors.get(found.editor)?.text!==norm(request.message))) {
+    if(!current || (site==='1688' && preparedEditors.get(found.editor)?.text!==draftText(request.message))) {
       inputMethod=fill(found.editor,request.message);await new Promise(resolve=>setTimeout(resolve,350));
     }
     const fresh=inspect(request.profile);
     if(fresh.kind!=='chat' || fresh.editor!==found.editor) return {ok:false,reason:fresh.reason || fresh.obstacle || 'Интерфейс чата изменился при заполнении'};
-    if(textOf(fresh.editor)!==norm(request.message)) return {ok:false,reason:'Сайт не принял текст. Проверьте редактор вручную.'};
+    if(textOf(fresh.editor)!==draftText(request.message)) return {ok:false,reason:'Сайт не принял текст. Проверьте редактор вручную.'};
     const reason=validation(fresh.send);
     if(reason) return {ok:false,reason};
     if(site==='1688' && !preparedEditors.get(fresh.editor)?.native)return {ok:false,needsNativeInput:true,pageUrl:location.href};
@@ -358,7 +363,7 @@
       if(location.href!==request.expectedUrl) return {clicked:false,reason:'Адрес страницы изменился. Проверьте получателя.'};
       const found=inspect(profile);
       if(found.kind!=='chat') return {clicked:false,reason:found.reason || found.obstacle || 'Чат больше не доступен; форма запроса не используется'};
-      if(textOf(found.editor)!==norm(request.message)) return {clicked:false,reason:'Текст изменился. Отправка остановлена.'};
+      if(textOf(found.editor)!==draftText(request.message)) return {clicked:false,reason:'Текст изменился. Отправка остановлена.'};
       const reason=validation(found.send);
       if(reason) return {clicked:false,reason};
       if(unavailable(found.send)) return {clicked:false,reason:'Кнопка отправки недоступна'};

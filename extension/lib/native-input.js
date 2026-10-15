@@ -6,7 +6,7 @@ export async function activate1688(job, call, debuggerApi = chrome.debugger) {
   let attached=false;
   const check=async stage=>{
     const reply=await call(job,job.frameId,'NATIVE_INPUT',{token,stage,expectedUrl:job.inputUrl});
-    if(!reply?.ok)throw new Error(reply?.reason || 'Фокус или текст редактора изменился');
+    if(!reply?.ok)throw Object.assign(new Error(reply?.reason || 'Фокус или текст редактора изменился'),{inputFailure:'editor',inputStage:stage});
   };
   const key=async(type,key,code,keyCode,text)=>debuggerApi.sendCommand(target,'Input.dispatchKeyEvent',{
     type,key,code,windowsVirtualKeyCode:keyCode,...(text?{text,unmodifiedText:text}:{}),
@@ -22,6 +22,9 @@ export async function activate1688(job, call, debuggerApi = chrome.debugger) {
     await key('rawKeyDown','Backspace','Backspace',8);
     await key('keyUp','Backspace','Backspace',8);
     await check('done');
+  } catch(error) {
+    error.inputFailure ||= attached?'transport':'attach';
+    throw error;
   } finally {
     if(attached)await debuggerApi.detach(target).catch(()=>{});
   }

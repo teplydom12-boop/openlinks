@@ -65,10 +65,12 @@ async function prepareChat(state,job) {
     await activate1688({...job,inputUrl:reply.pageUrl},call);
     await new Promise(resolve=>setTimeout(resolve,350));
     const ready=await call(job,job.frameId,'PREPARE');
-    if(ready.needsNativeInput)throw new Error('Редактор не сохранил результат ввода клавиш');
+    if(ready.needsNativeInput)throw Object.assign(new Error('Редактор не сохранил результат ввода клавиш'),{inputFailure:'editor',inputStage:'done'});
     return ready;
   } catch(error) {
-    return {ok:false,nativeInputError:true,reason:'Не удалось активировать редактор 1688: '+error.message+'. Проверьте разрешение debugger, закройте DevTools этой вкладки и нажмите «Проверить снова». Отправка не выполнялась.'};
+    const stage={focus:'при фокусировке',before:'перед вводом пробела',space:'после пробела',done:'после Backspace'}[error.inputStage];
+    const hint=['attach','transport'].includes(error.inputFailure)?'Проверьте разрешение debugger, закройте DevTools этой вкладки и нажмите «Проверить снова».':'Проверьте черновик и нажмите «Проверить снова».';
+    return {ok:false,nativeInputError:true,reason:`Не удалось активировать редактор 1688${stage?' ('+stage+')':''}: ${error.message}. ${hint} Отправка не выполнялась.`};
   }
 }
 async function prepareFailed(state,job,reply) {

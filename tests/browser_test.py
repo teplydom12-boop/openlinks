@@ -387,29 +387,34 @@ try:
         cdp=context.new_cdp_session(supplier)
         native_source=(ROOT/'extension/lib/native-input.js').read_text().replace('export async function activate1688(', 'window.activate1688 = async function (')
         native_transport="""() => {
-          window.attaches=0;window.detaches=0;window.nativeCommands=[];
-          chrome.debugger={attach:async()=>{attaches++},detach:async()=>{detaches++},sendCommand:(target,method,params)=>new Promise(resolve=>nativeCommands.push({method,params,resolve}))};
+          window.attaches=0;window.detaches=0;window.nativeCommands=[];window.nativeKeys=[];window.nativeSpaceCodes=[];
+          chrome.debugger={attach:async()=>{attaches++},detach:async()=>{detaches++},sendCommand:(target,method,params)=>new Promise(resolve=>{nativeKeys.push(params);nativeCommands.push({method,params,resolve})})};
           window.prepareNative=async(message='Hello, WeChat: demo')=>{
             const draft=await adapter('PREPARE',{message});
             if(!draft.needsNativeInput)return draft;
-            await activate1688({platform:'1688',tabId:1,frameId:0,inputUrl:draft.pageUrl},(job,frame,type,extra)=>adapter(type,{message,...extra}));
+            await activate1688({platform:'1688',tabId:1,frameId:0,inputUrl:draft.pageUrl},(job,frame,type,extra)=>{window.beforeNativeCheck?.(extra.stage);return adapter(type,{message,...extra})});
             return adapter('PREPARE',{message});
           };
         }"""
         supplier.add_script_tag(content=native_source)
         supplier.evaluate(native_transport)
-        def prepare_native(message='Hello, WeChat: demo',target=supplier):
+        def prepare_native(message='Hello, WeChat: demo',target=supplier,expect_error=False):
             # Dispatch outside a pending Runtime.evaluate/exposed binding on
             # the input target, just as the extension worker does in Chrome.
-            target.evaluate("message=>{window.nativeResult=null;prepareNative(message).then(value=>{nativeResult={value}},error=>{nativeResult={error:error.message}});}",message)
+            target.evaluate("message=>{window.nativeResult=null;prepareNative(message).then(value=>{nativeResult={value}},error=>{nativeResult={error:error.message,inputFailure:error.inputFailure,inputStage:error.inputStage}});}",message)
             deadline=time.monotonic()+10
             while time.monotonic()<deadline:
                 command=target.evaluate('nativeCommands[0] && {method:nativeCommands[0].method,params:nativeCommands[0].params}')
                 if command:
                     cdp.send(command['method'],command['params'])
+                    if command['params']['type']=='char':
+                        target.evaluate("()=>{nativeSpaceCodes.push(document.querySelector('pre').textContent.slice(-1).charCodeAt(0));}")
                     target.evaluate('()=>{nativeCommands.shift().resolve();}')
                 result=target.evaluate('nativeResult')
                 if result:
+                    if expect_error:
+                        assert 'error' in result,result
+                        return result
                     assert 'error' not in result,result
                     return result['value']
                 supplier.wait_for_timeout(10)
@@ -422,6 +427,7 @@ try:
         prepared=prepare_native(rich_message)
         assert prepared['ok'] and prepared['inputMethod']=='chrome-keyboard', prepared
         assert supplier.evaluate('lastTrustedKey')=='Backspace'
+        assert supplier.evaluate('nativeSpaceCodes')==[0xA0]
         assert supplier.locator('pre').inner_text()==rich_message
         assert supplier.evaluate('attaches')==supplier.evaluate('detaches')==1
         assert supplier.evaluate('model')==rich_message and supplier.evaluate('nativeEdits')>0
@@ -434,12 +440,35 @@ try:
         expect(supplier.locator('#history .outgoing')).to_have_text(rich_message)
         assert not supplier.evaluate("message=>adapter('SEND',{message,expectedUrl:location.href})",rich_message)['clicked']
         passed('1688 requires real Space/Backspace: Chrome keyboard activates Send, preserves multiline Unicode text and detaches; duplicate preparation does not type again')
+        # The attached capture has a one-character draft followed by &nbsp;.
+        # Test that shape and a composer that preserves ordinary spaces.
+        for whitespace,message in [('pre-line','1'),('pre','2')]:
+            supplier.evaluate("([ws,message])=>{let e=document.querySelector('pre');e.style.whiteSpace=ws;e.textContent=message+'\\u00a0';}",[whitespace,message])
+            prepared=prepare_native(message)
+            assert prepared['ok'],prepared
+            assert supplier.locator('pre').inner_text()==message
+            assert supplier.evaluate('model')==message
+            assert supplier.evaluate('nativeSpaceCodes.at(-1)')==(0xA0 if whitespace=='pre-line' else 0x20)
+            assert supplier.evaluate("message=>adapter('SEND',{message,attemptId:'space-'+getComputedStyle(document.querySelector('pre')).whiteSpace,expectedUrl:location.href})",message)['accepted']
+        passed('captured 1688 NBSP draft recovers; both NBSP and ordinary native spaces complete without altering the message')
+
+        # NBSP equivalence must not accept an extra space or a changed letter.
+        sends=supplier.evaluate('sendClicks')
+        for replacement in ['1\u00a0\u00a0','2\u00a0']:
+            supplier.evaluate("text=>{let e=document.querySelector('pre');e.textContent='';window.nativeKeys=[];window.beforeNativeCheck=stage=>{if(stage==='space')e.textContent=text;};}",replacement)
+            failed=prepare_native('1',expect_error=True)
+            assert failed['inputFailure']=='editor' and failed['inputStage']=='space',failed
+            assert not supplier.evaluate("nativeKeys.some(k=>k.key==='Backspace')")
+            assert supplier.evaluate('sendClicks')==sends
+            assert supplier.evaluate('attaches')==supplier.evaluate('detaches')
+        supplier.evaluate("()=>{window.beforeNativeCheck=null;document.querySelector('pre').textContent='';}")
+        passed('genuine letter changes and extra whitespace stop before Backspace or sending, with an editor error and debugger released')
         supplier.evaluate('ignoreSend=true')
         assert prepare_native()['ok']
         ignored=supplier.evaluate("adapter('SEND',{attemptId:'ignored',expectedUrl:location.href})")
         assert ignored['clicked'] and not ignored['accepted']
         assert supplier.locator('pre').inner_text()=='Hello, WeChat: demo'
-        assert supplier.evaluate('sendClicks')==2
+        assert supplier.evaluate('sendClicks')==sends+1
         assert not supplier.evaluate("adapter('SEND',{attemptId:'ignored',expectedUrl:location.href})")['clicked']
         passed('1688 ignored click is reported as unaccepted with draft intact and no automatic retry')
         supplier.evaluate("document.querySelector('pre').textContent='User draft'")

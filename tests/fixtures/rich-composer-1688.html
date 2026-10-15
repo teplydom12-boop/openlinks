@@ -1,7 +1,8 @@
 <!doctype html><html><head><meta charset="utf-8"><title>Synthetic 1688 editor regression</title>
-<style>pre.edit{min-height:80px;min-width:300px;border:1px solid} .disabled{opacity:.6}</style></head><body>
-<!-- Synthetic behavior fixture using the user's reported pre.edit hook.
-     The actual inner 1688 messenger document was not supplied. -->
+<style>pre.edit{min-height:80px;min-width:300px;border:1px solid;white-space:pre-line} .disabled{opacity:.6}</style></head><body>
+<!-- Sanitized pre.edit hook: the 185364703 capture contains a trailing &nbsp;.
+     Collapsing whitespace reproduces Chromium's native space-to-NBSP editing.
+     Framework behavior is synthetic; no captured conversations or scripts. -->
 <section data-chat-root><pre class="edit" contenteditable="true"></pre><button class="disabled" aria-disabled="true">发送</button><div id="history"></div></section>
 <script>
 window.sendClicks=0;window.nativeEdits=0;window.ignoreSend=false;window.model='';
