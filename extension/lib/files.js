@@ -26,6 +26,16 @@ export async function writeFile(folder,name,text) {
   try { await writer.write(text); await writer.close(); }
   catch(error) { await writer.abort().catch(()=>{}); throw error; }
 }
+export async function writeLog(folder,text,allowReplace=false) {
+  try {
+    const handle=await folder.getFileHandle('activity.log');
+    const prefix=await (await handle.getFile()).slice(0,96).text();
+    if(!allowReplace && !prefix.startsWith('# OpenLinks — activity.log\n')) {
+      throw new Error('activity.log уже существует и не принадлежит OpenLinks. Выберите папку заново и подтвердите замену или укажите другую папку.');
+    }
+  } catch(error) { if(error.name!=='NotFoundError') throw error; }
+  await writeFile(folder,'activity.log',text);
+}
 export function download(name,content,type='text/plain;charset=utf-8') {
   const url=URL.createObjectURL(new Blob([content],{type}));
   const anchor=document.createElement('a'); anchor.href=url; anchor.download=name; anchor.click();

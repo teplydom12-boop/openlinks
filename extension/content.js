@@ -1,12 +1,14 @@
 (() => {
   if (globalThis.__openlinksInstalled) return;
   globalThis.__openlinksInstalled = true;
-  const CONTACT = /^(contact supplier|contact now|contact us|chat now|chat with supplier|send inquiry|send enquiry|inquire now|inquiry|联系卖家|联系供应商|联系我们|立即咨询|在线咨询|立即询价|询盘|发询盘|在线洽谈|联系商家|Связаться с поставщиком|Написать поставщику)$/iu;
-  const SEND = /^(send|send message|send inquiry|send enquiry|submit inquiry|submit enquiry|发送|发送消息|发送询盘|提交询盘|立即发送|Отправить|Отправить запрос)$/iu;
-  const SUCCESS = /^(message sent[.!]?|your message has been sent[.!]?|inquiry sent[.!]?|your inquiry has been sent[.!]?|发送成功[！!。]?|消息发送成功[！!。]?|询盘发送成功[！!。]?|Сообщение отправлено[.!]?)$/iu;
+  const CONTACT = /^(chat now|chat with supplier|start chat|live chat|online chat|chat online|chat|talk to supplier|联系卖家|联系供应商|立即咨询|在线咨询|在线洽谈|在线交谈|立即沟通|联系商家|Написать в чат|Чат с продавцом)$/iu;
+  const SEND = /^(send|send message|发送|发送消息|立即发送|Отправить|Отправить сообщение)$/iu;
+  const SUCCESS = /^(message sent[.!]?|your message has been sent[.!]?|发送成功[！!。]?|消息发送成功[！!。]?|Сообщение отправлено[.!]?)$/iu;
+  const INQUIRY = /inquir|enquir|quotation|request[\s_-]*(?:a[\s_-]*)?quote|\brfq\b|msgsend|询盘|询价|запрос|заявк/iu;
   const EDITORS = 'textarea,[contenteditable="true"],[role="textbox"][contenteditable]';
   const ACTIONS = 'a,button,[role="button"],input[type="submit"],input[type="button"]';
   const OUTGOING = '[data-direction="outgoing"],[data-is-self="true"],.message-outgoing,.message-self,.msg-self,.msg-sent,.message-right,.im-message-right';
+  const CHAT_ROOT = '[data-chat-root],[data-chat],[class~="chat"],[id*="chat" i],[class*="chat-panel" i],[class*="chat-window" i],[class*="chat-container" i],[class*="conversation" i],[class*="messenger" i],[role="dialog"][aria-label*="chat" i]';
   const sentOps = new Set();
   const norm = value => String(value || '').replace(/\r\n/g,'\n').trim();
   function visible(node) {
@@ -28,6 +30,17 @@
     if(selector) return all(selector);
     return all(fallback).filter(node=>labels(node).some(label=>label.length<100 && regex.test(label)));
   }
+  function isInquiry(node) {
+    const names=node.matches(EDITORS) ? [node.getAttribute('aria-label'),node.getAttribute('title')] : labels(node);
+    if(INQUIRY.test([...names,node.getAttribute('href') || '',node.getAttribute('formaction') || ''].join(' '))) return true;
+    const form=node.form || node.closest('form');
+    if(!form) return false;
+    if(INQUIRY.test([form.id,form.getAttribute('action') || '',form.getAttribute('name') || '',form.getAttribute('aria-label') || ''].join(' '))) return true;
+    return [...form.querySelectorAll('input[type="email"],input[type="tel"],input[name*="subject" i],input[name*="quantity" i]')].some(visible);
+  }
+  function commonChat(editor,send,roots) {
+    return roots.find(root=>root.contains(editor) && root.contains(send));
+  }
   function obstacle() {
     const challenges = all('#nc_1_wrapper,.nc-container,.geetest_panel,[id*="captcha" i],[class*="captcha" i],iframe[src*="captcha" i],iframe[src*="recaptcha" i],iframe[src*="hcaptcha" i],#baxia-dialog-content');
     if(challenges.length) return 'Обнаружена проверка CAPTCHA. Пройдите её вручную и нажмите «Проверить снова».';
@@ -39,28 +52,42 @@
   function inspect(profile) {
     const blocked=obstacle();
     if(blocked) return {kind:'obstacle',obstacle:blocked};
+    const diagnostics={page:location.origin+location.pathname,editors:0,sends:0,chatRoots:0,contacts:0,inquiriesIgnored:0};
+    // A custom selector cannot turn an inquiry page into a live conversation.
+    if(INQUIRY.test(location.pathname)) return {kind:'inquiry',reason:'Открыта страница запроса/Inquiry. Нужен чат продавца; запрос отправляться не будет.',diagnostics};
     const editors=all(profile.editor || EDITORS).filter(node=>!node.disabled && !node.readOnly && !node.closest('[role="search"]') && !/search|搜索|查找/i.test([node.name,node.id,node.getAttribute('placeholder'),node.getAttribute('aria-label')].join(' ')));
     // A valid form may initially have a disabled Send button until text is entered.
-    const sends=candidates(profile.send,ACTIONS,SEND);
-    if(editors.length && sends.length) {
-      if(editors.length!==1 || sends.length!==1) return {kind:'ambiguous',reason:'Найдено несколько полей сообщения или кнопок отправки. Уточните CSS-селекторы.'};
-      return {kind:'form',editor:editors[0],send:sends[0]};
+    const rawSends=candidates(profile.send,ACTIONS,SEND);
+    const sends=rawSends.filter(node=>!isInquiry(node));
+    const roots=all(profile.chat || CHAT_ROOT);
+    const pairs=[];
+    for(const editor of editors) for(const send of sends) {
+      const root=commonChat(editor,send,roots);
+      if(root && !isInquiry(editor)) pairs.push({editor,send,root});
     }
-    if(editors.length>1) return {kind:'ambiguous',reason:'На странице несколько текстовых полей. Укажите селектор сообщения в настройках.'};
-    const contacts=candidates(profile.contact,ACTIONS,CONTACT);
+    Object.assign(diagnostics,{editors:editors.length,sends:sends.length,chatRoots:roots.length,inquiriesIgnored:rawSends.length-sends.length});
+    if(pairs.length>1) return {kind:'ambiguous',reason:'Найдено несколько редакторов или кнопок внутри чата. Уточните CSS-селекторы.',diagnostics};
+    if(pairs.length===1) return {kind:'chat',...pairs[0],diagnostics};
+    const rawContacts=candidates(profile.contact,ACTIONS,CONTACT);
+    const contacts=rawContacts.filter(node=>!isInquiry(node));
+    diagnostics.contacts=contacts.length;
+    diagnostics.inquiriesIgnored+=rawContacts.length-contacts.length;
     const unique=[];
     for(const node of contacts) {
       const href=node.tagName==='A' && node.getAttribute('href') ? node.href : '';
       if(href && unique.some(other=>other.href===href)) continue;
       unique.push({node,href});
     }
-    if(unique.length>1) return {kind:'ambiguous',reason:'На странице несколько разных контактов. Откройте нужный чат вручную или задайте селектор контакта.'};
+    if(unique.length>1) return {kind:'ambiguous',reason:'На странице несколько разных кнопок чата. Откройте нужный чат вручную или задайте селектор.',diagnostics};
     if(unique.length===1) {
       const {node,href}=unique[0];
       // javascript:, aliim: and wangwang: are not navigated by the extension.
-      return {kind:'contact',contact:node,href:/^https:\/\//i.test(href) && href!==location.href ? href : null};
+      return {kind:'contact',contact:node,href:/^https:\/\//i.test(href) && href!==location.href ? href : null,diagnostics};
     }
-    return {kind:'waiting'};
+    const inquiryButtons=all(ACTIONS).filter(isInquiry);
+    diagnostics.inquiriesIgnored=Math.max(diagnostics.inquiriesIgnored,inquiryButtons.length);
+    if(inquiryButtons.length || editors.some(isInquiry)) return {kind:'inquiry',reason:'Найдена форма запроса, а не чат. Откройте Chat now / веб-чат в этой вкладке и повторите проверку.',diagnostics};
+    return {kind:'waiting',diagnostics};
   }
   function textOf(node) { return norm('value' in node ? node.value : node.innerText); }
   function evidence(profile,message) {
@@ -89,10 +116,12 @@
   }
   async function prepare(request) {
     const found=inspect(request.profile);
-    if(found.kind!=='form') return {ok:false,reason:found.obstacle || found.reason || 'Не найдена однозначная форма сообщения'};
+    if(found.kind!=='chat') return {ok:false,reason:found.obstacle || found.reason || 'Не найден однозначный редактор внутри чата. Форма запроса не используется.'};
     const current=textOf(found.editor);
     if(current && current!==norm(request.message)) return {ok:false,reason:'В поле уже есть другой текст. Расширение не перезаписывает чужой черновик.'};
     if(!current) { fill(found.editor,request.message); await new Promise(resolve=>setTimeout(resolve,350)); }
+    const fresh=inspect(request.profile);
+    if(fresh.kind!=='chat' || fresh.editor!==found.editor || fresh.send!==found.send) return {ok:false,reason:fresh.reason || fresh.obstacle || 'Интерфейс чата изменился при заполнении'};
     if(textOf(found.editor)!==norm(request.message)) return {ok:false,reason:'Сайт не принял текст. Проверьте редактор вручную.'};
     const reason=validation(found.send);
     if(reason) return {ok:false,reason};
@@ -103,7 +132,7 @@
     const profile=request.profile || {};
     if(request.type==='PROBE') {
       const found=inspect(profile);
-      return {kind:found.kind,obstacle:found.obstacle,reason:found.reason,href:found.href};
+      return {kind:found.kind,obstacle:found.obstacle,reason:found.reason,href:found.href,diagnostics:found.diagnostics};
     }
     if(request.type==='CONTACT') {
       const found=inspect(profile);
@@ -117,7 +146,7 @@
       if(sentOps.has(request.jobId)) return {clicked:false,reason:'Эта попытка уже выполнялась. Повтор запрещён.'};
       if(location.href!==request.expectedUrl) return {clicked:false,reason:'Адрес страницы изменился. Проверьте получателя.'};
       const found=inspect(profile);
-      if(found.kind!=='form') return {clicked:false,reason:found.reason || found.obstacle || 'Форма изменилась'};
+      if(found.kind!=='chat') return {clicked:false,reason:found.reason || found.obstacle || 'Чат больше не доступен; форма запроса не используется'};
       if(textOf(found.editor)!==norm(request.message)) return {clicked:false,reason:'Текст изменился. Отправка остановлена.'};
       const reason=validation(found.send);
       if(reason) return {clicked:false,reason};

@@ -1,7 +1,8 @@
-import {PLATFORMS, STATUS, FINAL, makePlan, WINDOW_MS, scheduleText, reportText, nextAllowed} from './lib/core.js';
-import {getFolder,rememberFolder,writeFile,download} from './lib/files.js';
+import {PLATFORMS, STATUS, EVENT_LABELS, FINAL, makePlan, WINDOW_MS, scheduleText, reportText, activityText, nextAllowed} from './lib/core.js';
+import {getFolder,rememberFolder,writeFile,writeLog,download} from './lib/files.js';
 const $=selector=>document.querySelector(selector);
 let state, folder, settingsDirty=false, fileWrites=Promise.resolve(), toastTimer;
+const approvedFolders=new WeakSet();
 const time=at=>at ? new Date(at).toLocaleString('ru-RU',{month:'short',day:'numeric',hour:'2-digit',minute:'2-digit',second:'2-digit'}) : '—';
 function toast(text,error=false) {
   $('#toast').textContent=text; $('#toast').classList.toggle('error',error); $('#toast').hidden=false;
@@ -31,7 +32,7 @@ function initSettings() {
     block.append(label,input); $('#interval-fields').append(block);
     const profile=element('div',undefined,'profile'); profile.append(element('h3',platform.label));
     const grid=element('div',undefined,'profile-grid');
-    for(const [field,title] of Object.entries({contact:'Кнопка контакта',editor:'Поле сообщения',send:'Кнопка отправки',success:'Новое подтверждение успеха'})) {
+    for(const [field,title] of Object.entries({chat:'Область чата (контейнер редактора и отправки)',contact:'Кнопка открытия чата',editor:'Поле сообщения в чате',send:'Кнопка отправки в чат',success:'Новое подтверждение успеха'})) {
       const item=element('div'); const label=element('label',title); label.htmlFor=`profile-${key}-${field}`;
       const input=element('input'); Object.assign(input,{type:'text',id:`profile-${key}-${field}`,maxLength:500,placeholder:'Автопоиск по смыслу',spellcheck:false});
       item.append(label,input); grid.append(item);
@@ -45,17 +46,22 @@ function fillSettings() {
   $('#message').value=state.settings.message; $('#review').checked=state.settings.review;
   for(const key of Object.keys(PLATFORMS)) {
     $('#interval-'+key).value=state.settings.intervals[key];
-    for(const field of ['contact','editor','send','success']) $(`#profile-${key}-${field}`).value=state.settings.profiles[key][field];
+    for(const field of ['chat','contact','editor','send','success']) $(`#profile-${key}-${field}`).value=state.settings.profiles[key][field] || '';
   }
 }
 function render() {
   if(!state) return;
   const now=Date.now(), active=state.queue.find(j=>j.id===state.activeId);
-  $('#run-state').textContent=state.running ? (active?.status==='review'&&!active.approved?'Ждёт подтверждения':'Очередь работает') : 'На паузе';
+  $('#run-state').textContent=state.running ? (state.waiting ? 'Ожидание интервала / лимита' : active?.status==='review'&&!active.approved?'Ждёт подтверждения':'Очередь работает') : 'На паузе';
   $('#run-state').classList.toggle('running',state.running);
   $('#start').disabled=state.running; $('#pause').disabled=!state.running;
   $('#nav-count').textContent=state.queue.filter(j=>!FINAL.has(j.status)).length;
   $('#queue-count').textContent=state.queue.length;
+  const activity=state.activity || state.events.at(-1);
+  $('#activity-stage').textContent=activity ? (EVENT_LABELS[activity.type] || activity.type)+' · '+time(activity.at) : 'Очередь ещё не запущена';
+  $('#activity-detail').textContent=activity?.detail || 'Добавьте ссылки и сохраните сообщение.';
+  $('#waiting-detail').hidden=!state.waiting;
+  if(state.waiting) $('#waiting-detail').textContent=`До ${time(state.waiting.until)} · осталось ${Math.max(0,Math.ceil((state.waiting.until-now)/1000))} с. ${state.waiting.detail}`;
   const cards=$('#platform-cards'); cards.replaceChildren();
   for(const [key,p] of Object.entries(PLATFORMS)) {
     const count=kind=>state.slots.filter(s=>s.platform===key && s.kind===kind && s.at>now-WINDOW_MS).length;
@@ -66,7 +72,7 @@ function render() {
     const meter=element('div',undefined,'meter'),fill=element('div',undefined,'meter-fill');
     fill.style.width=(p.limit?Math.min(100,sends/p.limit*100):0)+'%'; meter.append(fill);
     const next=nextAllowed(state,key,'visit',now);
-    card.append(head,quota,meter,element('p',`Посещений: ${visits}${p.limit?' / '+p.limit:''} · пауза ${state.settings.intervals[key]} с`),element('p',next>now?'Следующее посещение: '+time(next):'Готово к следующему обращению'));
+    card.append(head,quota,meter,element('p',`Посещений: ${visits}${p.limit?' / '+p.limit:''} · соседние: ${state.settings.intervals[key]} с`),element('p',next>now?'Ограничение площадки до '+time(next):'Интервал / лимит площадки не задерживает'));
     cards.append(card);
   }
   $('#active-card').hidden=!active;
@@ -79,7 +85,7 @@ function render() {
     $('#skip-active').disabled=active.status==='sending';
   }
   const body=$('#queue-body'); body.replaceChildren();
-  for(const job of makePlan(state,now)) {
+  for(const [index,job] of makePlan(state,now).entries()) {
     const row=element('tr'), urlCell=element('td'),link=element('a',new URL(job.url).hostname);
     link.href=job.url; link.target='_blank'; link.rel='noreferrer'; link.title=job.url; urlCell.append(link);
     const status=element('td'); status.append(element('span',STATUS[job.status] || job.status,'badge '+job.status));
@@ -88,12 +94,14 @@ function render() {
       const skip=element('button','Пропустить','link-button');
       skip.addEventListener('click',()=>command('SKIP',{id:job.id}).catch(e=>toast(e.message,true))); action.append(skip);
     }
-    row.append(urlCell,element('td',PLATFORMS[job.platform].label),element('td',time(job.plannedAt)),status,action); body.append(row);
+    row.append(element('td',String(index+1)),urlCell,element('td',PLATFORMS[job.platform].label),element('td',time(job.plannedAt)),status,action); body.append(row);
   }
   $('#empty').hidden=state.queue.length>0;
   const report=$('#report-body'); report.replaceChildren();
-  for(const entry of [...state.events].reverse().slice(0,500)) {
-    const row=element('tr'); row.append(element('td',time(entry.at)),element('td',STATUS[entry.type] || ({visit:'Посещение',send_attempt:'Попытка отправки',draft_ready:'Черновик готов',start:'Запуск',pause:'Пауза',import:'Импорт',complete:'Завершено',recheck:'Повторная проверка',chat_tab:'Вкладка чата',remove_pending:'Очистка очереди'}[entry.type] || entry.type)),element('td',[entry.url,entry.detail].filter(Boolean).join(' · '))); report.append(row);
+  const filter=$('#log-filter').value.toLowerCase();
+  const levels={action:'Действие',observation:'Наблюдение',decision:'Решение',wait:'Ожидание',error:'Остановка'};
+  for(const entry of [...state.events].reverse().filter(entry=>[entry.url,entry.detail,EVENT_LABELS[entry.type],entry.type].join(' ').toLowerCase().includes(filter)).slice(0,500)) {
+    const row=element('tr'); row.append(element('td',time(entry.at)),element('td',levels[entry.level] || 'Действие'),element('td',EVENT_LABELS[entry.type] || entry.type),element('td',[entry.url,entry.detail].filter(Boolean).join(' · '))); report.append(row);
   }
   fillSettings();
 }
@@ -104,6 +112,7 @@ function syncFiles() {
     if(await target.queryPermission({mode:'readwrite'})!=='granted') {
       $('#folder-status').textContent='Нужно разрешение папки. Нажмите кнопку выбора папки ещё раз.'; return;
     }
+    await writeLog(target,activityText(snapshot),approvedFolders.has(target));
     await writeFile(target,'schedule.txt',scheduleText(snapshot));
     await writeFile(target,'report.txt',reportText(snapshot));
     $('#folder-status').textContent=`Папка «${target.name}» · сохранено ${new Date().toLocaleTimeString('ru-RU')}. Оставьте это окно открытым.`;
@@ -119,7 +128,7 @@ $('#settings-form').addEventListener('submit',async event=>{
     const settings={message:$('#message').value,review:$('#review').checked,intervals:{},profiles:{}};
     for(const key of Object.keys(PLATFORMS)) {
       settings.intervals[key]=Number($('#interval-'+key).value); settings.profiles[key]={};
-      for(const field of ['contact','editor','send','success']) {
+      for(const field of ['chat','contact','editor','send','success']) {
         const selector=$(`#profile-${key}-${field}`).value.trim();
         if(selector) document.createDocumentFragment().querySelector(selector); // Validate syntax only.
         settings.profiles[key][field]=selector;
@@ -165,15 +174,19 @@ button('#connect-folder',async()=>{
   if(!window.showDirectoryPicker) throw new Error('Выбор папки не поддерживается. Используйте скачивание файлов.');
   const handle=await showDirectoryPicker({id:'openlinks-reports',mode:'readwrite'});
   let exists=false;
-  for(const name of ['schedule.txt','report.txt']) {
+  for(const name of ['schedule.txt','report.txt','activity.log']) {
     try { await handle.getFileHandle(name); exists=true; } catch(error) { if(error.name!=='NotFoundError') throw error; }
   }
-  if(exists && !confirm('В папке уже есть schedule.txt или report.txt. Заменять их данными текущей очереди?')) return;
-  folder=handle; await rememberFolder(handle); syncFiles();
+  if(exists && !confirm('В папке уже есть schedule.txt, report.txt или activity.log. Заменять их данными текущей очереди?')) return;
+  approvedFolders.add(handle); folder=handle; await rememberFolder(handle); syncFiles();
 });
 button('#export-schedule',()=>download('schedule.txt',scheduleText(state)));
 button('#export-report',()=>download('report.txt',reportText(state)));
 button('#report-download',()=>download('report.txt',reportText(state)));
+button('#export-log',()=>download('activity.log',activityText(state)));
+button('#log-download',()=>download('activity.log',activityText(state)));
+button('#show-log',()=>showView('report'));
+$('#log-filter').addEventListener('input',render);
 button('#export-json',()=>download('openlinks-snapshot.json',JSON.stringify(state,null,2),'application/json'));
 chrome.storage.onChanged.addListener((changes,area)=>{
   if(area==='local' && changes.openlinksState?.newValue) {

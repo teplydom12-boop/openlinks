@@ -6,7 +6,7 @@ export const PLATFORMS = {
 };
 export const FINAL = new Set(['sent', 'skipped', 'failed']);
 export const STATUS = {
-  pending: 'В очереди', visiting: 'Открытие магазина', contacting: 'Открытие формы',
+  pending: 'В очереди', visiting: 'Открытие магазина', contacting: 'Открытие чата',
   drafting: 'Подготовка сообщения', review: 'Ждёт подтверждения', sending: 'Проверка отправки',
   sent: 'Отправлено', uncertain: 'Отправка не подтверждена', blocked: 'Нужно вмешательство',
   failed: 'Ошибка', skipped: 'Пропущено',
@@ -30,12 +30,28 @@ export function classify(raw) {
 }
 export function initialState() {
   return {
-    version: 1, running: false, activeId: null, queue: [], events: [], slots: [],
+    version: 2, running: false, activeId: null, waiting: null, activity: null, queue: [], events: [], slots: [],
     settings: {message: '', review: true, intervals: { '1688': 180, alibaba: 420, mic: 60 },
       profiles: Object.fromEntries(Object.keys(PLATFORMS).map(key => [key, {
-        contact: '', editor: '', send: '', success: '',
+        chat: '', contact: '', editor: '', send: '', success: '',
       }]))},
   };
+}
+export function migrateState(saved) {
+  if (!saved) return initialState();
+  if (saved.version === 2) return saved;
+  const state = structuredClone(saved);
+  state.version = 2; state.running = false; state.waiting = null; state.activity = null;
+  state.settings.review = true;
+  for (const profile of Object.values(state.settings.profiles)) profile.chat ||= '';
+  const active = state.queue.find(job => job.id === state.activeId);
+  if (active) {
+    active.status = active.status === 'sending' || active.status === 'uncertain' ? 'uncertain' : 'blocked';
+    active.reason = 'Расширение обновлено: теперь используется только чат. Обновите вкладку и проверьте состояние сообщения.';
+    active.approved = false;
+  }
+  state.events.push({id:crypto.randomUUID(),at:Date.now(),type:'upgrade',level:'decision',detail:'Переход на строгую очередь и отправку только в чат. Выполнение приостановлено, подтверждение включено.'});
+  return state;
 }
 export function validateSettings(value) {
   const settings = structuredClone(value);
@@ -50,7 +66,8 @@ export function validateSettings(value) {
     }
     settings.intervals[key] = interval;
     if (!settings.profiles?.[key]) throw new Error('Не задан профиль площадки');
-    for (const field of ['contact', 'editor', 'send', 'success']) {
+    settings.profiles[key].chat ||= '';
+    for (const field of ['chat', 'contact', 'editor', 'send', 'success']) {
       if (typeof settings.profiles[key][field] !== 'string' || settings.profiles[key][field].length > 500) {
         throw new Error('CSS-селектор: не более 500 символов');
       }
@@ -60,17 +77,26 @@ export function validateSettings(value) {
 }
 // Count visits and sends separately. Reservations survive errors and queue deletion.
 // This limits contact operations, not the HTTP requests made by the site itself.
-export function nextAllowed(state, platform, kind, now) {
+export function eligibility(state, platform, kind, now) {
   const slots = state.slots.filter(s => s.platform === platform && s.kind === kind)
     .map(s => s.at).sort((a,b) => a-b);
   let next = now;
-  if (slots.length) next = Math.max(next, slots.at(-1) + state.settings.intervals[platform] * 1000);
+  const reasons = [];
+  const last = state.slots.filter(slot => slot.kind === 'visit').at(-1);
+  if (kind === 'visit' && last?.platform === platform) {
+    const intervalAt = last.at + state.settings.intervals[platform] * 1000;
+    if (intervalAt > now) { next = Math.max(next, intervalAt); reasons.push(`Соседние магазины на ${PLATFORMS[platform].label}: интервал ${state.settings.intervals[platform]} с`); }
+  }
+  // Clock rollback must not turn future reservations into unused capacity.
+  if (slots.at(-1) > now) { next = Math.max(next, slots.at(-1) + 1000); reasons.push('Системные часы отстают от сохранённых операций'); }
   const limit = PLATFORMS[platform].limit;
   if (limit && slots.length >= limit) {
-    next = Math.max(next, slots.at(-limit) + WINDOW_MS + 1000);
+    const quotaAt = slots.at(-limit) + WINDOW_MS + 1000;
+    if (quotaAt > now) { next = Math.max(next, quotaAt); reasons.push(`Лимит ${PLATFORMS[platform].label}: ${limit} за 20 минут (${kind === 'visit' ? 'посещения' : 'отправки'})`); }
   }
-  return next;
+  return {at: next, reasons, previousPlatform:last?.platform || null};
 }
+export const nextAllowed = (state, platform, kind, now) => eligibility(state, platform, kind, now).at;
 export function makePlan(state, now = Date.now()) {
   const virtual = {...state, slots: [...state.slots]};
   const dates = new Map();
@@ -87,10 +113,12 @@ export function makePlan(state, now = Date.now()) {
   return state.queue.map(job => ({...job, plannedAt: dates.get(job.id) ?? job.visitAt ?? null}));
 }
 export function dueJob(state, now) {
-  // Eligible platforms can proceed while another platform is cooling down.
-  return state.queue.filter(job => job.status === 'pending')
-    .map(job => ({job, at: nextAllowed(state, job.platform, 'visit', Math.max(now, job.requestedAt || 0))}))
-    .sort((a,b) => a.at - b.at || state.queue.indexOf(a.job) - state.queue.indexOf(b.job))[0];
+  const job = state.queue.find(job => job.status === 'pending');
+  if (!job) return undefined;
+  const allowed = eligibility(state, job.platform, 'visit', now);
+  const reasons = [...allowed.reasons];
+  if (job.requestedAt > now) reasons.push('Заданное время посещения ещё не наступило');
+  return {job, at: Math.max(allowed.at, job.requestedAt || 0), reasons};
 }
 export function parseList(text, existing = [], now = Date.now()) {
   const seen = new Set(existing.map(job => job.url));
@@ -127,4 +155,16 @@ export function reportText(state) {
   return '# OpenLinks — report.txt\n# Время UTC (ISO 8601). sent означает подтверждение интерфейсом, не доставку или прочтение.\n' +
     '# время\tсобытие\tURL\tподробности\n' + state.events.map(e =>
       [iso(e.at), e.type, clean(e.url), clean(e.detail)].join('\t')).join('\n') + '\n';
+}
+export const EVENT_LABELS = {
+  decision:'Выбор следующего магазина', wait:'Ожидание', visit:'Открываю магазин', page_opened:'Вкладка открыта',
+  dom_scan:'Проверка страницы', chat_open:'Открываю чат', chat_ready:'Чат найден', draft_ready:'Сообщение подготовлено',
+  approved:'Отправка подтверждена пользователем', send_attempt:'Отправляю в чат', clicked:'Кнопка отправки нажата',
+  delivery_check:'Проверка результата', send_disconnect:'Ответ вкладки потерян', settings:'Настройки сохранены',
+  start:'Запуск',pause:'Пауза',import:'Импорт',complete:'Очередь завершена',recheck:'Проверяю снова',
+  chat_tab:'Новая вкладка чата',remove_pending:'Удаление ожидающих задач',upgrade:'Обновление расширения',...STATUS,
+};
+export function activityText(state) {
+  return '# OpenLinks — activity.log\n# Наблюдаемые действия, результаты проверок и причины решений. Время UTC.\n' +
+    state.events.map(entry => `${iso(entry.at)} [${entry.level || 'action'}] ${EVENT_LABELS[entry.type] || entry.type}${entry.url ? ' | '+clean(entry.url) : ''} | ${clean(entry.detail)}`).join('\n') + '\n';
 }

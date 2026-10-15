@@ -1,6 +1,6 @@
 <!doctype html><html><head><meta charset="utf-8"><title>Fixture chat</title></head><body>
-<h1>Conversation with Test supplier</h1><div id="history"></div>
-<form id="inquiry"><label>Message<textarea id="message" required></textarea></label><button type="submit" id="send" disabled>Send</button></form>
+<h1>Conversation with Test supplier</h1><section id="chat-panel" data-chat-root><div id="history"></div>
+<form id="conversation"><label>Message<textarea id="message" required></textarea></label><button type="submit" id="send" disabled>Send</button></form></section>
 <script>
 let clicks=0;
 const editor=document.querySelector('#message'),send=document.querySelector('#send');

@@ -69,15 +69,38 @@ try:
         file_data = ui.evaluate("""async()=>{
           const directory=await navigator.storage.getDirectory();
           const read=async name=>await (await (await directory.getFileHandle(name)).getFile()).text();
-          return {schedule:await read('schedule.txt'),report:await read('report.txt')};
+          return {schedule:await read('schedule.txt'),report:await read('report.txt'),log:await read('activity.log')};
         }""")
         assert 'jcnyjxsb.en.alibaba.com' in file_data['schedule']
         assert 'Browser UI test' in file_data['report']
-        passed('auto-write creates actual schedule.txt and report.txt using File System Access')
+        assert 'Импорт' in file_data['log']
+        passed('auto-write creates schedule.txt, report.txt and activity.log using File System Access')
+        protection=ui.evaluate("""async()=>{
+          const {writeLog,activityText}= {...await import('/extension/lib/files.js'),...await import('/extension/lib/core.js')};
+          const folder=await navigator.storage.getDirectory();
+          const handle=await folder.getFileHandle('activity.log');
+          const writer=await handle.createWritable();await writer.write('My unrelated log');await writer.close();
+          let rejected=false;try{await writeLog(folder,'# OpenLinks — activity.log\\nnew log');}catch{rejected=true;}
+          const preserved=await (await handle.getFile()).text();
+          await writeLog(folder,'# OpenLinks — activity.log\\nRestored browser test log',true);
+          return {rejected,preserved};
+        }""")
+        assert protection=={'rejected':True,'preserved':'My unrelated log'}
+        passed('new activity.log cannot silently overwrite an unrelated existing file')
         with ui.expect_download() as download:
             ui.locator('#export-schedule').click()
         assert download.value.suggested_filename == 'schedule.txt'
         passed('manual TXT download')
+        ui.locator('#show-log').click()
+        ui.locator('#log-filter').fill('неизвестное-событие')
+        expect(ui.locator('#report-body tr')).to_have_count(0)
+        ui.locator('#log-filter').fill('импорт')
+        expect(ui.locator('#report-body tr')).to_have_count(2)
+        with ui.expect_download() as log_download:
+            ui.locator('#log-download').click()
+        assert log_download.value.suggested_filename=='activity.log'
+        ui.get_by_role('button', name='Очередь поставщиков').click()
+        passed('detailed live log has search and downloadable activity.log')
         ui.screenshot(path=str(RESULTS/'dashboard.png'), full_page=True)
         ui.set_viewport_size({'width': 600, 'height': 850})
         assert ui.evaluate('document.documentElement.scrollWidth <= window.innerWidth')
@@ -99,7 +122,7 @@ try:
         passed('semantic contact discovery')
         supplier.goto('https://test.en.alibaba.com/chat')
         supplier.add_script_tag(path=str(ROOT/'extension/content.js'))
-        assert supplier.evaluate("adapter('PROBE')")['kind']=='form'
+        assert supplier.evaluate("adapter('PROBE')")['kind']=='chat'
         result = supplier.evaluate("adapter('PREPARE')")
         assert result['ok']
         expect(supplier.locator('#message')).to_have_value('Hello, WeChat: demo')
@@ -120,14 +143,27 @@ try:
         assert 'CAPTCHA' in supplier.evaluate("adapter('PROBE')")['obstacle']
         assert not supplier.evaluate("adapter('SEND', {jobId:'another',expectedUrl:location.href})")['clicked']
         passed('visible CAPTCHA blocks preparation and sending')
-        supplier.evaluate("document.querySelector('#fixture-captcha').remove();document.body.insertAdjacentHTML('beforeend','<textarea id=second></textarea>')")
+        supplier.evaluate("document.querySelector('#fixture-captcha').remove();document.querySelector('#chat-panel').insertAdjacentHTML('beforeend','<textarea id=second></textarea>')")
         assert supplier.evaluate("adapter('PROBE')")['kind']=='ambiguous'
         passed('ambiguous editors stop automation')
         assert supplier.evaluate("adapter('PROBE',{profile:{editor:'['}})")['kind']=='ambiguous'
         passed('invalid CSS selector fails closed')
         supplier.evaluate("document.querySelector('#second').remove();document.querySelector('#message').value='';document.querySelector('form').insertAdjacentHTML('afterbegin','<input required type=email id=email>')")
-        assert 'обязательные' in supplier.evaluate("adapter('PREPARE')")['reason']
-        passed('required additional form fields require human input')
+        assert 'запрос' in supplier.evaluate("adapter('PREPARE')")['reason']
+        passed('inquiry-like form with additional email field is rejected')
+        supplier.evaluate("document.body.innerHTML='<form id=sendInquiry><textarea id=message></textarea><button id=send>Send inquiry</button></form>'")
+        assert supplier.evaluate("adapter('PROBE')")['kind']=='inquiry'
+        assert not supplier.evaluate("adapter('PREPARE')")['ok']
+        expect(supplier.locator('#message')).to_have_value('')
+        assert not supplier.evaluate("adapter('SEND',{jobId:'forbidden',expectedUrl:location.href,profile:{chat:'body',editor:'#message',send:'#send'}})")['clicked']
+        passed('inquiry is neither filled nor sent, even with explicit selectors')
+        supplier.evaluate("document.body.innerHTML='<a href=/sendInquiry id=contact>Send inquiry</a>'")
+        assert not supplier.evaluate("adapter('CONTACT',{profile:{contact:'#contact'}})")['ok']
+        passed('explicit contact selector cannot click Send inquiry')
+        supplier.evaluate("document.body.innerHTML='<textarea id=message></textarea><button id=send>Send</button>'")
+        assert supplier.evaluate("adapter('PROBE')")['kind']!='chat'
+        assert not supplier.evaluate("adapter('PREPARE')")['ok']
+        passed('generic textarea and Send without conversation context are not a chat')
         assert not errors, errors
         passed('no browser JavaScript errors')
         browser.close()
