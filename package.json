@@ -1,10 +1,10 @@
 {
   "name": "openlinks-supplier-outreach",
-  "version": "0.7.0",
+  "version": "0.8.0",
   "private": true,
   "type": "module",
   "scripts": {
     "test": "node --test tests/*.test.js",
-    "check": "node --check extension/rules-shared.js && node --check extension/routes-1688-shared.js && node --check extension/background.js && node --check extension/supplier-chat.js && node --check extension/content.js && node --check extension/dashboard.js"
+    "check": "node --check extension/rules-shared.js && node --check extension/routes-1688-shared.js && node --check extension/lib/native-input.js && node --check extension/background.js && node --check extension/supplier-chat.js && node --check extension/content.js && node --check extension/dashboard.js"
   }
 }

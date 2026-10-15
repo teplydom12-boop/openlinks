@@ -17,6 +17,7 @@
   const supplierChat=globalThis.OpenLinksSupplierChat?.create(site,{all,visible,isInquiry,labels,selectorFor,obstacle,profileFor:effectiveProfile});
   const sentOps = new Set();
   const preparedEditors = new WeakMap();
+  let nativeInput=null, pendingClose=null;
   let picker=null;
   let challenge=null;
   const norm = value => String(value || '').replace(/\r\n/g,'\n').trim();
@@ -139,6 +140,36 @@
     return {kind:'waiting',diagnostics};
   }
   function textOf(node) { return norm('value' in node ? node.value : node.innerText); }
+  function rawText(node) {return 'value' in node ? node.value : node.innerText;}
+  function nativeEdit(request) {
+    if(site!=='1688' || location.href!==request.expectedUrl)return {ok:false,reason:'Адрес чата изменился'};
+    const found=inspect(request.profile),editor=found.editor;
+    if(found.kind!=='chat' || textOf(editor)!==norm(request.message))return {ok:false,reason:'Редактор или черновик изменился'};
+    if(request.stage==='focus') {
+      editor.focus();
+      if('selectionStart' in editor)editor.setSelectionRange(editor.value.length,editor.value.length);
+      else {const range=document.createRange();range.selectNodeContents(editor);range.collapse(false);const selection=getSelection();selection.removeAllRanges();selection.addRange(range);}
+      nativeInput={token:request.token,editor,text:rawText(editor)};
+    }
+    const operation=nativeInput;
+    let active=document.activeElement;while(active?.shadowRoot?.activeElement)active=active.shadowRoot.activeElement;
+    if(!operation || operation.token!==request.token || editor!==operation.editor || active!==editor)return {ok:false,reason:'Фокус ушёл из редактора чата'};
+    const expected=operation.text+(request.stage==='space'?' ':'');
+    if(rawText(editor)!==expected)return {ok:false,reason:'Текст изменился при вводе клавиш; проверьте черновик'};
+    // Do not delete a character after the user moved the caret or selected text.
+    if('selectionStart' in editor) {
+      if(editor.selectionStart!==editor.value.length || editor.selectionEnd!==editor.value.length)return {ok:false,reason:'Курсор перемещён'};
+    } else {
+      const selection=getSelection();
+      if(!selection?.isCollapsed || !selection.rangeCount || !editor.contains(selection.anchorNode))return {ok:false,reason:'Курсор перемещён'};
+      const tail=selection.getRangeAt(0).cloneRange();tail.setEnd(editor,editor.childNodes.length);
+      if(tail.toString())return {ok:false,reason:'Курсор перемещён'};
+    }
+    if(request.stage==='done') {
+      preparedEditors.set(editor,{text:norm(request.message),method:'chrome-keyboard',native:true});nativeInput=null;
+    }
+    return {ok:true};
+  }
   function fill(editor,message) {
     editor.focus();
     let method='native-value';
@@ -183,6 +214,7 @@
     if(textOf(fresh.editor)!==norm(request.message)) return {ok:false,reason:'Сайт не принял текст. Проверьте редактор вручную.'};
     const reason=validation(fresh.send);
     if(reason) return {ok:false,reason};
+    if(site==='1688' && !preparedEditors.get(fresh.editor)?.native)return {ok:false,needsNativeInput:true,pageUrl:location.href};
     if(unavailable(fresh.send)) return {ok:false,reason:'Кнопка отправки недоступна. Проверьте обязательные поля или ограничения сайта.'};
     return {ok:true,pageUrl:location.href,inputMethod};
   }
@@ -283,6 +315,15 @@
   }
   function handle(request) {
     const profile=request.profile || {};
+    if(request.type==='NATIVE_INPUT')return nativeEdit(request);
+    if(request.type==='ARM_CLOSE') {
+      if(location.href!==request.expectedUrl)return {ok:false};
+      if(pendingClose)clearTimeout(pendingClose.timer);
+      const closing=pendingClose={token:request.token,url:location.href,changed:false};
+      if(!request.guardOnly)closing.timer=setTimeout(()=>chrome.runtime.sendMessage({type:'CHAT_CLOSE_DUE',token:closing.token}).catch(()=>{}),Math.max(0,request.at-Date.now()));
+      return {ok:true};
+    }
+    if(request.type==='CAN_CLOSE')return {ok:!!pendingClose && pendingClose.token===request.token && pendingClose.url===location.href && !pendingClose.changed};
     if(request.type==='PROBE') {
       const found=inspect(profile);
       const close=dismissal();
@@ -336,10 +377,13 @@
     return {ok:false,reason:'Неизвестная команда'};
   }
   chrome.runtime.onMessage.addListener((request,sender,respond)=>{
-    if(sender.id!==chrome.runtime.id || !['PROBE','CONTACT','PREPARE','SEND','PICK_START','PICK_STOP','DISMISS_CHALLENGE','OPEN_CHAT','STOP_OPEN_CHAT'].includes(request.type)) return;
+    if(sender.id!==chrome.runtime.id || !['PROBE','CONTACT','PREPARE','SEND','PICK_START','PICK_STOP','DISMISS_CHALLENGE','OPEN_CHAT','STOP_OPEN_CHAT','NATIVE_INPUT','ARM_CLOSE','CAN_CLOSE'].includes(request.type)) return;
     Promise.resolve().then(()=>handle(request)).then(respond,error=>respond({ok:false,kind:'ambiguous',reason:'Ошибка селектора или формы: '+error.message}));
     return true;
   });
-  addEventListener('pagehide',()=>supplierChat?.stop());
+  addEventListener('pagehide',()=>{supplierChat?.stop();if(pendingClose)pendingClose.changed=true;});
+  // A new manual draft makes this a conversation the user is working in.
+  document.addEventListener('input',event=>{if(event.isTrusted && pendingClose)pendingClose.changed=true;},true);
+  document.addEventListener('pointerdown',event=>{if(event.isTrusted && pendingClose)pendingClose.changed=true;},true);
   chrome.runtime.sendMessage({type:'PAGE_READY',chatRoute:obstacle()?null:storeChatRoute()}).catch(()=>{});
 })();

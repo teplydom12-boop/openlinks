@@ -191,6 +191,7 @@ export const EVENT_LABELS = {
   chat_lookup:'Определяю получателя 1688',chat_lookup_fallback:'Перехожу к обычному открытию чата',chat_route_removed:'Адрес чата забыт',
   quota_deferred:'Площадка отложена из-за лимита',quota_resume:'Возврат к отложенной задаче',
   remove_job:'Строка удалена',manual_retry:'Повтор по решению пользователя',editor_input:'Ввод текста',composer_accepted:'Редактор 1688 очистился',
+  chat_close_scheduled:'Закрытие чата назначено',chat_closed:'Вкладка чата закрыта',chat_close_cancelled:'Закрытие чата отменено',
   chat_discovered:'Открытый чат распознан',
   chat_open_attempt:'Штатный клик открытия чата',
 };

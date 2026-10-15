@@ -10,6 +10,7 @@ import os
 import re
 from pathlib import Path
 import threading
+import time
 from playwright.sync_api import sync_playwright, expect
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -187,6 +188,8 @@ try:
             'https://air.1688.com/captured-shell': 'captured-1688-shell.html',
             'https://example-shop.1688.com/': '1688-metadata.html',
             'https://air.1688.com/rich-composer': 'rich-composer-1688.html',
+            'https://chat-test.1688.com/rich-composer': 'rich-composer-1688.html',
+            'https://air.1688.com/composer-frame': '1688-composer-frame.html',
         }
         # Every iframe/resource request is intercepted locally. No vendor request
         # or challenge is fetched, even though the fixtures preserve frame URLs.
@@ -379,10 +382,48 @@ try:
         supplier.add_script_tag(path=str(ROOT/'extension/supplier-chat.js'))
         supplier.add_script_tag(path=str(ROOT/'extension/content.js'))
         rich_message='Hello <b>供应商</b>!\nWeChat: test & demo'
+        # Run the production keyboard routine through a real Chromium CDP
+        # session. Only chrome.debugger transport is replaced; input is trusted.
+        cdp=context.new_cdp_session(supplier)
+        native_source=(ROOT/'extension/lib/native-input.js').read_text().replace('export async function activate1688(', 'window.activate1688 = async function (')
+        native_transport="""() => {
+          window.attaches=0;window.detaches=0;window.nativeCommands=[];
+          chrome.debugger={attach:async()=>{attaches++},detach:async()=>{detaches++},sendCommand:(target,method,params)=>new Promise(resolve=>nativeCommands.push({method,params,resolve}))};
+          window.prepareNative=async(message='Hello, WeChat: demo')=>{
+            const draft=await adapter('PREPARE',{message});
+            if(!draft.needsNativeInput)return draft;
+            await activate1688({platform:'1688',tabId:1,frameId:0,inputUrl:draft.pageUrl},(job,frame,type,extra)=>adapter(type,{message,...extra}));
+            return adapter('PREPARE',{message});
+          };
+        }"""
+        supplier.add_script_tag(content=native_source)
+        supplier.evaluate(native_transport)
+        def prepare_native(message='Hello, WeChat: demo',target=supplier):
+            # Dispatch outside a pending Runtime.evaluate/exposed binding on
+            # the input target, just as the extension worker does in Chrome.
+            target.evaluate("message=>{window.nativeResult=null;prepareNative(message).then(value=>{nativeResult={value}},error=>{nativeResult={error:error.message}});}",message)
+            deadline=time.monotonic()+10
+            while time.monotonic()<deadline:
+                command=target.evaluate('nativeCommands[0] && {method:nativeCommands[0].method,params:nativeCommands[0].params}')
+                if command:
+                    cdp.send(command['method'],command['params'])
+                    target.evaluate('()=>{nativeCommands.shift().resolve();}')
+                result=target.evaluate('nativeResult')
+                if result:
+                    assert 'error' not in result,result
+                    return result['value']
+                supplier.wait_for_timeout(10)
+            raise AssertionError('Chrome keyboard preparation timed out')
         supplier.evaluate("message=>{document.querySelector('pre').textContent=message;}",rich_message)
         assert supplier.evaluate('model')==''
         prepared=supplier.evaluate("message=>adapter('PREPARE',{message})",rich_message)
-        assert prepared['ok'] and prepared['inputMethod']=='native-insertText', prepared
+        assert not prepared['ok'] and prepared['needsNativeInput'], prepared
+        assert supplier.locator('button').get_attribute('aria-disabled')=='true'
+        prepared=prepare_native(rich_message)
+        assert prepared['ok'] and prepared['inputMethod']=='chrome-keyboard', prepared
+        assert supplier.evaluate('lastTrustedKey')=='Backspace'
+        assert supplier.locator('pre').inner_text()==rich_message
+        assert supplier.evaluate('attaches')==supplier.evaluate('detaches')==1
         assert supplier.evaluate('model')==rich_message and supplier.evaluate('nativeEdits')>0
         assert supplier.locator('pre b').count()==0
         edits=supplier.evaluate('nativeEdits')
@@ -392,9 +433,9 @@ try:
         assert sent['clicked'] and sent['accepted'] and supplier.evaluate('sendClicks')==1
         expect(supplier.locator('#history .outgoing')).to_have_text(rich_message)
         assert not supplier.evaluate("message=>adapter('SEND',{message,expectedUrl:location.href})",rich_message)['clicked']
-        passed('1688 equal DOM-only draft is repaired by native editing; Unicode/plain text preserved; duplicate preparation does not rewrite it')
+        passed('1688 requires real Space/Backspace: Chrome keyboard activates Send, preserves multiline Unicode text and detaches; duplicate preparation does not type again')
         supplier.evaluate('ignoreSend=true')
-        assert supplier.evaluate("adapter('PREPARE')")['ok']
+        assert prepare_native()['ok']
         ignored=supplier.evaluate("adapter('SEND',{attemptId:'ignored',expectedUrl:location.href})")
         assert ignored['clicked'] and not ignored['accepted']
         assert supplier.locator('pre').inner_text()=='Hello, WeChat: demo'
@@ -405,6 +446,40 @@ try:
         assert not supplier.evaluate("adapter('PREPARE')")['ok']
         assert supplier.locator('pre').inner_text()=='User draft'
         passed('1688 native editing never overwrites a different user draft')
+
+        # Closure marker belongs to this document only and is invalidated by
+        # actual user interaction. A page cannot schedule another tab's close.
+        assert supplier.evaluate("adapter('ARM_CLOSE',{token:'close-1',expectedUrl:location.href,at:Date.now()+10000})")['ok']
+        assert supplier.evaluate("adapter('CAN_CLOSE',{token:'close-1'})")['ok']
+        assert not supplier.evaluate("adapter('CAN_CLOSE',{token:'other'})")['ok']
+        supplier.clock.install()
+        supplier.clock.pause_at(int(time.time()*1000)+1000)
+        supplier.evaluate("adapterMessages.length=0")
+        assert supplier.evaluate("adapter('ARM_CLOSE',{token:'timed-close',expectedUrl:location.href,at:Date.now()+10000})")['ok']
+        supplier.clock.run_for(9999)
+        assert not supplier.evaluate("adapterMessages.some(m=>m.type==='CHAT_CLOSE_DUE')")
+        supplier.clock.run_for(1)
+        assert supplier.evaluate("adapterMessages.filter(m=>m.type==='CHAT_CLOSE_DUE').map(m=>m.token)")==['timed-close']
+        passed('content timer wakes the worker after 10 seconds, never before the deadline')
+        supplier.clock.resume()
+        supplier.locator('pre').click()
+        assert not supplier.evaluate("adapter('CAN_CLOSE',{token:'timed-close'})")['ok']
+        passed('a trusted user interaction cancels the document-specific auto-close marker')
+
+        supplier.goto('https://air.1688.com/composer-frame')
+        inner=supplier.frame(url='https://chat-test.1688.com/rich-composer')
+        assert inner
+        inner.add_script_tag(path=str(ROOT/'extension/content.js'))
+        inner.add_script_tag(content=native_source)
+        inner.evaluate(native_transport)
+        supplier.locator('#outside').fill('Keep this unrelated draft')
+        prepared=prepare_native(rich_message,target=inner)
+        assert prepared['ok'] and inner.evaluate('lastTrustedKey')=='Backspace'
+        assert inner.locator('pre').inner_text()==rich_message
+        assert supplier.locator('#outside').input_value()=='Keep this unrelated draft'
+        assert inner.evaluate('model')==rich_message
+        passed('real keyboard input targets the 1688 iframe composer while preserving a focused field on its parent page')
+        cdp.detach()
 
         # A MIC lesson describes the minimized chat control, not the initial
         # storefront action. It must transfer to another shop and survive reload.

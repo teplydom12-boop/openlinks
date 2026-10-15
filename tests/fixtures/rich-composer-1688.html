@@ -9,7 +9,11 @@ const editor=document.querySelector('pre.edit'),send=document.querySelector('but
 // A DOM-only draft must not update the framework model. Native editing emits
 // a trusted input event, including when invoked via execCommand('insertText').
 editor.addEventListener('input',event=>{if(event.isTrusted){nativeEdits++;model=editor.innerText;}});
-editor.addEventListener('keyup',()=>{
+editor.addEventListener('keyup',event=>{
+  // Reproduce the remaining bug: synthetic keyup/execCommand alone cannot
+  // activate Send. The user reports that a real space key activates it.
+  if(!event.isTrusted || !['Space','Backspace'].includes(event.code))return;
+  window.lastTrustedKey=event.code;
   const enabled=!!model.trim();send.setAttribute('aria-disabled',String(!enabled));send.classList.toggle('disabled',!enabled);
 });
 send.onclick=()=>{

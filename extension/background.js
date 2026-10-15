@@ -2,12 +2,14 @@ import {migrateState, validateSettings, classify, parseList, dueJob, eligibility
 import './rules-shared.js';
 import './routes-1688-shared.js';
 import './supplier-chat.js';
+import {activate1688} from './lib/native-input.js';
 const {makeRule,mergeRule}=globalThis.OpenLinksRules;
 const routes1688=globalThis.OpenLinks1688;
 const supplierChat=globalThis.OpenLinksSupplierChat;
 
 const KEY = 'openlinksState';
 const CHAT_LOAD_MS = 30000;
+const CLOSE_PREFIX='openlinks-close:';
 let serial = Promise.resolve();
 const exclusive = task => {
   const result = serial.then(task);
@@ -53,6 +55,72 @@ async function call(job, frameId, type, extra = {}) {
   return chrome.tabs.sendMessage(job.tabId, {
     type, jobId:job.id, message:job.message, profile:job.profile, ...extra,
   }, {frameId});
+}
+async function prepareChat(state,job) {
+  const reply=await call(job,job.frameId,'PREPARE');
+  if(job.platform!=='1688' || !reply?.needsNativeInput)return reply;
+  event(state,'editor_input',job,'1688: фокусирую редактор, ввожу пробел настоящими событиями Chrome и удаляю его Backspace. Enter не нажимается.');
+  await save(state);
+  try {
+    await activate1688({...job,inputUrl:reply.pageUrl},call);
+    await new Promise(resolve=>setTimeout(resolve,350));
+    const ready=await call(job,job.frameId,'PREPARE');
+    if(ready.needsNativeInput)throw new Error('Редактор не сохранил результат ввода клавиш');
+    return ready;
+  } catch(error) {
+    return {ok:false,nativeInputError:true,reason:'Не удалось активировать редактор 1688: '+error.message+'. Проверьте разрешение debugger, закройте DevTools этой вкладки и нажмите «Проверить снова». Отправка не выполнялась.'};
+  }
+}
+async function prepareFailed(state,job,reply) {
+  if(reply?.nativeInputError){halt(state,job,reply.reason);await save(state);}
+  else await askForHelp(state,job,reply?.reason || 'Редактор или кнопка изменились','send');
+}
+async function scheduleClose(state,job) {
+  if(job.needsTabCheck || !Number.isInteger(job.tabId) || !Number.isInteger(job.frameId) || !job.reviewUrl)return;
+  try {
+    const tab=await chrome.tabs.get(job.tabId);
+    if(classify(tab.url).platform!==job.platform || tab.pendingUrl)return;
+    const closing={token:crypto.randomUUID(),jobId:job.id,tabId:job.tabId,frameId:job.frameId,pageUrl:job.reviewUrl,topUrl:tab.url,url:job.url,at:job.finishedAt+10000};
+    state.pendingClosures ||= [];
+    state.pendingClosures=state.pendingClosures.filter(item=>item.tabId!==job.tabId);
+    state.pendingClosures.push(closing);await save(state);
+    await chrome.alarms.create(CLOSE_PREFIX+closing.token,{when:closing.at});
+    if(job.frameId!==0) {
+      const top=await call(job,0,'ARM_CLOSE',{token:closing.token,expectedUrl:closing.topUrl,at:closing.at,guardOnly:true});
+      if(!top?.ok)throw new Error('Основная страница изменилась');
+    }
+    const armed=await call(job,job.frameId,'ARM_CLOSE',{token:closing.token,expectedUrl:closing.pageUrl,at:closing.at});
+    if(!armed?.ok)throw new Error('Страница чата изменилась');
+    event(state,'chat_close_scheduled',job,'Вкладка чата закроется через 10 секунд. Очередь может продолжать работу.');
+  } catch(error) {
+    state.pendingClosures=(state.pendingClosures || []).filter(item=>item.jobId!==job.id);
+    event(state,'chat_close_cancelled',job,'Не удалось назначить закрытие: '+error.message,'observation');
+  }
+  await save(state);
+}
+async function closeChat(token,sender) {
+  const state=await load(),closing=state.pendingClosures?.find(item=>item.token===token);
+  if(!closing)return {ok:false};
+  if(sender && (sender.tab?.id!==closing.tabId || sender.frameId!==closing.frameId || sender.url!==closing.pageUrl))return {ok:false};
+  if(Date.now()<closing.at){await chrome.alarms.create(CLOSE_PREFIX+token,{when:closing.at});return {ok:false};}
+  const job=state.queue.find(item=>item.id===closing.jobId) || {id:closing.jobId,url:closing.url};
+  state.pendingClosures=state.pendingClosures.filter(item=>item.token!==token);
+  // Consume before closing: duplicate alarms/messages cannot close a reused tab.
+  await save(state);
+  try {
+    if(state.queue.some(item=>item.tabId===closing.tabId && !FINAL.has(item.status)))throw new Error('Вкладка используется другой задачей');
+    const tab=await chrome.tabs.get(closing.tabId);
+    if(tab.url!==closing.topUrl || tab.pendingUrl)throw new Error('Адрес вкладки изменился');
+    const ready=await chrome.tabs.sendMessage(closing.tabId,{type:'CAN_CLOSE',token},{frameId:closing.frameId});
+    if(!ready?.ok)throw new Error('Чат изменился или вы продолжили работу в нём');
+    if(closing.frameId!==0) {
+      const top=await chrome.tabs.sendMessage(closing.tabId,{type:'CAN_CLOSE',token},{frameId:0});
+      if(!top?.ok)throw new Error('Вы продолжили работу на основной странице');
+    }
+    await chrome.tabs.remove(closing.tabId);
+    event(state,'chat_closed',job,'Прошло 10 секунд после отправки; вкладка чата закрыта.');
+  } catch(error) {event(state,'chat_close_cancelled',job,'Вкладка оставлена открытой: '+error.message,'observation');}
+  await save(state);return {ok:true};
 }
 async function probe(job) {
   const results = await Promise.all((await frames(job)).map(async frame => {
@@ -146,7 +214,7 @@ async function finish(state, job, status, detail) {
   state.activeId = null;
   state.waiting = null;
   await save(state);
-  // Do not close the conversation. It can contain a reply or a manually completed form.
+  if(['attempted','sent'].includes(status))await scheduleClose(state,job);
   if (state.running) await alarm(Date.now()+1000);
 }
 async function interruptedSend(state,job,detail) {
@@ -171,8 +239,8 @@ async function performSend(state, job) {
     return;
   }
   state.waiting = null;
-  const reply = await call(job, job.frameId, 'PREPARE');
-  if(!reply.ok){await askForHelp(state,job,reply.reason || 'Редактор или кнопка изменились','send');return;}
+  const reply = await prepareChat(state,job);
+  if(!reply.ok){await prepareFailed(state,job,reply);return;}
   if (reply.pageUrl !== job.reviewUrl) {
     halt(state, job, reply.reason || 'Страница изменилась. Проверьте получателя и форму заново.');
     await save(state); return;
@@ -339,8 +407,8 @@ async function tick() {
   if (forms.length > 1) { await askForHelp(state,job,'Несколько редакторов в разных фреймах. Укажите нужное поле.','editor'); return; }
   if (forms.length === 1) {
     job.frameId = forms[0].frameId;
-    const reply = await call(job, job.frameId, 'PREPARE');
-    if (!reply.ok) { await askForHelp(state,job,reply.reason,'send'); return; }
+    const reply = await prepareChat(state,job);
+    if (!reply.ok) { await prepareFailed(state,job,reply); return; }
     event(state,'chat_ready',job,`Найдена одна пара «редактор + отправка» внутри области чата, фрейм ${job.frameId}. Форма запроса исключена.`,'decision');
     job.status = 'review'; job.reviewUrl = reply.pageUrl; job.approved = job.manualSend || !state.settings.review;job.manualSend=false;
     job.reason = state.settings.review ? 'Проверьте получателя и текст, затем подтвердите отправку.' : '';
@@ -403,6 +471,7 @@ async function safeTick() {
   }
 }
 async function dispatch(message, sender) {
+  if(message.type==='CHAT_CLOSE_DUE')return closeChat(message.token,sender);
   if(message.type==='CHAT_OPEN_EVENT') {
     const state=await load(),job=state.queue.find(item=>item.id===state.activeId),opening=job?.chatOpening;
     if(!job || !supplierChat.supports(job.platform) || !state.running || job.status!=='contacting' || job.chatOpened ||
@@ -582,7 +651,10 @@ chrome.runtime.onMessage.addListener((message,sender,respond) => {
   exclusive(()=>dispatch(message,sender)).then(respond,error=>respond({ok:false,error:error.message}));
   return true;
 });
-chrome.alarms.onAlarm.addListener(item=>{ if(item.name==='openlinks-tick') exclusive(safeTick); });
+chrome.alarms.onAlarm.addListener(item=>{
+  if(item.name==='openlinks-tick')exclusive(safeTick);
+  else if(item.name.startsWith(CLOSE_PREFIX))exclusive(()=>closeChat(item.name.slice(CLOSE_PREFIX.length)));
+});
 function rememberChat(state,job,url,source='вкладка открытого чата') {
   if(job.platform!=='1688')return false;
   const key=routes1688.storeKey(job.url),safe=routes1688.route(url);if(!key || !safe)return false;
@@ -700,6 +772,8 @@ chrome.webNavigation.onCreatedNavigationTarget.addListener(details=>exclusive(as
 }));
 chrome.runtime.onStartup.addListener(()=>exclusive(async()=>{
   const state=await load();
+  // Tab IDs may be reused after a browser restart. Old closure timers lose authority.
+  if(state.pendingClosures?.length){state.pendingClosures=[];await save(state);}
   const deferred=state.queue.filter(job=>job.status==='deferred_send');
   for(const job of deferred){job.approved=false;job.needsTabCheck=true;}
   // Existing tab IDs and account state cannot be assumed to survive a browser restart.
@@ -714,6 +788,7 @@ chrome.runtime.onStartup.addListener(()=>exclusive(async()=>{
 }));
 chrome.runtime.onInstalled.addListener((details={})=>exclusive(async()=>{
   const state=await load();
+  state.pendingClosures=[];
   if(details.reason==='update') {
     state.settings.review=true;
     for(const deferred of state.queue.filter(item=>item.status==='deferred_send')){deferred.approved=false;deferred.needsTabCheck=true;}

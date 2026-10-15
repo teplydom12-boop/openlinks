@@ -4,30 +4,115 @@ import {readFileSync} from 'node:fs';
 import {initialState} from '../extension/lib/core.js';
 const listener=()=>{const list=[];return {list,addListener(fn){list.push(fn);}};};
 let stored,clicks,contactClicks,commands,requests,beforeClick,probeKind,sendResult,frameUrl,tabCount,opened,missing,obstacle,prepareOk,lookupPages,fetches,probeRoute,updated,probeKey,listedTabs,frameList,tabReplies,frameProbes,deliveries;
+let scheduled,removed,canClose,nativeRequired,debuggerFailure,debuggerCalls;
 const metadataFixture=readFileSync(new URL('./fixtures/1688-metadata.html',import.meta.url),'utf8');
 globalThis.fetch=async(url,options)=>{fetches.push({url,credentials:options.credentials});const html=lookupPages.get(url);if(html===undefined)throw new Error('No local metadata fixture');return new Response(html,{headers:{'content-type':'text/html'}});};
 const runtime={onMessage:listener(),onStartup:listener(),onInstalled:listener(),getURL:path=>'chrome-extension://test/'+path};
-const alarms={onAlarm:listener(),create:async()=>{}};
+const alarms={onAlarm:listener(),create:async(name,options)=>{scheduled.push({name,...options});}};
 globalThis.chrome={runtime,alarms,storage:{local:{get:async()=>({openlinksState:structuredClone(stored)}),set:async data=>{stored=structuredClone(data.openlinksState);}}},
  tabs:{onUpdated:listener(),onCreated:listener(),create:async data=>{opened.push(data.url);return {id:++tabCount};},update:async(id,data)=>{updated.push({id,...data});},query:async()=>structuredClone(listedTabs),get:async id=>tabReplies.get(id) || ({id,url:frameUrl}),
+ remove:async id=>{removed.push(id);},
  sendMessage:async(tab,data,options)=>{
   deliveries.push({tabId:tab,frameId:options.frameId,type:data.type});
   commands.push(data.type);
   requests.push(structuredClone(data));
   if(data.type==='PROBE')return {engine:frameUrl.includes('1688.com')?undefined:'supplier-chat-v2',kind:probeKind,key:probeKey,chatRoute:probeRoute,obstacle:obstacle?.text,canDismiss:obstacle?.dismiss,dismissKey:obstacle?.key,reason:probeKind==='inquiry'?'Форма запроса, нужен чат':undefined,...frameProbes.get(options.frameId)};
-  if(data.type==='PREPARE')return {ok:prepareOk,pageUrl:frameList?.find(frame=>frame.frameId===options.frameId)?.url || frameUrl,reason:prepareOk?undefined:'Редактор изменился'};
+  if(data.type==='PREPARE')return {ok:prepareOk && !nativeRequired,needsNativeInput:nativeRequired,pageUrl:frameList?.find(frame=>frame.frameId===options.frameId)?.url || frameUrl,reason:prepareOk?undefined:'Редактор изменился'};
+  if(data.type==='NATIVE_INPUT' && data.stage==='done')nativeRequired=false;
+  if(data.type==='CAN_CLOSE')return {ok:canClose};
   if(data.type==='SEND'){clicks++;beforeClick=structuredClone(stored);if(sendResult==='disconnect')throw new Error('Disconnected');if(sendResult==='malformed')return {ok:false};return {clicked:sendResult!==false,accepted:sendResult===true,reason:'Кнопка изменилась'};}
   if(data.type==='CONTACT'){contactClicks++;return {ok:true,key:probeKey};}
   if(data.type==='DISMISS_CHALLENGE'){if(obstacle?.stuck)return {clicked:true,closed:false};obstacle=null;return {clicked:true,closed:true};}
   return {ok:true};
  }},webNavigation:{onCreatedNavigationTarget:listener(),getAllFrames:async()=>{if(missing)throw new Error('No tab');return frameList || [{frameId:0,url:frameUrl}];}},action:{onClicked:listener()},windows:{}};
 await import('../extension/background.js');
+chrome.debugger={
+ attach:async target=>{debuggerCalls.push({type:'attach',target});if(debuggerFailure)throw new Error(debuggerFailure);},
+ detach:async target=>{debuggerCalls.push({type:'detach',target});},
+ sendCommand:async(target,method,params)=>{debuggerCalls.push({target,method,params});},
+};
 const ui={id:'test',url:'chrome-extension://test/dashboard.html'};
 const message=(type,extra={},sender=ui)=>new Promise(resolve=>runtime.onMessage.list[0]({type,...extra},sender,resolve));
 async function tick(){alarms.onAlarm.list[0]({name:'openlinks-tick'});await message('GET');}
-function reset(){stored=initialState();stored.settings.message='Hello';clicks=0;contactClicks=0;commands=[];requests=[];beforeClick=null;probeKind='chat';sendResult=true;frameUrl='https://a.en.alibaba.com/chat';tabCount=0;opened=[];missing=false;obstacle=null;prepareOk=true;lookupPages=new Map();fetches=[];probeRoute=null;updated=[];probeKey='#contact';listedTabs=[];frameList=null;tabReplies=new Map();frameProbes=new Map();deliveries=[];}
+function reset(){stored=initialState();stored.settings.message='Hello';clicks=0;contactClicks=0;commands=[];requests=[];beforeClick=null;probeKind='chat';sendResult=true;frameUrl='https://a.en.alibaba.com/chat';tabCount=0;opened=[];missing=false;obstacle=null;prepareOk=true;lookupPages=new Map();fetches=[];probeRoute=null;updated=[];probeKey='#contact';listedTabs=[];frameList=null;tabReplies=new Map();frameProbes=new Map();deliveries=[];scheduled=[];removed=[];canClose=true;nativeRequired=false;debuggerFailure=null;debuggerCalls=[];}
 async function review(url='https://a.en.alibaba.com/'){await message('IMPORT',{text:url});await message('START');await tick();await tick();}
 async function openingTimedOut(){stored.queue[0].chatOpening.at=Date.now()-21000;await tick();}
+
+async function fireClose(token){alarms.onAlarm.list[0]({name:'openlinks-close:'+token});await message('GET');}
+test('completed send schedules closure for 10 seconds later without delaying another platform',async t=>{
+ reset();await review();await message('IMPORT',{text:'https://b.1688.com/'});await message('APPROVE');await tick();
+ const closing=stored.pendingClosures[0],job=stored.queue[0];
+ assert.equal(closing.at-job.finishedAt,10000);assert.equal(removed.length,0);
+ assert.ok(scheduled.some(alarm=>alarm.name==='openlinks-close:'+closing.token && alarm.when===closing.at));
+ await fireClose(closing.token);assert.equal(removed.length,0);
+ await tick();assert.equal(stored.activeId,stored.queue[1].id);assert.equal(opened.length,2);
+ t.mock.method(Date,'now',()=>closing.at);
+ await fireClose(closing.token);assert.deepEqual(removed,[job.tabId]);assert.equal(stored.activeId,stored.queue[1].id);
+ await fireClose(closing.token);assert.equal(removed.length,1);assert.equal(clicks,1);
+});
+test('document timer wakes worker while paused; wrong frame or token cannot close a tab',async t=>{
+ reset();await review();await message('APPROVE');await tick();await message('PAUSE');
+ const closing=stored.pendingClosures[0],sender={tab:{id:closing.tabId},frameId:closing.frameId,url:closing.pageUrl};
+ t.mock.method(Date,'now',()=>closing.at);
+ assert.equal((await message('CHAT_CLOSE_DUE',{token:closing.token},{...sender,frameId:99})).ok,false);
+ assert.equal((await message('CHAT_CLOSE_DUE',{token:'wrong'},sender)).ok,false);
+ assert.equal(removed.length,0);
+ await message('CHAT_CLOSE_DUE',{token:closing.token},sender);assert.deepEqual(removed,[closing.tabId]);
+});
+test('navigation, user edits and reuse by an unfinished task all cancel closure',async t=>{
+ for(const reason of ['navigation','user','reuse']) {
+  reset();await review();await message('APPROVE');await tick();const closing=stored.pendingClosures[0];
+  if(reason==='navigation')tabReplies.set(closing.tabId,{id:closing.tabId,url:'https://a.en.alibaba.com/another'});
+  if(reason==='user')canClose=false;
+  if(reason==='reuse')stored.queue.push({id:'another',tabId:closing.tabId,status:'review'});
+  const mock=t.mock.method(Date,'now',()=>closing.at);
+  await fireClose(closing.token);assert.equal(removed.length,0,reason);assert.equal(stored.pendingClosures.length,0);
+  assert.ok(stored.events.some(e=>e.type==='chat_close_cancelled'));mock.mock.restore();
+ }
+});
+test('browser restart drops close authority; queue deletion alone preserves scheduled closure',async t=>{
+ reset();await review();await message('APPROVE');await tick();let closing=stored.pendingClosures[0];
+ await message('REMOVE_JOB',{id:closing.jobId});assert.equal(stored.queue.length,0);
+ const mock=t.mock.method(Date,'now',()=>closing.at);await fireClose(closing.token);assert.deepEqual(removed,[closing.tabId]);mock.mock.restore();
+ reset();await review();await message('APPROVE');await tick();closing=stored.pendingClosures[0];
+ runtime.onStartup.list[0]();await message('GET');assert.equal(stored.pendingClosures.length,0);
+ t.mock.method(Date,'now',()=>closing.at);await fireClose(closing.token);assert.equal(removed.length,0);
+});
+test('unsent draft, skipped supplier and uncertain 1688 click leave their tabs open',async()=>{
+ reset();await review();assert.equal(stored.pendingClosures?.length || 0,0);
+ await message('SKIP',{id:stored.activeId});assert.equal(stored.pendingClosures?.length || 0,0);
+ reset();frameUrl='https://a.1688.com/chat';sendResult='unaccepted';await review('https://a.1688.com/');await message('APPROVE');await tick();
+ assert.equal(stored.queue[0].status,'uncertain');assert.equal(stored.pendingClosures?.length || 0,0);assert.equal(removed.length,0);
+ await message('MARK_SENT');assert.equal(stored.pendingClosures.length,1);
+});
+test('1688 activates the selected frame before reserving send quota and does not repeat keyboard input after approval',async()=>{
+ reset();frameUrl='https://a.1688.com/chat';nativeRequired=true;await review('https://a.1688.com/');
+ assert.equal(stored.queue[0].status,'review');assert.equal(clicks,0);assert.equal(stored.slots.filter(s=>s.kind==='send').length,0);
+ assert.equal(debuggerCalls[0].type,'attach');assert.equal(debuggerCalls.at(-1).type,'detach');
+ const inputCalls=debuggerCalls.length;
+ assert.deepEqual(requests.filter(r=>r.type==='NATIVE_INPUT').map(r=>r.stage),['focus','before','space','done']);
+ await message('APPROVE');await tick();assert.equal(clicks,1);assert.equal(debuggerCalls.length,inputCalls);
+});
+test('debugger attach failure pauses without clicking, reserving quota or teaching the wrong button',async()=>{
+ reset();frameUrl='https://a.1688.com/chat';nativeRequired=true;debuggerFailure='Another debugger is already attached';await review('https://a.1688.com/');
+ assert.equal(stored.running,false);assert.equal(stored.queue[0].status,'blocked');assert.match(stored.queue[0].reason,/DevTools/);
+ assert.equal(clicks,0);assert.equal(stored.learning,null);assert.equal(stored.slots.filter(s=>s.kind==='send').length,0);
+ assert.equal(debuggerCalls.length,1);
+});
+test('embedded chat closure guards both the frame and its containing document',async t=>{
+ reset();frameList=[{frameId:0,url:frameUrl},{frameId:6,parentFrameId:0,url:'https://message.alibaba.com/chat'}];
+ frameProbes.set(0,{kind:'waiting',opened:true,frames:[{url:frameList[1].url,visible:true}]});
+ await review();await message('APPROVE');await tick();const closing=stored.pendingClosures[0];
+ assert.equal(closing.frameId,6);
+ assert.deepEqual(deliveries.filter(d=>d.type==='ARM_CLOSE').map(d=>d.frameId),[0,6]);
+ t.mock.method(Date,'now',()=>closing.at);await fireClose(closing.token);
+ assert.deepEqual(deliveries.filter(d=>d.type==='CAN_CLOSE').map(d=>d.frameId),[6,0]);assert.deepEqual(removed,[closing.tabId]);
+});
+test('manual confirmation after restart cannot authorize closing an unverified old tab ID',async()=>{
+ reset();frameUrl='https://a.1688.com/chat';sendResult='unaccepted';await review('https://a.1688.com/');await message('APPROVE');await tick();
+ runtime.onStartup.list[0]();await message('GET');assert.equal(stored.queue[0].needsTabCheck,true);
+ await message('MARK_SENT');assert.equal(stored.queue[0].status,'sent');assert.equal(stored.pendingClosures?.length || 0,0);
+});
 
 test('click is persisted before side effect; completion does not wait for success or read receipt',async()=>{
  reset();await review();assert.equal(clicks,0);await message('APPROVE');await tick();

@@ -1,9 +1,9 @@
 {
   "manifest_version": 3,
   "name": "OpenLinks — поставщики",
-  "version": "0.7.0",
+  "version": "0.8.0",
   "description": "Очередь обращений к поставщикам, ограничения частоты, подтверждение отправки и журнал.",
-  "permissions": ["storage", "alarms", "webNavigation"],
+  "permissions": ["storage", "alarms", "webNavigation", "debugger"],
   "host_permissions": ["https://*.1688.com/*", "https://*.alibaba.com/*", "https://*.made-in-china.com/*"],
   "background": {"service_worker": "background.js", "type": "module"},
   "action": {"default_title": "Открыть OpenLinks"},
