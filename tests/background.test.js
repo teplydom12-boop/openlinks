@@ -84,9 +84,9 @@ test('browser restart drops close authority; queue deletion alone preserves sche
  runtime.onStartup.list[0]();await message('GET');assert.equal(stored.pendingClosures.length,0);
  t.mock.method(Date,'now',()=>closing.at);await fireClose(closing.token);assert.equal(removed.length,0);
 });
-test('unsent draft, skipped supplier and uncertain 1688 click leave their tabs open',async()=>{
+test('draft stays open until explicitly skipped; unknown 1688 click does not auto-close',async()=>{
  reset();await review();assert.equal(stored.pendingClosures?.length || 0,0);
- await message('SKIP',{id:stored.activeId});assert.equal(stored.pendingClosures?.length || 0,0);
+ await message('SKIP',{id:stored.activeId});assert.equal(stored.pendingClosures?.length || 0,0);assert.deepEqual(removed,[1]);
  reset();frameUrl='https://a.1688.com/chat';sendResult='unaccepted';await review('https://a.1688.com/');await message('APPROVE');await tick();
  assert.equal(stored.queue[0].status,'attempt_unknown');assert.equal(stored.pendingClosures?.length || 0,0);assert.equal(removed.length,0);
  legacyUncertain();await message('MARK_SENT');assert.equal(stored.pendingClosures.length,1);
@@ -610,4 +610,80 @@ test('browser restart discards remembered approval from a retry even after bindi
  reset();await review();prepareOk=false;await message('APPROVE');await tick();assert.equal(stored.queue[0].retryApprovedUrl,frameUrl);
  runtime.onStartup.list[0]();await message('GET');assert.equal(stored.queue[0].retryApprovedUrl,undefined);
  prepareOk=true;await message('BIND_TAB',{tabId:1});await tick();assert.equal(stored.queue[0].status,'review');assert.equal(stored.queue[0].approved,false);assert.equal(clicks,0);
+});
+
+test('manual skip closes an opened supplier immediately once, preserves quotas and continues the queue',async()=>{
+ reset();await review();await message('IMPORT',{text:'https://next.1688.com/'});
+ const id=stored.activeId,slots=structuredClone(stored.slots);
+ assert.equal((await message('SKIP',{id})).ok,true);assert.deepEqual(removed,[1]);assert.equal(clicks,0);
+ assert.equal(stored.queue[0].status,'skipped');assert.equal(stored.activeId,null);assert.deepEqual(stored.slots,slots);
+ assert.ok(stored.events.some(e=>e.type==='skip_tab_closed' && e.jobId===id));
+ assert.equal((await message('SKIP',{id})).ok,false);assert.deepEqual(removed,[1]);
+ await tick();assert.equal(opened.at(-1),'https://next.1688.com/');
+});
+test('skipping a pending unvisited link opens and closes nothing, clearing its quota wait',async()=>{
+ reset();await message('IMPORT',{text:'https://a.en.alibaba.com/'});
+ const id=stored.queue[0].id;stored.waiting={jobId:id,until:Date.now()+60000};
+ assert.equal((await message('SKIP',{id})).ok,true);assert.deepEqual(removed,[]);assert.deepEqual(opened,[]);
+ assert.equal(stored.waiting,null);assert.equal(stored.queue[0].status,'skipped');assert.ok(stored.queue[0].finishedAt);
+});
+test('manual skip closes both the original storefront and its separately adopted messenger for every platform',async()=>{
+ for(const [store,chat] of [
+  ['https://current.1688.com/',messenger1688],
+  ['https://shop.en.alibaba.com/','https://onetalk.alibaba.com/message/weblite.htm?shop=one'],
+  ['https://shop.en.made-in-china.com/','https://webim.made-in-china.com/super-tm/?shop=one'],
+ ]) {
+  reset();frameUrl=store;probeKind='waiting';await review(store);
+  chrome.tabs.onCreated.list[0]({id:20,openerTabId:1,url:chat});await message('GET');
+  assert.equal(stored.queue[0].tabId,20);assert.equal(stored.queue[0].chatTabUrl,chat);
+  tabReplies.set(1,{id:1,url:store});tabReplies.set(20,{id:20,url:chat});
+  const id=stored.activeId;await message('SKIP',{id});assert.deepEqual(removed,[20,1]);assert.equal(clicks,0);
+  assert.equal(stored.events.filter(e=>e.type==='skip_tab_closed' && e.jobId===id).length,2);
+ }
+});
+test('manual skip closes a cached direct 1688 chat without requiring a storefront visit',async()=>{
+ reset();const store='https://current.1688.com/';stored.chatRoutes[store]={url:messenger1688};frameUrl=messenger1688;
+ await review(store);await message('SKIP',{id:stored.activeId});assert.deepEqual(removed,[1]);assert.deepEqual(opened,[globalThis.OpenLinks1688.route(messenger1688)]);
+});
+test('skipping a quota-deferred chat closes only that job and leaves the active supplier running',async()=>{
+ reset();await review();const old=stored.queue[0];old.status='deferred_send';stored.activeId=null;
+ stored.slots.push(...[0,1,2].map(i=>({platform:'alibaba',kind:'send',at:Date.now()-1000+i})));
+ await message('IMPORT',{text:'https://next.1688.com/'});await tick();const currentId=stored.activeId;
+ tabReplies.set(old.tabId,{id:old.tabId,url:'https://a.en.alibaba.com/chat'});
+ assert.equal((await message('SKIP',{id:old.id})).ok,true);assert.deepEqual(removed,[old.tabId]);
+ assert.equal(stored.activeId,currentId);assert.equal(stored.running,true);assert.equal(stored.queue[1].status,'visiting');
+});
+test('skip does not close a navigated, reused or unverified tab, but still records the skipped job',async()=>{
+ for(const mode of ['navigation','pending-navigation','reused','restart']) {
+  reset();await review();const id=stored.activeId;
+  if(mode==='navigation')tabReplies.set(1,{id:1,url:'https://other.en.alibaba.com/'});
+  if(mode==='pending-navigation')tabReplies.set(1,{id:1,url:frameUrl,pendingUrl:'https://example.org/'});
+  if(mode==='reused')stored.queue.push({id:'other',url:'https://other.en.alibaba.com/',platform:'alibaba',status:'deferred_send',supplierTabId:1});
+  if(mode==='restart'){runtime.onStartup.list[0]();await message('GET');}
+  assert.equal((await message('SKIP',{id})).ok,true);assert.deepEqual(removed,[],mode);assert.equal(stored.queue[0].status,'skipped');
+  assert.ok(stored.events.some(e=>e.type==='skip_tab_kept' && e.jobId===id),mode);
+ }
+});
+test('rebinding after restart only authorizes closure of the newly selected tab, not the stale source tab',async()=>{
+ reset();await review();runtime.onStartup.list[0]();await message('GET');
+ tabReplies.set(7,{id:7,url:frameUrl});await message('BIND_TAB',{tabId:7});
+ assert.equal(stored.queue[0].supplierTabId,undefined);await message('SKIP',{id:stored.activeId});assert.deepEqual(removed,[7]);
+});
+test('a loading storefront can be skipped before its first document commits',async()=>{
+ reset();await message('IMPORT',{text:'https://a.en.alibaba.com/'});await message('START');await tick();
+ tabReplies.set(1,{id:1,url:'about:blank',pendingUrl:'https://a.en.alibaba.com/'});
+ await message('SKIP',{id:stored.activeId});assert.deepEqual(removed,[1]);
+});
+test('a missing tab or close failure cannot block skip or continuation',async t=>{
+ for(const stage of ['get','remove']) {
+  reset();await review();await message('IMPORT',{text:'https://next.1688.com/'});
+  const id=stored.activeId,mock=t.mock.method(chrome.tabs,stage,async()=>{throw new Error('Tab already closed')});
+  assert.equal((await message('SKIP',{id})).ok,true);assert.equal(stored.queue[0].status,'skipped');assert.equal(stored.running,true);
+  assert.ok(stored.events.some(e=>e.type==='skip_tab_kept'));mock.mock.restore();
+  await tick();assert.equal(opened.at(-1),'https://next.1688.com/');
+ }
+});
+test('skip cannot interrupt a started send or change automatic error-skip tab behavior',async()=>{
+ reset();await review();stored.queue[0].status='sending';assert.equal((await message('SKIP',{id:stored.activeId})).ok,false);assert.deepEqual(removed,[]);
+ reset();prepareOk=false;await review();await retryDue();await retryDue();assert.equal(stored.queue[0].status,'failed');assert.deepEqual(removed,[]);
 });

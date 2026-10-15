@@ -161,6 +161,40 @@ async function closeChat(token,sender) {
   } catch(error) {event(state,'chat_close_cancelled',job,'Вкладка оставлена открытой: '+error.message,'observation');}
   await save(state);return {ok:true};
 }
+async function closeSkippedTabs(state,job) {
+  const tabIds=[...new Set([job.tabId,job.supplierTabId].filter(Number.isInteger))];
+  state.pendingClosures=(state.pendingClosures || []).filter(item=>item.jobId!==job.id);
+  await save(state);
+  for(const tabId of tabIds) {
+    try {
+      if(job.needsTabCheck)throw new Error('После перезапуска вкладка ещё не привязана заново');
+      if(state.queue.some(item=>item.id!==job.id && !FINAL.has(item.status) && [item.tabId,item.supplierTabId].includes(tabId)))
+        throw new Error('Вкладка используется другой задачей');
+      const tab=await chrome.tabs.get(tabId);
+      const matches=url=>{
+        try {
+          if(classify(url).platform!==job.platform)return false;
+          const storefront=!routes1688.isMessenger(job.url) && !supplierChat.isMessenger(job.url,job.platform);
+          if(storefront && new URL(url).origin===new URL(job.url).origin)return true;
+          const known=job.platform==='1688' && routes1688.cached(state.chatRoutes,job.url);
+          if(known && routes1688.route(url)===known)return true;
+          if(tabId!==job.tabId)return false;
+          if([job.url,job.chatTabUrl,job.boundTabUrl,job.frameId===0?job.reviewUrl:null].includes(url))return true;
+          // Jobs saved before 0.9.1 already own this tab ID but have no top URL.
+          return !job.chatTabUrl && !job.boundTabUrl && supplierChat.isMessenger(url,job.platform);
+        } catch {return false;}
+      };
+      if((tab.url && tab.url!=='about:blank' && !matches(tab.url)) ||
+        (tab.pendingUrl && !matches(tab.pendingUrl)) || (!matches(tab.url) && !matches(tab.pendingUrl)))
+        throw new Error('Вкладка больше не открыта на странице этого поставщика');
+      await chrome.tabs.remove(tabId);
+      event(state,'skip_tab_closed',job,`Пропущено пользователем; вкладка ${tabId} закрыта сразу.`);
+    } catch(error) {
+      event(state,'skip_tab_kept',job,`Пропуск сохранён; вкладка ${tabId} не закрыта: ${error.message}`,'observation');
+    }
+  }
+  await save(state);
+}
 async function probe(job) {
   const results = await Promise.all((await frames(job)).map(async frame => {
     try { return {...await call(job, frame.frameId, 'PROBE'), frameId:frame.frameId,parentFrameId:frame.parentFrameId ?? 0,pageUrl:frame.url}; }
@@ -654,7 +688,9 @@ async function dispatch(message, sender) {
       if(!job || job.status==='sending' || FINAL.has(job.status))throw new Error('Нет задачи для привязки');
       const tab=await chrome.tabs.get(Number(message.tabId));
       if(classify(tab.url).platform!==job.platform)throw new Error('Вкладка другой площадки');
+      if(job.needsTabCheck && job.supplierTabId!==tab.id)delete job.supplierTabId;
       await stopLearning(state,job);job.tabId=tab.id;
+      job.boundTabUrl=tab.url;
       if(supplierChat.supports(job.platform)){delete job.chatOpening;job.chatOpened=false;}
       if(job.status!=='uncertain'){job.status='contacting';job.stepAt=Date.now();job.reason='';state.running=true;}
       delete job.needsTabCheck;
@@ -675,7 +711,13 @@ async function dispatch(message, sender) {
       if (!target || FINAL.has(target.status)) throw new Error('Нечего пропускать');
       if (target.status==='sending') throw new Error('Дождитесь проверки уже начатой отправки');
       if (target.id===state.activeId) await finish(state,target,'skipped','Пропущено пользователем');
-      else { target.status='skipped'; event(state,'skipped',target,'Пропущено пользователем'); await save(state); }
+      else {
+        await stopOpening(target);target.status='skipped';target.finishedAt=Date.now();target.reason='Пропущено пользователем';
+        if(state.waiting?.jobId===target.id)state.waiting=null;
+        event(state,'skipped',target,target.reason);await save(state);
+      }
+      await closeSkippedTabs(state,target);
+      if(state.running)await alarm(Date.now()+1000);
       return {ok:true};
     }
     case 'REMOVE_JOB': {
@@ -765,6 +807,7 @@ async function adoptChatTab(state,tab,allowKnownRecipient=false) {
     if(before!==state.chatRoutes[routes1688.storeKey(job.url)]?.url)await save(state);
     if(routes1688.isMessenger(tab.pendingUrl || tab.url))await note1688Chat(state,job);
     if(supplierChat.supports(job.platform) && supplierChat.isMessenger(tab.pendingUrl || tab.url,job.platform) && (state.running || watchingSupplierChat(state,job))) {
+      job.chatTabUrl=tab.pendingUrl || tab.url;
       job.chatOpened=true;
       if(watchingSupplierChat(state,job))await resumeChatDiscovery(state,job,'Открылась страница мессенджера. Перехожу к редактору.');
       await stopOpening(job);await save(state);
@@ -795,7 +838,7 @@ async function adoptChatTab(state,tab,allowKnownRecipient=false) {
       else await stopLearning(state,job);
       job.chatOpened=true;if(job.status!=='retry_wait')job.status='contacting';
     }
-    job.tabId=tab.id; job.stepAt=Date.now(); event(state,'chat_tab',job,'Открыта вкладка чата площадки');
+    job.tabId=tab.id;job.chatTabUrl=tab.pendingUrl || tab.url; job.stepAt=Date.now(); event(state,'chat_tab',job,'Открыта вкладка чата площадки');
     if(job.status==='blocked')job.resumeStatus='contacting';
     rememberChat(state,job,tab.pendingUrl || tab.url);
     if(job.platform==='1688')await note1688Chat(state,job);
