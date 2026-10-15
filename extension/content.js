@@ -202,11 +202,21 @@
     let method='native-value';
     if(editor instanceof HTMLTextAreaElement || editor instanceof HTMLInputElement) {
       const proto=editor instanceof HTMLTextAreaElement ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
+      Object.getOwnPropertyDescriptor(proto,'value').set.call(editor,'');
+      editor.dispatchEvent(new InputEvent('input',{bubbles:true,composed:true,inputType:'deleteContentBackward',data:null}));
+      editor.dispatchEvent(new Event('change',{bubbles:true,composed:true}));
       Object.getOwnPropertyDescriptor(proto,'value').set.call(editor,message);
     } else {
       // Native editing updates rich-editor models; textContent alone only paints
       // a draft and can leave 1688's Send button inactive. insertText never parses HTML.
       const selection=getSelection(),range=document.createRange();
+      range.selectNodeContents(editor);selection.removeAllRanges();selection.addRange(range);
+      if(editor.childNodes.length)document.execCommand('delete',false);
+      // Chromium can leave a <br> or formatting wrappers after native deletion.
+      // Clear those too before notifying the editor and inserting the new text.
+      editor.replaceChildren();
+      editor.dispatchEvent(new InputEvent('input',{bubbles:true,composed:true,inputType:'deleteContentBackward',data:null}));
+      editor.dispatchEvent(new Event('change',{bubbles:true,composed:true}));
       range.selectNodeContents(editor);selection.removeAllRanges();selection.addRange(range);
       method='native-insertText';
       if(!document.execCommand('insertText',false,message)) {
@@ -231,21 +241,22 @@
     const found=inspect(request.profile);
     if(found.kind!=='chat') return {ok:false,reason:found.obstacle || found.reason || 'Не найден однозначный редактор внутри чата. Форма запроса не используется.'};
     const current=textOf(found.editor);
-    if(current && current!==draftText(request.message)) return {ok:false,reason:'В поле уже есть другой текст. Расширение не перезаписывает чужой черновик.'};
+    const mustFill=!current || current!==draftText(request.message) || preparedEditors.get(found.editor)?.text!==draftText(request.message) || (site!=='1688' && request.reactivate);
+    const draftReplaced=!!current && !!mustFill,reply=result=>({draftReplaced,...result});
     if(site==='1688' && request.reactivate && preparedEditors.has(found.editor))preparedEditors.get(found.editor).native=false;
     let inputMethod=preparedEditors.get(found.editor)?.method || 'existing-draft';
-    // Repair an equal draft left by an older version, without touching other text.
-    if(!current || (site==='1688' && preparedEditors.get(found.editor)?.text!==draftText(request.message))) {
+    // The user requested replacing existing drafts in the selected chat editor.
+    if(mustFill) {
       inputMethod=fill(found.editor,request.message);await new Promise(resolve=>setTimeout(resolve,350));
     }
     const fresh=inspect(request.profile);
-    if(fresh.kind!=='chat' || fresh.editor!==found.editor) return {ok:false,reason:fresh.reason || fresh.obstacle || 'Интерфейс чата изменился при заполнении'};
-    if(textOf(fresh.editor)!==draftText(request.message)) return {ok:false,reason:'Сайт не принял текст. Проверьте редактор вручную.'};
+    if(fresh.kind!=='chat' || fresh.editor!==found.editor) return reply({ok:false,reason:fresh.reason || fresh.obstacle || 'Интерфейс чата изменился при заполнении'});
+    if(textOf(fresh.editor)!==draftText(request.message)) return reply({ok:false,reason:'Сайт не принял текст. Проверьте редактор вручную.'});
     const reason=validation(fresh.send);
-    if(reason) return {ok:false,reason};
-    if(site==='1688' && !preparedEditors.get(fresh.editor)?.native)return {ok:false,needsNativeInput:true,pageUrl:location.href};
-    if(unavailable(fresh.send)) return {ok:false,reason:'Кнопка отправки недоступна. Проверьте обязательные поля или ограничения сайта.'};
-    return {ok:true,pageUrl:location.href,inputMethod};
+    if(reason) return reply({ok:false,reason});
+    if(site==='1688' && !preparedEditors.get(fresh.editor)?.native)return reply({ok:false,needsNativeInput:true,pageUrl:location.href});
+    if(unavailable(fresh.send)) return reply({ok:false,reason:'Кнопка отправки недоступна. Проверьте обязательные поля или ограничения сайта.'});
+    return reply({ok:true,pageUrl:location.href,inputMethod});
   }
   function effectiveProfile(raw={}) {
     const profile={...raw},seen=new Set(),resolved={};

@@ -1,5 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import {localTimestamp} from '../extension/lib/time.js';
 import {initialState, migrateState, classify, parseList, WINDOW_MS, nextAllowed, makePlan, dueJob, scheduleText, reportText, activityText, validateSettings, linkResults} from '../extension/lib/core.js';
 test('v4 migration upgrades TrustPass learning and keeps an interrupted 1688 send unresolved',()=>{
  const saved=initialState();saved.version=4;saved.activeId='send';saved.running=true;
@@ -143,7 +144,7 @@ test('upgrade retains history and quotas, enables review and pauses old inquiry-
 test('activity log includes observable decisions, wait reasons and their timestamps',()=>{
   const state=initialState();state.events=[{at:1000,type:'wait',level:'wait',url:'https://a.alibaba.com/',detail:'Лимит 3 за 20 минут\nСледующая ссылка не обгоняет'}];
   const log=activityText(state);
-  assert.match(log,/1970-01-01T00:00:01.000Z \[wait\] Ожидание/);assert.match(log,/Лимит 3/);
+  assert.ok(log.includes(localTimestamp(1000)+' [wait] Ожидание'));assert.match(log,/Лимит 3/);
   assert.match(log,/минут Следующая/);
 });
 test('settings cannot bypass hard quotas through zero/invalid intervals',()=>{

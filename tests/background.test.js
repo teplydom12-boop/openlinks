@@ -687,3 +687,17 @@ test('skip cannot interrupt a started send or change automatic error-skip tab be
  reset();await review();stored.queue[0].status='sending';assert.equal((await message('SKIP',{id:stored.activeId})).ok,false);assert.deepEqual(removed,[]);
  reset();prepareOk=false;await review();await retryDue();await retryDue();assert.equal(stored.queue[0].status,'failed');assert.deepEqual(removed,[]);
 });
+
+test('draft replacement is logged before native activation without storing the old draft',async t=>{
+ reset();frameUrl='https://air.1688.com/chat';nativeRequired=true;
+ const original=chrome.tabs.sendMessage;let first=true;
+ t.mock.method(chrome.tabs,'sendMessage',async(tab,data,options)=>{
+  const reply=await original(tab,data,options);
+  if(data.type==='PREPARE' && first){first=false;return {...reply,draftReplaced:true};}return reply;
+ });
+ await review('https://shop.1688.com/');
+ assert.equal(stored.queue[0].status,'review');assert.equal(clicks,0);
+ const replacement=stored.events.filter(e=>e.type==='draft_replaced');assert.equal(replacement.length,1);
+ assert.match(replacement[0].detail,/очищен/);assert.equal(replacement[0].jobId,stored.activeId);
+ assert.ok(stored.events.findIndex(e=>e.type==='draft_replaced')<stored.events.findIndex(e=>e.type==='editor_input'));
+});

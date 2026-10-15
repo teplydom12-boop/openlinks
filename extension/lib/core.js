@@ -1,4 +1,5 @@
 import '../rules-shared.js';
+import {localTimestamp,timeZone} from './time.js';
 const {upgradeRule}=globalThis.OpenLinksRules;
 export const WINDOW_MS = 20 * 60 * 1000;
 export const PLATFORMS = {
@@ -166,11 +167,11 @@ export function parseList(text, existing = [], now = Date.now()) {
   });
   return {jobs, errors};
 }
-const iso = time => time ? new Date(time).toISOString() : '—';
+const iso = localTimestamp;
 const clean = text => String(text ?? '').replace(/[\r\n\t]/g, ' ');
 export function scheduleText(state, now = Date.now()) {
   const plan = makePlan(state, now);
-  return '# OpenLinks — schedule.txt\n# Время UTC (ISO 8601). Для ожидающих задач — оценка; ручные паузы сдвигают расписание.\n' +
+  return `# OpenLinks — schedule.txt\n# Местное время компьютера: ${timeZone()} (ISO 8601 со смещением UTC). Для ожидающих задач — оценка; ручные паузы сдвигают расписание.\n` +
     '# время\tплощадка\tстатус\tURL\n' +
     plan.map(j => [iso(j.plannedAt), PLATFORMS[j.platform].label, j.status, j.url].join('\t')).join('\n') + '\n';
 }
@@ -197,7 +198,7 @@ export function linkResults(state) {
   })).sort((a,b)=>(b.at || 0)-(a.at || 0));
 }
 export function reportText(state) {
-  return '# OpenLinks — report.txt\n# Время UTC. attempted = нажатие отправки; attempt_unknown = результат неизвестен, без автоповтора. Для новых attempted на 1688 проверено очищение редактора. Сервер, доставка и прочтение не проверяются. sent = старая или ручная отметка.\n' +
+  return `# OpenLinks — report.txt\n# Местное время компьютера: ${timeZone()}. attempted = нажатие отправки; attempt_unknown = результат неизвестен, без автоповтора. Для новых attempted на 1688 проверено очищение редактора. Сервер, доставка и прочтение не проверяются. sent = старая или ручная отметка.\n` +
     '# РЕЗУЛЬТАТЫ ПО ССЫЛКАМ — каждое повторное добавление является отдельной задачей\n# время\tID задачи\tстатус\tошибок\tURL\tпричина\n'+
     linkResults(state).map(row=>[iso(row.at),row.id,row.status,row.errorCount,clean(row.url),clean(row.reason)].join('\t')).join('\n')+'\n\n'+
     '# СОБЫТИЯ\n# время\tсобытие\tURL\tподробности\n' + state.events.map(e =>
@@ -220,8 +221,9 @@ export const EVENT_LABELS = {
   chat_discovered:'Открытый чат распознан',
   chat_open_attempt:'Штатный клик открытия чата',
   chat_loading:'Ожидание готовности чата',job_error:'Ошибка ссылки',retry_scheduled:'Автопроверка назначена',retry_started:'Автоматически проверяю снова',
+  draft_replaced:'Старый текст в поле заменён',
 };
 export function activityText(state) {
-  return '# OpenLinks — activity.log\n# Наблюдаемые действия, результаты проверок и причины решений. Время UTC.\n' +
+  return `# OpenLinks — activity.log\n# Наблюдаемые действия, результаты проверок и причины решений. Местное время компьютера: ${timeZone()}.\n` +
     state.events.map(entry => `${iso(entry.at)} [${entry.level || 'action'}] ${EVENT_LABELS[entry.type] || entry.type}${entry.url ? ' | '+clean(entry.url) : ''} | ${clean(entry.detail)}`).join('\n') + '\n';
 }

@@ -1,3 +1,4 @@
+import {WORKBOOK_MARKER} from './excel.js';
 const DB='openlinks-files';
 async function database() {
   return new Promise((resolve,reject)=>{
@@ -35,6 +36,16 @@ export async function writeLog(folder,text,allowReplace=false) {
     }
   } catch(error) { if(error.name!=='NotFoundError') throw error; }
   await writeFile(folder,'activity.log',text);
+}
+export async function writeExcel(folder,bytes,allowReplace=false) {
+  try {
+    const file=await (await folder.getFileHandle('report.xlsx')).getFile();
+    const tail=new Uint8Array(await file.slice(-(22+WORKBOOK_MARKER.length)).arrayBuffer());
+    const owned=tail.length===22+WORKBOOK_MARKER.length && new DataView(tail.buffer).getUint32(0,true)===0x06054b50 &&
+      new DataView(tail.buffer).getUint16(20,true)===WORKBOOK_MARKER.length && new TextDecoder().decode(tail.slice(22))===WORKBOOK_MARKER;
+    if(!allowReplace && !owned)throw new Error('report.xlsx уже существует и не принадлежит OpenLinks. Выберите папку заново и подтвердите замену или укажите другую папку.');
+  } catch(error) {if(error.name!=='NotFoundError')throw error;}
+  await writeFile(folder,'report.xlsx',bytes);
 }
 export function download(name,content,type='text/plain;charset=utf-8') {
   const url=URL.createObjectURL(new Blob([content],{type}));

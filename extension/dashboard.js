@@ -1,10 +1,12 @@
 import {PLATFORMS, STATUS, EVENT_LABELS, FINAL, makePlan, WINDOW_MS, scheduleText, reportText, activityText, nextAllowed, linkResults} from './lib/core.js';
-import {getFolder,rememberFolder,writeFile,writeLog,download} from './lib/files.js';
+import {getFolder,rememberFolder,writeFile,writeLog,writeExcel,download} from './lib/files.js';
+import {reportExcel,EXCEL_MIME} from './lib/excel.js';
+import {displayTime,timeZone} from './lib/time.js';
 import './routes-1688-shared.js';
 const $=selector=>document.querySelector(selector);
 let state, folder, settingsDirty=false, fileWrites=Promise.resolve(), toastTimer, selectedResult=null;
 const approvedFolders=new WeakSet();
-const time=at=>at ? new Date(at).toLocaleString('ru-RU',{month:'short',day:'numeric',hour:'2-digit',minute:'2-digit',second:'2-digit'}) : '—';
+const time=displayTime;
 function toast(text,error=false) {
   $('#toast').textContent=text; $('#toast').classList.toggle('error',error); $('#toast').hidden=false;
   clearTimeout(toastTimer); toastTimer=setTimeout(()=>$('#toast').hidden=true,9000);
@@ -53,6 +55,7 @@ function fillSettings() {
 function render() {
   if(!state) return;
   const now=Date.now(), active=state.queue.find(j=>j.id===state.activeId);
+  $('#report-timezone').textContent=`Время в таблицах и файлах соответствует часовому поясу компьютера: ${timeZone()}.`;
   $('#run-state').textContent=state.learning?'Ждёт обучающего клика':state.running ? (active?.status==='retry_wait'?`Автопроверка через ${Math.max(0,Math.ceil((active.retryAt-now)/1000))} с`:state.waiting ? 'Ожидание интервала / лимита' : active?.status==='review'&&!active.approved?'Ждёт подтверждения':'Очередь работает') : 'На паузе';
   $('#run-state').classList.toggle('running',state.running);
   $('#start').disabled=state.running; $('#pause').disabled=!state.running;
@@ -161,6 +164,7 @@ function syncFiles() {
     await writeLog(target,activityText(snapshot),approvedFolders.has(target));
     await writeFile(target,'schedule.txt',scheduleText(snapshot));
     await writeFile(target,'report.txt',reportText(snapshot));
+    await writeExcel(target,reportExcel(snapshot),approvedFolders.has(target));
     $('#folder-status').textContent=`Папка «${target.name}» · сохранено ${new Date().toLocaleTimeString('ru-RU')}. Оставьте это окно открытым.`;
   }).catch(error=>{
     $('#folder-status').textContent='Ошибка записи: '+error.message;
@@ -231,15 +235,17 @@ button('#connect-folder',async()=>{
   if(!window.showDirectoryPicker) throw new Error('Выбор папки не поддерживается. Используйте скачивание файлов.');
   const handle=await showDirectoryPicker({id:'openlinks-reports',mode:'readwrite'});
   let exists=false;
-  for(const name of ['schedule.txt','report.txt','activity.log']) {
+  for(const name of ['schedule.txt','report.txt','report.xlsx','activity.log']) {
     try { await handle.getFileHandle(name); exists=true; } catch(error) { if(error.name!=='NotFoundError') throw error; }
   }
-  if(exists && !confirm('В папке уже есть schedule.txt, report.txt или activity.log. Заменять их данными текущей очереди?')) return;
+  if(exists && !confirm('В папке уже есть schedule.txt, report.txt, report.xlsx или activity.log. Заменять их данными текущей очереди?')) return;
   approvedFolders.add(handle); folder=handle; await rememberFolder(handle); syncFiles();
 });
 button('#export-schedule',()=>download('schedule.txt',scheduleText(state)));
 button('#export-report',()=>download('report.txt',reportText(state)));
 button('#report-download',()=>download('report.txt',reportText(state)));
+button('#export-excel',()=>download('report.xlsx',reportExcel(state),EXCEL_MIME));
+button('#excel-download',()=>download('report.xlsx',reportExcel(state),EXCEL_MIME));
 button('#export-log',()=>download('activity.log',activityText(state)));
 button('#log-download',()=>download('activity.log',activityText(state)));
 button('#show-log',()=>showView('report'));

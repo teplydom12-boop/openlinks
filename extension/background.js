@@ -3,6 +3,7 @@ import './rules-shared.js';
 import './routes-1688-shared.js';
 import './supplier-chat.js';
 import {activate1688} from './lib/native-input.js';
+import {localTimestamp} from './lib/time.js';
 const {makeRule,mergeRule}=globalThis.OpenLinksRules;
 const routes1688=globalThis.OpenLinks1688;
 const supplierChat=globalThis.OpenLinksSupplierChat;
@@ -25,7 +26,7 @@ function event(state, type, job, detail = '', level = 'action') {
   state.activity=entry;
 }
 async function waitFor(state,job,at,reasons,kind) {
-  const detail=`${reasons.join('; ')}. Продолжение не ранее ${new Date(at).toISOString()}. Обход очереди разрешён только для площадок с исчерпанной квотой.`;
+  const detail=`${reasons.join('; ')}. Продолжение не ранее ${localTimestamp(at)}. Обход очереди разрешён только для площадок с исчерпанной квотой.`;
   if(state.waiting?.jobId!==job.id || state.waiting?.until!==at || state.waiting?.kind!==kind) {
     state.waiting={jobId:job.id,until:at,kind,detail};
     event(state,'wait',job,detail,'wait'); await save(state);
@@ -33,7 +34,7 @@ async function waitFor(state,job,at,reasons,kind) {
   await alarm(at);
 }
 function deferQuota(state,job,at,reasons) {
-  const detail=`${reasons.join('; ')}. Возврат не ранее ${new Date(at).toISOString()}; проверяю доступность других площадок.`;
+  const detail=`${reasons.join('; ')}. Возврат не ранее ${localTimestamp(at)}; проверяю доступность других площадок.`;
   if(job.quotaDeferredUntil!==at)event(state,'quota_deferred',job,detail,'decision');
   job.quotaDeferredUntil=at;job.reason=detail;
 }
@@ -65,6 +66,7 @@ async function prepareChat(state,job) {
     if(!readiness?.ok)return {...readiness,ok:false,waiting:true,reason:readiness?.reason || 'Жду готовности редактора 1688'};
   }
   const reply=await call(job,job.frameId,'PREPARE',{reactivate:job.reactivate===true});
+  if(reply?.draftReplaced){event(state,'draft_replaced',job,'Старый текст в найденном поле чата полностью очищен и заменён сообщением из настроек. Содержимое старого текста не записывается.');await save(state);}
   if(reply?.ok)delete job.readyWaitAt;
   if(!reply?.waiting)delete job.reactivate;
   if(job.platform!=='1688' || !reply?.needsNativeInput)return reply;

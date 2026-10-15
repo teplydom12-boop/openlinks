@@ -5,6 +5,8 @@ message transport and dashboard's Chrome API are replaced by explicit test doubl
 The actual core, content script, dashboard and file writer run unmodified.
 """
 import functools
+import io
+from openpyxl import load_workbook
 import http.server
 import os
 import re
@@ -34,7 +36,7 @@ BASE = f'http://127.0.0.1:{server.server_port}'
 try:
     with sync_playwright() as p:
         browser = p.chromium.launch(executable_path=os.environ.get('CHROMIUM_PATH', '/usr/bin/chromium'), headless=True)
-        context = browser.new_context(viewport={'width': 1440, 'height': 1050})
+        context = browser.new_context(viewport={'width': 1440, 'height': 1050}, timezone_id='Asia/Irkutsk')
         errors = []
         context.on('page', lambda page: page.on('pageerror', lambda error: errors.append(str(error))))
         ui = context.new_page()
@@ -71,12 +73,17 @@ try:
         file_data = ui.evaluate("""async()=>{
           const directory=await navigator.storage.getDirectory();
           const read=async name=>await (await (await directory.getFileHandle(name)).getFile()).text();
-          return {schedule:await read('schedule.txt'),report:await read('report.txt'),log:await read('activity.log')};
+          return {schedule:await read('schedule.txt'),report:await read('report.txt'),log:await read('activity.log'),excel:Array.from(new Uint8Array(await (await (await directory.getFileHandle('report.xlsx')).getFile()).arrayBuffer()))};
         }""")
         assert 'jcnyjxsb.en.alibaba.com' in file_data['schedule']
         assert 'Browser UI test' in file_data['report']
         assert 'Импорт' in file_data['log']
-        passed('auto-write creates schedule.txt, report.txt and activity.log using File System Access')
+        assert 'Asia/Irkutsk' in file_data['report'] and '+08:00' in file_data['log']
+        automatic_book=load_workbook(io.BytesIO(bytes(file_data['excel'])))
+        assert automatic_book.sheetnames==['Результаты','События']
+        assert automatic_book['Результаты'].max_row==13
+        assert 'Asia/Irkutsk' in automatic_book['Результаты']['G2'].value
+        passed('auto-write creates Excel, TXT and LOG reports with the computer timezone using File System Access')
         protection=ui.evaluate("""async()=>{
           const {writeLog,activityText}= {...await import('/extension/lib/files.js'),...await import('/extension/lib/core.js')};
           const folder=await navigator.storage.getDirectory();
@@ -89,6 +96,18 @@ try:
         }""")
         assert protection=={'rejected':True,'preserved':'My unrelated log'}
         passed('new activity.log cannot silently overwrite an unrelated existing file')
+        excel_protection=ui.evaluate("""async()=>{
+          const {writeExcel}=await import('/extension/lib/files.js'),{reportExcel}=await import('/extension/lib/excel.js'),{initialState}=await import('/extension/lib/core.js');
+          const folder=await navigator.storage.getDirectory(),bytes=reportExcel(initialState());
+          await writeExcel(folder,bytes);
+          const handle=await folder.getFileHandle('report.xlsx'),writer=await handle.createWritable();await writer.write('Unrelated workbook');await writer.close();
+          let rejected=false;try{await writeExcel(folder,bytes);}catch{rejected=true;}
+          const preserved=await (await handle.getFile()).text();await writeExcel(folder,bytes,true);
+          return {rejected,preserved};
+        }""")
+        assert excel_protection=={'rejected':True,'preserved':'Unrelated workbook'}
+        passed('Excel auto-write replaces its own workbook and preserves an unrelated existing workbook')
+
         with ui.expect_download() as download:
             ui.locator('#export-schedule').click()
         assert download.value.suggested_filename == 'schedule.txt'
@@ -136,6 +155,19 @@ try:
             ui.locator('#report-download').click()
         report=Path(report_download.value.path()).read_text()
         assert 'РЕЗУЛЬТАТЫ ПО ССЫЛКАМ' in report and 'failed\t3' in report and 'СОБЫТИЯ' in report
+        expect(ui.locator('#report-timezone')).to_contain_text('Asia/Irkutsk')
+        with ui.expect_download() as excel_download:
+            ui.locator('#excel-download').click()
+        assert excel_download.value.suggested_filename=='report.xlsx'
+        book=load_workbook(io.BytesIO(Path(excel_download.value.path()).read_bytes()))
+        assert book['Результаты'].max_row==5 and book['События'].max_row==4
+        assert book['Результаты'].freeze_panes=='A2'
+        for row in list(book['Результаты'].rows)[1:]:
+            assert row[5].is_date and row[6].value=='Asia/Irkutsk (UTC+08:00)'
+            assert ui.locator('#results-body').inner_text().find(row[5].value.strftime('%d.%m.%Y'))>=0
+            assert row[5].value.strftime('%H:%M:%S') in ui.locator('#results-body').inner_text()
+        passed('Excel download contains all link results and events with real local dates matching the dashboard')
+
         ui.screenshot(path=str(RESULTS/'link-journal.png'),full_page=True)
         ui.set_viewport_size({'width':600,'height':850})
         assert ui.evaluate('document.documentElement.scrollWidth <= window.innerWidth')
@@ -178,10 +210,13 @@ try:
         assert supplier.evaluate('clicks')==1
         assert not supplier.evaluate("adapter('SEND', {expectedUrl:location.href})")['clicked']
         passed('single send without result checks and duplicate-click prevention')
-        supplier.evaluate("document.querySelector('#message').value='My existing draft'")
-        assert not supplier.evaluate("adapter('PREPARE')")['ok']
-        expect(supplier.locator('#message')).to_have_value('My existing draft')
-        passed('existing unrelated draft is preserved')
+        supplier.evaluate("()=>{let e=document.querySelector('#message');e.value='My existing draft';window.replacementInputs=[];e.addEventListener('input',()=>replacementInputs.push(e.value));}")
+        replaced=supplier.evaluate("adapter('PREPARE')")
+        assert replaced['ok'] and replaced['draftReplaced']
+        expect(supplier.locator('#message')).to_have_value('Hello, WeChat: demo')
+        assert supplier.evaluate('replacementInputs')==['','Hello, WeChat: demo']
+        assert supplier.evaluate('clicks')==1
+        passed('Alibaba clears the old draft before inserting the new message without prematurely sending')
         supplier.evaluate("document.body.insertAdjacentHTML('beforeend','<div id=fixture-captcha style=width:200px;height:60px>Check</div>')")
         assert 'CAPTCHA' in supplier.evaluate("adapter('PROBE')")['obstacle']
         assert not supplier.evaluate("adapter('SEND', {jobId:'another',expectedUrl:location.href})")['clicked']
@@ -532,10 +567,16 @@ try:
         assert supplier.evaluate('sendClicks')==sends+1
         assert not supplier.evaluate("adapter('SEND',{attemptId:'ignored',expectedUrl:location.href})")['clicked']
         passed('1688 ignored click is reported as unaccepted with draft intact and no automatic retry')
-        supplier.evaluate("document.querySelector('pre').textContent='User draft'")
-        assert not supplier.evaluate("adapter('PREPARE')")['ok']
-        assert supplier.locator('pre').inner_text()=='User draft'
-        passed('1688 native editing never overwrites a different user draft')
+        supplier.evaluate("()=>{let e=document.querySelector('pre');e.innerHTML='<b>Old text</b><div>Second line</div>';window.replacementInputs=[];e.addEventListener('input',()=>replacementInputs.push(e.innerText));}")
+        replaced=supplier.evaluate("adapter('PREPARE')")
+        assert replaced['needsNativeInput'] and replaced['draftReplaced']
+        assert supplier.locator('pre').inner_text()=='Hello, WeChat: demo'
+        cleared=supplier.evaluate('replacementInputs')
+        assert cleared[0].strip()=='' and '' in cleared,cleared
+        assert prepare_native()['ok']
+        assert supplier.evaluate('model')=='Hello, WeChat: demo'
+        assert supplier.evaluate('sendClicks')==sends+1
+        passed('1688 clears a multiline rich draft, activates the new message with native keys and does not send during preparation')
 
         # Closure marker belongs to this document only and is invalidated by
         # actual user interaction. A page cannot schedule another tab's close.
@@ -601,6 +642,20 @@ try:
         supplier.evaluate("document.body.append(document.querySelector('[aria-label=tm]').cloneNode(true))")
         assert supplier.evaluate("adapter('PROBE',{profile:{rules:[micRule]}})")['kind']!='contact'
         passed('MIC minimized-chat lesson survives supplier/test-ID changes via saved alternatives; ambiguous recipients are rejected')
+        supplier.goto('https://webim.made-in-china.com/super-tm/')
+        supplier.evaluate("document.body.innerHTML='<section data-chat-root><div contenteditable=true class=webtm-input>Old MIC draft</div><button class=webtm-send-button>Send</button></section><textarea id=unrelated>Keep outside field</textarea>';window.clearStages=[];document.querySelector('.webtm-input').addEventListener('input',e=>clearStages.push(e.target.innerText));")
+        supplier.add_script_tag(path=str(ROOT/'extension/supplier-chat.js'))
+        supplier.add_script_tag(path=str(ROOT/'extension/content.js'))
+        assert not supplier.evaluate("adapter('PREPARE')")['ok']
+        assert supplier.locator('.webtm-input').inner_text()=='Old MIC draft'
+        replaced=supplier.evaluate("adapter('PREPARE',{profile:{editor:'.webtm-input'}})")
+        assert replaced['ok'] and replaced['draftReplaced']
+        assert supplier.locator('.webtm-input').inner_text()=='Hello, WeChat: demo'
+        assert supplier.locator('#unrelated').input_value()=='Keep outside field'
+        cleared=supplier.evaluate('clearStages')
+        assert cleared[0].strip()=='' and '' in cleared,cleared
+        passed('Made-in-China clears and replaces the selected rich editor while leaving unrelated fields intact')
+
 
         ui.get_by_role('button',name='Очередь поставщиков').click()
         row=ui.locator('#queue-body tr').filter(has_text='jcnyjxsb.en.alibaba.com')
