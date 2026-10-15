@@ -30,3 +30,21 @@ window.seedChatRoute=(store,url)=>{
   storageListeners.forEach(listener=>listener({openlinksState:{newValue:snapshot}},'local'));
 };
 window.showDirectoryPicker=()=>navigator.storage.getDirectory();
+
+window.seedLinkResults=()=>{
+  const previous=structuredClone(state);
+  window.restoreLinkResults=()=>{
+    state=previous;
+    storageListeners.forEach(listener=>listener({openlinksState:{newValue:structuredClone(state)}},'local'));
+  };
+  const url='https://same.alibaba.com/';
+  state.queue=[{id:'pending',url:'https://waiting.1688.com/',platform:'1688',status:'pending',createdAt:Date.now()}];
+  state.activeId=null;state.running=false;
+  state.events=[
+    {jobId:'first',url,at:Date.now()-3000,type:'attempted',jobStatus:'attempted',errorCount:0,detail:'Clicked once'},
+    {jobId:'second',url,at:Date.now()-2000,type:'failed',jobStatus:'failed',errorCount:3,detail:'Three errors'},
+    {jobId:'unknown',url:'https://unknown.1688.com/',at:Date.now()-1000,type:'attempt_unknown',jobStatus:'attempt_unknown',errorCount:1,detail:'Unknown result'},
+  ];
+  const snapshot=structuredClone(state);
+  storageListeners.forEach(listener=>listener({openlinksState:{newValue:snapshot}},'local'));
+};

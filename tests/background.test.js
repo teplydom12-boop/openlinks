@@ -5,7 +5,7 @@ import {initialState} from '../extension/lib/core.js';
 import {domReply} from './debugger-harness.js';
 const listener=()=>{const list=[];return {list,addListener(fn){list.push(fn);}};};
 let stored,clicks,contactClicks,commands,requests,beforeClick,probeKind,sendResult,frameUrl,tabCount,opened,missing,obstacle,prepareOk,lookupPages,fetches,probeRoute,updated,probeKey,listedTabs,frameList,tabReplies,frameProbes,deliveries;
-let scheduled,removed,canClose,nativeRequired,debuggerFailure,debuggerCalls,nativeFailure;
+let scheduled,removed,canClose,nativeRequired,debuggerFailure,debuggerCalls,nativeFailure,chatReady;
 const metadataFixture=readFileSync(new URL('./fixtures/1688-metadata.html',import.meta.url),'utf8');
 globalThis.fetch=async(url,options)=>{fetches.push({url,credentials:options.credentials});const html=lookupPages.get(url);if(html===undefined)throw new Error('No local metadata fixture');return new Response(html,{headers:{'content-type':'text/html'}});};
 const runtime={onMessage:listener(),onStartup:listener(),onInstalled:listener(),getURL:path=>'chrome-extension://test/'+path};
@@ -17,6 +17,7 @@ globalThis.chrome={runtime,alarms,storage:{local:{get:async()=>({openlinksState:
   deliveries.push({tabId:tab,frameId:options.frameId,type:data.type});
   commands.push(data.type);
   requests.push(structuredClone(data));
+  if(data.type==='CHAT_READY')return {ok:chatReady,waiting:!chatReady,reason:'Loading chat'};
   if(data.type==='PROBE')return {engine:frameUrl.includes('1688.com')?undefined:'supplier-chat-v2',kind:probeKind,key:probeKey,chatRoute:probeRoute,obstacle:obstacle?.text,canDismiss:obstacle?.dismiss,dismissKey:obstacle?.key,reason:probeKind==='inquiry'?'Форма запроса, нужен чат':undefined,...frameProbes.get(options.frameId)};
   if(data.type==='PREPARE')return {ok:prepareOk && !nativeRequired,needsNativeInput:nativeRequired,pageUrl:frameList?.find(frame=>frame.frameId===options.frameId)?.url || frameUrl,reason:prepareOk?undefined:'Редактор изменился'};
   if(data.type==='NATIVE_INPUT' && nativeFailure?.stage===data.stage)return {ok:false,reason:nativeFailure.reason};
@@ -36,10 +37,13 @@ chrome.debugger={
 const ui={id:'test',url:'chrome-extension://test/dashboard.html'};
 const message=(type,extra={},sender=ui)=>new Promise(resolve=>runtime.onMessage.list[0]({type,...extra},sender,resolve));
 async function tick(){alarms.onAlarm.list[0]({name:'openlinks-tick'});await message('GET');}
-function reset(){stored=initialState();stored.settings.message='Hello';clicks=0;contactClicks=0;commands=[];requests=[];beforeClick=null;probeKind='chat';sendResult=true;frameUrl='https://a.en.alibaba.com/chat';tabCount=0;opened=[];missing=false;obstacle=null;prepareOk=true;lookupPages=new Map();fetches=[];probeRoute=null;updated=[];probeKey='#contact';listedTabs=[];frameList=null;tabReplies=new Map();frameProbes=new Map();deliveries=[];scheduled=[];removed=[];canClose=true;nativeRequired=false;debuggerFailure=null;debuggerCalls=[];nativeFailure=null;}
+function reset(){stored=initialState();stored.settings.message='Hello';clicks=0;contactClicks=0;commands=[];requests=[];beforeClick=null;probeKind='chat';sendResult=true;frameUrl='https://a.en.alibaba.com/chat';tabCount=0;opened=[];missing=false;obstacle=null;prepareOk=true;lookupPages=new Map();fetches=[];probeRoute=null;updated=[];probeKey='#contact';listedTabs=[];frameList=null;tabReplies=new Map();frameProbes=new Map();deliveries=[];scheduled=[];removed=[];canClose=true;nativeRequired=false;debuggerFailure=null;debuggerCalls=[];nativeFailure=null;chatReady=true;}
 async function review(url='https://a.en.alibaba.com/'){await message('IMPORT',{text:url});await message('START');await tick();await tick();}
 async function openingTimedOut(){stored.queue[0].chatOpening.at=Date.now()-21000;await tick();}
 
+async function retryDue(){stored.queue.find(j=>j.id===stored.activeId).retryAt=Date.now()-1;await tick();}
+// Compatibility fixture for already-persisted manual/automatic interventions.
+function legacyUncertain(){stored.queue[0].status='uncertain';stored.activeId=stored.queue[0].id;stored.running=false;}
 async function fireClose(token){alarms.onAlarm.list[0]({name:'openlinks-close:'+token});await message('GET');}
 test('completed send schedules closure for 10 seconds later without delaying another platform',async t=>{
  reset();await review();await message('IMPORT',{text:'https://b.1688.com/'});await message('APPROVE');await tick();
@@ -84,8 +88,8 @@ test('unsent draft, skipped supplier and uncertain 1688 click leave their tabs o
  reset();await review();assert.equal(stored.pendingClosures?.length || 0,0);
  await message('SKIP',{id:stored.activeId});assert.equal(stored.pendingClosures?.length || 0,0);
  reset();frameUrl='https://a.1688.com/chat';sendResult='unaccepted';await review('https://a.1688.com/');await message('APPROVE');await tick();
- assert.equal(stored.queue[0].status,'uncertain');assert.equal(stored.pendingClosures?.length || 0,0);assert.equal(removed.length,0);
- await message('MARK_SENT');assert.equal(stored.pendingClosures.length,1);
+ assert.equal(stored.queue[0].status,'attempt_unknown');assert.equal(stored.pendingClosures?.length || 0,0);assert.equal(removed.length,0);
+ legacyUncertain();await message('MARK_SENT');assert.equal(stored.pendingClosures.length,1);
 });
 test('1688 activates the selected frame before reserving send quota and does not repeat keyboard input after approval',async()=>{
  reset();frameUrl='https://a.1688.com/chat';nativeRequired=true;await review('https://a.1688.com/');
@@ -95,16 +99,16 @@ test('1688 activates the selected frame before reserving send quota and does not
  assert.deepEqual(requests.filter(r=>r.type==='NATIVE_INPUT').map(r=>r.stage),['locate','focus','space','done','release']);
  await message('APPROVE');await tick();assert.equal(clicks,1);assert.equal(debuggerCalls.length,inputCalls);
 });
-test('debugger attach failure pauses without clicking, reserving quota or teaching the wrong button',async()=>{
+test('debugger attach failure schedules recovery without clicking, reserving quota or teaching the wrong button',async()=>{
  reset();frameUrl='https://a.1688.com/chat';nativeRequired=true;debuggerFailure='Another debugger is already attached';await review('https://a.1688.com/');
- assert.equal(stored.running,false);assert.equal(stored.queue[0].status,'blocked');assert.match(stored.queue[0].reason,/DevTools/);
+ assert.equal(stored.running,true);assert.equal(stored.queue[0].status,'retry_wait');assert.match(stored.queue[0].reason,/DevTools/);
  assert.equal(clicks,0);assert.equal(stored.learning,null);assert.equal(stored.slots.filter(s=>s.kind==='send').length,0);
  assert.equal(debuggerCalls.length,1);
 });
 test('changed draft reports the keyboard stage without misleading DevTools advice or a send attempt',async()=>{
  reset();frameUrl='https://a.1688.com/chat';nativeRequired=true;nativeFailure={stage:'space',reason:'Текст изменился при вводе клавиш'};
  await review('https://a.1688.com/');
- assert.equal(stored.running,false);assert.equal(stored.queue[0].status,'blocked');
+ assert.equal(stored.running,true);assert.equal(stored.queue[0].status,'retry_wait');
  assert.match(stored.queue[0].reason,/после пробела/);assert.doesNotMatch(stored.queue[0].reason,/DevTools|разрешение debugger/);
  assert.equal(clicks,0);assert.equal(stored.learning,null);assert.equal(stored.slots.filter(s=>s.kind==='send').length,0);
  assert.equal(debuggerCalls.at(-1).type,'detach');assert.ok(!debuggerCalls.some(c=>c.params?.key==='Backspace'));
@@ -120,7 +124,7 @@ test('embedded chat closure guards both the frame and its containing document',a
 });
 test('manual confirmation after restart cannot authorize closing an unverified old tab ID',async()=>{
  reset();frameUrl='https://a.1688.com/chat';sendResult='unaccepted';await review('https://a.1688.com/');await message('APPROVE');await tick();
- runtime.onStartup.list[0]();await message('GET');assert.equal(stored.queue[0].needsTabCheck,true);
+ legacyUncertain();runtime.onStartup.list[0]();await message('GET');assert.equal(stored.queue[0].needsTabCheck,true);
  await message('MARK_SENT');assert.equal(stored.queue[0].status,'sent');assert.equal(stored.pendingClosures?.length || 0,0);
 });
 
@@ -149,11 +153,11 @@ test('FIFO waits for first platform and logs identical wait only once',async()=>
  reset();stored.slots.push({platform:'alibaba',kind:'visit',at:Date.now()});await message('IMPORT',{text:'https://a.en.alibaba.com/\nhttps://b.1688.com/'});await message('START');await tick();await tick();
  assert.equal(opened.length,0);assert.equal(stored.waiting.jobId,stored.queue[0].id);assert.equal(stored.events.filter(e=>e.type==='wait').length,1);
 });
-test('no chat within the opening deadline pauses and arms a user lesson without sending',async()=>{
- reset();probeKind='inquiry';await review();await openingTimedOut();assert.equal(stored.running,false);assert.equal(stored.queue[0].status,'blocked');assert.equal(stored.learning.field,'contact');assert.equal(clicks,0);assert.ok(commands.includes('PICK_START'));
+test('no chat within the opening deadline schedules a bounded retry without sending',async()=>{
+ reset();probeKind='inquiry';await review();await openingTimedOut();assert.equal(stored.running,true);assert.equal(stored.queue[0].status,'retry_wait');assert.equal(stored.queue[0].helpField,'contact');assert.equal(clicks,0);assert.equal(stored.learning,null);
 });
 test('learning is scoped and persisted before the new opener uses the chosen contact',async()=>{
- reset();probeKind='inquiry';await review();await openingTimedOut();const token=stored.learning.token;
+ reset();probeKind='inquiry';await review();await openingTimedOut();await message('TEACH',{field:'contact'});const token=stored.learning.token;
  const sender={id:'test',url:frameUrl,tab:{id:stored.queue[0].tabId},frameId:0};
  assert.equal((await message('LEARN_PICK',{token:'wrong',field:'contact',selector:'#contact'},sender)).ok,false);
  const reply=await message('LEARN_PICK',{token,field:'contact',selector:'#contact',tag:'button',label:'Chat'},sender);
@@ -165,11 +169,11 @@ test('teaching send reserves quota before the replay and counts it as user appro
  await message('LEARN_PICK',{token,field:'send',selector:'#send',tag:'button',label:'Send',chatSelector:'#conversation'}, {id:'test',url:frameUrl,tab:{id:stored.queue[0].tabId},frameId:0});
  await tick();assert.equal(stored.rules.length,2);assert.equal(clicks,1);assert.equal(stored.queue[0].status,'attempted');assert.equal(beforeClick.slots.filter(s=>s.kind==='send').length,1);
 });
-test('native refused click triggers teaching rather than waiting for a server result',async()=>{
- reset();sendResult=false;await review();await message('APPROVE');await tick();assert.equal(stored.queue[0].status,'blocked');assert.equal(stored.learning.field,'send');assert.ok(!commands.includes('CHECK_SENT'));
+test('refused click schedules a retry without waiting for a server result',async()=>{
+ reset();sendResult=false;await review();await message('APPROVE');await tick();assert.equal(stored.queue[0].status,'retry_wait');assert.equal(stored.queue[0].helpField,'send');assert.equal(stored.learning,null);assert.ok(!commands.includes('CHECK_SENT'));
 });
-test('composer changing after approval starts teaching without reserving a send',async()=>{
- reset();await review();prepareOk=false;await message('APPROVE');await tick();assert.equal(clicks,0);assert.equal(stored.learning.field,'send');assert.equal(stored.slots.filter(s=>s.kind==='send').length,0);
+test('composer changing after approval schedules recovery without reserving a send',async()=>{
+ reset();await review();prepareOk=false;await message('APPROVE');await tick();assert.equal(clicks,0);assert.equal(stored.queue[0].status,'retry_wait');assert.equal(stored.slots.filter(s=>s.kind==='send').length,0);
 });
 test('new same-platform iframe receives the active lesson but an unrelated frame does not',async()=>{
  reset();probeKind='inquiry';await review();await openingTimedOut();
@@ -177,9 +181,9 @@ test('new same-platform iframe receives the active lesson but an unrelated frame
  await message('PAGE_READY',{}, {id:'test',url:frameUrl,tab:{id:tabId},frameId:3});assert.ok(stored.learning.frameIds.includes(3));
  await message('PAGE_READY',{}, {id:'test',url:'https://other.test/',tab:{id:tabId},frameId:4});assert.ok(!stored.learning.frameIds.includes(4));
 });
-test('manual recheck after obstacle resumes storefront contact discovery',async()=>{
- reset();probeKind='contact';obstacle={text:'CAPTCHA',dismiss:false};await review();assert.equal(stored.queue[0].status,'blocked');
- obstacle=null;await message('RECHECK');await tick();assert.ok(commands.includes('OPEN_CHAT'));assert.equal(contactClicks,0);
+test('automatic recheck after obstacle resumes storefront contact discovery',async()=>{
+ reset();probeKind='contact';obstacle={text:'CAPTCHA',dismiss:false};await review();assert.equal(stored.queue[0].status,'retry_wait');
+ obstacle=null;await retryDue();assert.ok(commands.includes('OPEN_CHAT'));assert.equal(contactClicks,0);
 });
 test('each reappearance of the known 1688 overlay is dismissed, including at review',async()=>{
  reset();frameUrl='https://13153773601.1688.com/';probeKind='contact';obstacle={text:'CAPTCHA',dismiss:true};await review(frameUrl);
@@ -189,10 +193,10 @@ test('each reappearance of the known 1688 overlay is dismissed, including at rev
  obstacle={text:'CAPTCHA',dismiss:true,key:'third'};await message('APPROVE');await tick();assert.equal(clicks,0);
  assert.equal(commands.filter(c=>c==='DISMISS_CHALLENGE').length,3);await tick();assert.equal(clicks,1);
 });
-test('a close control that does not dismiss its overlay pauses rather than looping',async()=>{
+test('a close control that does not dismiss its overlay schedules bounded recovery without looping clicks',async()=>{
  reset();frameUrl='https://named.1688.com/';obstacle={text:'CAPTCHA',dismiss:true,key:'stuck',stuck:true};
  await review(frameUrl);await tick();await tick();assert.equal(commands.filter(c=>c==='DISMISS_CHALLENGE').length,2);
- assert.equal(stored.running,false);assert.equal(stored.queue[0].status,'blocked');assert.equal(clicks,0);
+ assert.equal(stored.running,true);assert.equal(stored.queue[0].status,'retry_wait');assert.equal(clicks,0);
 });
 test('quota bypass opens one eligible supplier and later resumes the first deferred row',async()=>{
  reset();const now=Date.now();stored.settings.review=false;
@@ -307,29 +311,23 @@ test('update during sending finalizes an unknown attempt and preserves quota',as
  runtime.onInstalled.list[0]({reason:'update'});await message('GET');assert.equal(stored.queue[0].status,'attempt_unknown');assert.equal(stored.slots.length,1);assert.equal(stored.activeId,null);assert.equal(stored.running,false);
 });
 
-test('1688 ignored click stops the queue and cannot be resumed by START, RECHECK or teaching',async()=>{
+test('1688 ignored click becomes an unknown result and continues without repeating the send',async()=>{
  reset();frameUrl='https://air.1688.com/chat';sendResult='unchanged';await review('https://shop.1688.com/');
  await message('IMPORT',{text:'https://next.en.made-in-china.com/'});await message('APPROVE');await tick();
- assert.equal(stored.queue[0].status,'uncertain');assert.equal(stored.running,false);assert.equal(stored.activeId,stored.queue[0].id);
- for(const [type,extra] of [['START',{}],['RECHECK',{}],['TEACH',{field:'send'}]])assert.equal((await message(type,extra)).ok,false);
- await message('BIND_TAB',{tabId:1});assert.equal(stored.queue[0].status,'uncertain');assert.equal(stored.running,false);
- await tick();assert.equal(clicks,1);assert.equal(opened.length,1);
- const firstAttempt=requests.find(r=>r.type==='SEND').attemptId;
- sendResult=true;assert.equal((await message('RETRY_SEND')).ok,true);await tick();
- assert.equal(stored.queue[0].status,'attempted');assert.equal(clicks,2);assert.notEqual(requests.filter(r=>r.type==='SEND').at(-1).attemptId,firstAttempt);
- assert.equal(stored.slots.filter(s=>s.kind==='send').length,2);
- await tick();assert.equal(opened.at(-1),'https://next.en.made-in-china.com/');
+ assert.equal(stored.queue[0].status,'attempt_unknown');assert.equal(stored.activeId,null);assert.equal(stored.running,true);
+ for(const type of ['RECHECK','RETRY_SEND'])assert.equal((await message(type)).ok,false);
+ await tick();assert.equal(clicks,1);assert.equal(opened.at(-1),'https://next.en.made-in-china.com/');
+ assert.equal(stored.slots.filter(s=>s.kind==='send').length,1);
 });
-test('1688 manual confirmation continues without another click and interrupted sends stay paused across restart',async()=>{
- reset();frameUrl='https://air.1688.com/chat';sendResult='disconnect';await review('https://shop.1688.com/');await message('APPROVE');await tick();
- assert.equal(stored.queue[0].status,'uncertain');assert.equal(stored.running,false);
+test('legacy uncertain send remains manually resolvable and cannot retry an unbound tab after restart',async()=>{
+ reset();frameUrl='https://air.1688.com/chat';sendResult='disconnect';await review('https://shop.1688.com/');await message('APPROVE');await tick();legacyUncertain();
  runtime.onStartup.list[0]();await message('GET');assert.equal(stored.queue[0].status,'uncertain');assert.ok(stored.queue[0].needsTabCheck);
  assert.equal((await message('RETRY_SEND')).ok,false);assert.equal((await message('MARK_SENT')).ok,true);
  assert.equal(stored.queue[0].status,'sent');assert.equal(stored.activeId,null);assert.equal(stored.running,true);assert.equal(clicks,1);
 });
-test('1688 worker recovery retains uncertain operation without opening another supplier',async()=>{
+test('1688 worker recovery records an unknown result without repeating the click',async()=>{
  reset();stored.running=true;stored.activeId='x';stored.queue=[{id:'x',platform:'1688',url:'https://shop.1688.com/',status:'sending'}];
- await tick();assert.equal(stored.queue[0].status,'uncertain');assert.equal(stored.activeId,'x');assert.equal(stored.running,false);assert.equal(clicks,0);
+ await tick();assert.equal(stored.queue[0].status,'attempt_unknown');assert.equal(stored.activeId,null);assert.equal(stored.running,true);assert.equal(clicks,0);
 });
 test('Alibaba and MIC start the reference opener without direct URL navigation or a legacy contact click',async()=>{
  for(const url of ['https://a.trustpass.alibaba.com/','https://a.en.made-in-china.com/']) {
@@ -347,7 +345,7 @@ test('single-row removal preserves history, quotas and rules and allows reimport
  await tick();assert.equal(opened.length,1);assert.ok(stored.waiting);
 });
 test('removing a blocked active row cancels its lesson but not other rows or quota reservations',async()=>{
- reset();probeKind='inquiry';await review();await openingTimedOut();await message('IMPORT',{text:'https://next.en.made-in-china.com/'});
+ reset();probeKind='inquiry';await review();await openingTimedOut();await message('TEACH',{field:'contact'});await message('IMPORT',{text:'https://next.en.made-in-china.com/'});
  const target=stored.activeId,slots=structuredClone(stored.slots);
  assert.equal((await message('REMOVE_JOB',{id:target})).ok,true);assert.equal(stored.activeId,null);assert.equal(stored.learning,null);
  assert.equal(stored.queue.length,1);assert.equal(stored.queue[0].status,'pending');assert.deepEqual(stored.slots,slots);assert.ok(commands.includes('PICK_STOP'));
@@ -359,15 +357,17 @@ test('sending row cannot be deleted, and deleting an awaited pending row clears 
  assert.ok(stored.waiting);await message('REMOVE_JOB',{id:stored.queue[0].id});assert.equal(stored.waiting,null);assert.equal(stored.queue.length,0);assert.equal(stored.slots.length,1);
 });
 
-test('1688 unexpected reply after SEND is uncertain and never starts send teaching',async()=>{
+test('1688 unexpected reply after SEND is unknown and never starts send teaching',async()=>{
  reset();frameUrl='https://air.1688.com/chat';sendResult='malformed';await review('https://shop.1688.com/');await message('APPROVE');await tick();
- assert.equal(stored.queue[0].status,'uncertain');assert.equal(stored.running,false);assert.equal(stored.learning,null);assert.equal(clicks,1);
+ assert.equal(stored.queue[0].status,'attempt_unknown');assert.equal(stored.running,true);assert.equal(stored.learning,null);assert.equal(clicks,1);
 });
 
 const messenger1688='https://air.1688.com/app/ocms-fusion-components-1688/def_cbu_web_im/index.html?touid=cnalichncurrent&siteid=cnalichn';
 async function waitingFor1688Contact() {
  reset();frameUrl='https://current.1688.com/';probeKind='waiting';await review(frameUrl);
  stored.queue[0].stepAt=Date.now()-16000;await tick();
+ // Simulate an automatic lesson saved by the previous extension version.
+ await message('TEACH',{field:'contact'});stored.learning.automatic=true;
  assert.equal(stored.learning.field,'contact');assert.equal(stored.learning.automatic,true);assert.equal(stored.running,false);
 }
 test('1688 popup automatically ends stale contact teaching and advances to the editor without a contact click',async()=>{
@@ -402,14 +402,14 @@ test('1688 direct chat waits for its editor and never asks for the open-chat but
  reset();const store='https://current.1688.com/';stored.chatRoutes[store]={url:messenger1688};frameUrl=messenger1688;probeKind='waiting';
  await review(store);assert.ok(stored.queue[0].chatOpened);
  stored.queue[0].stepAt=Date.now()-16000;await tick();assert.equal(stored.learning,null);assert.equal(stored.running,true);
- stored.queue[0].stepAt=Date.now()-31000;await tick();assert.equal(stored.learning.field,'editor');assert.equal(stored.running,false);
- probeKind='chat';await message('PAGE_READY',{}, {id:'test',url:messenger1688,tab:{id:1},frameId:0});
+ stored.queue[0].stepAt=Date.now()-31000;await tick();assert.equal(stored.queue[0].status,'retry_wait');assert.equal(stored.queue[0].helpField,'editor');
+ probeKind='chat';await retryDue();
  assert.equal(stored.learning,null);assert.equal(stored.queue[0].status,'review');assert.equal(contactClicks,0);
 });
 test('1688 delayed editor can recover on an alarm without another page-load event',async()=>{
  reset();const store='https://current.1688.com/';stored.chatRoutes[store]={url:messenger1688};frameUrl=messenger1688;probeKind='waiting';
- await review(store);stored.queue[0].stepAt=Date.now()-31000;await tick();assert.equal(stored.learning.field,'editor');
- probeKind='chat';await tick();assert.equal(stored.queue[0].status,'review');assert.equal(stored.learning,null);assert.equal(clicks,0);
+ await review(store);stored.queue[0].stepAt=Date.now()-31000;await tick();assert.equal(stored.queue[0].status,'retry_wait');
+ probeKind='chat';await retryDue();assert.equal(stored.queue[0].status,'review');assert.equal(stored.learning,null);assert.equal(clicks,0);
 });
 test('a pre-opened 1688 chat is found before asking for contact teaching even if popup events were missed',async()=>{
  reset();frameUrl='https://current.1688.com/';probeKind='waiting';await review(frameUrl);
@@ -461,7 +461,7 @@ test('an already opened 1688 chat never clicks the learned go-shop action or ask
  reset();const store='https://current.1688.com/';stored.chatRoutes[store]={url:messenger1688};frameUrl=messenger1688;probeKind='contact';probeKey='div.go-shop';
  frameProbes.set(0,{diagnostics:{editors:1,sends:0,chatRoots:0,contacts:1,inquiriesIgnored:0}});
  await review(store);stored.queue[0].stepAt=Date.now()-31000;await tick();
- assert.equal(contactClicks,0);assert.equal(stored.learning.field,'send');assert.ok(stored.queue[0].chatOpened);
+ assert.equal(contactClicks,0);assert.equal(stored.queue[0].helpField,'send');assert.equal(stored.queue[0].status,'retry_wait');assert.ok(stored.queue[0].chatOpened);
 });
 
 async function beginSupplierOpening(url='https://shop.en.alibaba.com/') {
@@ -520,13 +520,13 @@ test('pause, removal and teaching stop the browser opener and reject subsequent 
   assert.equal(reply.ok,false);assert.equal(clicks,0);
  }
 });
-test('new opener login/captcha stop requires manual recovery and never asks to train the login button',async()=>{
+test('new opener login/captcha schedules recovery and never asks to train the login button',async()=>{
  await beginSupplierOpening();await openingEvent('blocked',{reason:'Нужен вход в аккаунт'});
- assert.equal(stored.running,false);assert.equal(stored.learning,null);assert.equal(stored.queue[0].status,'blocked');assert.ok(commands.includes('STOP_OPEN_CHAT'));
+ assert.equal(stored.running,true);assert.equal(stored.learning,null);assert.equal(stored.queue[0].status,'retry_wait');assert.ok(commands.includes('STOP_OPEN_CHAT'));
 });
-test('opening deadline stops retries and late editor discovery removes automatic teaching',async()=>{
- await beginSupplierOpening();await openingTimedOut();assert.equal(stored.learning.field,'contact');assert.equal(stored.running,false);
- probeKind='chat';await tick();assert.equal(stored.queue[0].status,'review');assert.equal(stored.learning,null);assert.equal(contactClicks,0);
+test('opening deadline schedules retry and a late editor is discovered automatically',async()=>{
+ await beginSupplierOpening();await openingTimedOut();assert.equal(stored.queue[0].status,'retry_wait');assert.equal(stored.running,true);
+ probeKind='chat';await retryDue();assert.equal(stored.queue[0].status,'review');assert.equal(stored.learning,null);assert.equal(contactClicks,0);
 });
 test('worker reload preserves an opening cycle attempt budget rather than restarting at zero',async()=>{
  await beginSupplierOpening();await openingEvent('attempt',{attempt:1});
@@ -541,13 +541,73 @@ test('new popup handling accepts a related messenger and rejects another storefr
   await message('PAUSE');chrome.tabs.onCreated.list[0]({id:22,openerTabId:21,url:chat});await message('GET');assert.equal(stored.running,false);assert.equal(stored.queue[0].tabId,21);
  }
 });
-test('an unrecognized editor loaded after automatic teaching receives the lesson in its new visible frame',async()=>{
+test('an unrecognized editor loaded after explicit teaching receives the lesson in its new visible frame',async()=>{
  await beginSupplierOpening();frameProbes.set(0,{kind:'waiting',opened:true,frames:[]});await tick();
- stored.queue[0].stepAt=Date.now()-31000;await tick();assert.equal(stored.learning.field,'editor');
+ stored.queue[0].stepAt=Date.now()-31000;await tick();await message('TEACH',{field:'editor'});assert.equal(stored.learning.field,'editor');
  const chat='https://onetalk.alibaba.com/message/weblite.htm';
  frameList=[{frameId:0,url:frameUrl},{frameId:4,parentFrameId:0,url:chat}];
  frameProbes.set(0,{kind:'waiting',opened:true,frames:[{url:chat,visible:true}]});frameProbes.set(4,{kind:'waiting',opened:true});
  await message('PAGE_READY',{}, {id:'test',url:chat,tab:{id:1},frameId:4});
  assert.equal(stored.learning.field,'editor');assert.ok(stored.learning.frameIds.includes(4));
  assert.ok(deliveries.some(item=>item.type==='PICK_START' && item.frameId===4));assert.equal(stored.running,false);
+});
+
+test('1688 waits for complete main-tab and chat readiness before native input, without counting loading as an error',async()=>{
+ reset();frameUrl='https://air.1688.com/chat';nativeRequired=true;chatReady=false;
+ tabReplies.set(1,{id:1,url:frameUrl,status:'loading'});await review('https://shop.1688.com/');
+ assert.equal(debuggerCalls.length,0);assert.ok(!commands.includes('PREPARE'));assert.equal(stored.queue[0].errorCount,undefined);
+ tabReplies.set(1,{id:1,url:frameUrl,status:'complete'});await tick();assert.equal(debuggerCalls.length,0);assert.ok(!commands.includes('PREPARE'));
+ chatReady=true;await tick();assert.equal(stored.queue[0].status,'review');assert.equal(debuggerCalls[0].type,'attach');assert.equal(clicks,0);
+});
+test('inactive 1688 button automatically retries after 10 seconds, reactivates and preserves prior approval',async t=>{
+ reset();frameUrl='https://air.1688.com/chat';await review('https://shop.1688.com/');
+ prepareOk=false;await message('APPROVE');const now=Date.now();t.mock.method(Date,'now',()=>now);await tick();
+ const job=stored.queue[0];assert.equal(job.status,'retry_wait');assert.equal(job.retryAt,now+10000);assert.equal(job.errorCount,1);
+ assert.equal(clicks,0);const preparations=commands.filter(c=>c==='PREPARE').length;
+ await tick();assert.equal(commands.filter(c=>c==='PREPARE').length,preparations);
+ t.mock.method(Date,'now',()=>now+9999);await tick();assert.equal(clicks,0);
+ prepareOk=true;nativeRequired=true;t.mock.method(Date,'now',()=>now+10000);await tick();
+ assert.ok(requests.some(r=>r.type==='PREPARE' && r.reactivate));assert.equal(debuggerCalls[0].type,'attach');
+ assert.equal(stored.queue[0].status,'attempted');assert.equal(clicks,1);assert.equal(opened.length,1);
+ assert.equal(stored.slots.filter(s=>s.kind==='visit').length,1);assert.equal(stored.slots.filter(s=>s.kind==='send').length,1);
+});
+test('three preparation failures skip the link, keep error history and continue to the next platform',async()=>{
+ reset();stored.settings.review=false;prepareOk=false;await review();await message('IMPORT',{text:'https://next.1688.com/'});
+ assert.equal(stored.queue[0].errorCount,1);await retryDue();assert.equal(stored.queue[0].errorCount,2);
+ await retryDue();assert.equal(stored.queue[0].status,'failed');assert.equal(stored.queue[0].autoSkipped,true);
+ assert.equal(stored.queue[0].failures.length,3);assert.equal(stored.activeId,null);assert.equal(stored.running,true);
+ assert.equal(stored.events.filter(e=>e.type==='job_error').length,3);assert.equal(clicks,0);assert.equal(stored.slots.filter(s=>s.kind==='send').length,0);
+ await tick();assert.equal(opened.length,2);assert.equal(stored.activeId,stored.queue[1].id);
+});
+test('loading timeout consumes one failure per 60 seconds, then a bounded retry',async t=>{
+ reset();frameUrl='https://air.1688.com/chat';chatReady=false;await review('https://shop.1688.com/');
+ const since=stored.queue[0].readyWaitAt;t.mock.method(Date,'now',()=>since+59999);await tick();assert.equal(stored.queue[0].errorCount,undefined);
+ t.mock.method(Date,'now',()=>since+60000);await tick();assert.equal(stored.queue[0].errorCount,1);assert.equal(stored.queue[0].status,'retry_wait');
+ t.mock.method(Date,'now',()=>since+70000);await tick();assert.equal(stored.queue[0].errorCount,1);assert.equal(stored.queue[0].readyWaitAt,since+70000);
+});
+test('explicit pause or teaching stops automatic retry and a manual recheck requests native reactivation',async()=>{
+ for(const mode of ['PAUSE','TEACH']) {
+  reset();prepareOk=false;await review();await message(mode,{field:'send'});
+  stored.queue[0].retryAt=Date.now()-1;const count=commands.filter(c=>c==='PREPARE').length;await tick();
+  assert.equal(commands.filter(c=>c==='PREPARE').length,count);assert.equal(stored.running,false);
+  if(mode==='TEACH'){prepareOk=true;await message('RECHECK');await tick();assert.ok(requests.findLast(r=>r.type==='PREPARE').reactivate);}
+ }
+});
+test('retry state survives worker reload, and delayed 1688 popup is adopted during the countdown',async()=>{
+ reset();frameUrl='https://current.1688.com/';probeKind='waiting';await review(frameUrl);stored.queue[0].stepAt=Date.now()-16000;await tick();
+ stored=JSON.parse(JSON.stringify(stored));const retryAt=stored.queue[0].retryAt;
+ chrome.tabs.onCreated.list[0]({id:20,openerTabId:1,url:messenger1688});await message('GET');
+ assert.equal(stored.queue[0].tabId,20);assert.equal(stored.queue[0].retryAt,retryAt);assert.equal(stored.queue[0].status,'retry_wait');
+ frameUrl=messenger1688;probeKind='chat';await retryDue();assert.equal(stored.queue[0].status,'review');assert.equal(contactClicks,0);assert.equal(opened.length,1);
+});
+test('a failed opener cycle never resets its authorized three-click budget during recovery',async t=>{
+ await beginSupplierOpening();const started=Date.now();
+ for(let attempt=1;attempt<=3;attempt++){t.mock.method(Date,'now',()=>started+attempt*5000);assert.equal((await openingEvent('attempt',{attempt})).ok,true);}
+ await openingTimedOut();const count=commands.filter(c=>c==='OPEN_CHAT').length;await retryDue();await retryDue();
+ assert.equal(stored.queue[0].status,'failed');assert.equal(commands.filter(c=>c==='OPEN_CHAT').length,count);assert.equal(clicks,0);
+});
+test('browser restart discards remembered approval from a retry even after binding the same chat URL',async()=>{
+ reset();await review();prepareOk=false;await message('APPROVE');await tick();assert.equal(stored.queue[0].retryApprovedUrl,frameUrl);
+ runtime.onStartup.list[0]();await message('GET');assert.equal(stored.queue[0].retryApprovedUrl,undefined);
+ prepareOk=true;await message('BIND_TAB',{tabId:1});await tick();assert.equal(stored.queue[0].status,'review');assert.equal(stored.queue[0].approved,false);assert.equal(clicks,0);
 });

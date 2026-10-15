@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import {initialState, migrateState, classify, parseList, WINDOW_MS, nextAllowed, makePlan, dueJob, scheduleText, reportText, activityText, validateSettings} from '../extension/lib/core.js';
+import {initialState, migrateState, classify, parseList, WINDOW_MS, nextAllowed, makePlan, dueJob, scheduleText, reportText, activityText, validateSettings, linkResults} from '../extension/lib/core.js';
 test('v4 migration upgrades TrustPass learning and keeps an interrupted 1688 send unresolved',()=>{
  const saved=initialState();saved.version=4;saved.activeId='send';saved.running=true;
  saved.rules=[{id:'lesson',platform:'alibaba',field:'contact',selector:'a.action-alitalk',scope:{host:'first.trustpass.alibaba.com',path:'/'}}];
@@ -167,4 +167,25 @@ test('reimporting schedule never repeats sent or uncertain jobs',()=>{
   const parsed=parseList(scheduleText(state,1000));
   assert.equal(parsed.jobs.length,1);assert.equal(parsed.jobs[0].url,'https://c.1688.com/');
   assert.equal(parsed.errors.length,2);
+});
+
+test('link journal preserves removed results, separates re-added URLs and counts errors before a successful retry',()=>{
+ const state=initialState(),url='https://a.alibaba.com/';
+ state.events=[
+  {at:1,jobId:'old',url,type:'job_error',jobStatus:'contacting',errorCount:1,detail:'Inactive button'},
+  {at:2,jobId:'old',url,type:'attempted',jobStatus:'attempted',errorCount:1,detail:'Clicked once'},
+  {at:3,jobId:'old',url,type:'remove_job',jobStatus:'attempted',errorCount:1,detail:'Removed'},
+  {at:4,jobId:'failed',url:'https://b.1688.com/',type:'failed',jobStatus:'failed',errorCount:3,detail:'Skipped after three errors'},
+  {at:5,jobId:'removed',url:'https://c.1688.com/',type:'remove_job',jobStatus:'pending',errorCount:0,detail:'Removed before visit'},
+ ];
+ state.queue=[{id:'new',url,status:'retry_wait',errorCount:1,reason:'Button inactive',createdAt:6}];
+ const rows=linkResults(state);assert.equal(rows.length,4);
+ assert.equal(rows.find(r=>r.id==='old').group,'worked');assert.equal(rows.find(r=>r.id==='old').errorCount,1);
+ assert.equal(rows.find(r=>r.id==='failed').group,'errors');assert.equal(rows.find(r=>r.id==='removed').group,'skipped');
+ assert.equal(rows.find(r=>r.id==='new').group,'pending');assert.equal(rows.find(r=>r.id==='new').reason,'Button inactive');
+ const report=reportText(state);assert.match(report,/РЕЗУЛЬТАТЫ ПО ССЫЛКАМ/);assert.match(report,/failed\t3/);assert.match(report,/СОБЫТИЯ/);
+});
+test('legacy event-only history and unknown clicks are never presented as successful sends',()=>{
+ const state=initialState();state.events=[{jobId:'legacy',url:'https://a.1688.com/',at:10,type:'attempt_unknown',detail:'No reply'}];
+ const row=linkResults(state)[0];assert.equal(row.group,'errors');assert.match(row.label,/без повтора/);assert.equal(row.reason,'No reply');
 });

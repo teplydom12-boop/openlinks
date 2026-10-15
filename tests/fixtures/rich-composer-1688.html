@@ -14,7 +14,7 @@ editor.addEventListener('input',event=>{if(event.isTrusted){nativeEdits++;model=
 editor.addEventListener('keyup',event=>{
   // Reproduce the remaining bug: synthetic keyup/execCommand alone cannot
   // activate Send. The user reports that a real space key activates it.
-  if(!clickedEditor || !event.isTrusted || !['Space','Backspace'].includes(event.code))return;
+  if(window.acceptKeyboard===false || !clickedEditor || !event.isTrusted || !['Space','Backspace'].includes(event.code))return;
   window.lastTrustedKey=event.code;
   const enabled=!!model.trim();send.setAttribute('aria-disabled',String(!enabled));send.classList.toggle('disabled',!enabled);
 });

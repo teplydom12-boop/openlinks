@@ -117,6 +117,33 @@ try:
         expect(ui.locator('#known-chats a')).to_have_count(0)
         ui.get_by_role('button',name='Очередь поставщиков').click()
         passed('dashboard lists saved 1688 chat associations and forgets them without submitting settings')
+        ui.evaluate('seedLinkResults()')
+        ui.locator('#show-log').click()
+        expect(ui.locator('#results-body tr')).to_have_count(4)
+        expect(ui.locator('#result-summary')).to_contain_text('Ошибки / нужна проверка: 2')
+        ui.locator('#result-group').select_option('errors')
+        expect(ui.locator('#results-body tr')).to_have_count(2)
+        ui.locator('#result-search').fill('same.alibaba.com')
+        expect(ui.locator('#results-body tr')).to_have_count(1)
+        ui.locator('#results-body button').click()
+        expect(ui.locator('#report-body tr')).to_have_count(1)
+        expect(ui.locator('#report-body')).to_contain_text('Three errors')
+        ui.locator('#all-events').click()
+        expect(ui.locator('#report-body tr')).to_have_count(3)
+        ui.locator('#result-group').select_option('all')
+        ui.locator('#result-search').fill('')
+        with ui.expect_download() as report_download:
+            ui.locator('#report-download').click()
+        report=Path(report_download.value.path()).read_text()
+        assert 'РЕЗУЛЬТАТЫ ПО ССЫЛКАМ' in report and 'failed\t3' in report and 'СОБЫТИЯ' in report
+        ui.screenshot(path=str(RESULTS/'link-journal.png'),full_page=True)
+        ui.set_viewport_size({'width':600,'height':850})
+        assert ui.evaluate('document.documentElement.scrollWidth <= window.innerWidth')
+        ui.set_viewport_size({'width':1440,'height':1050})
+        passed('per-link journal separates repeated URLs, filters errors, opens task events and downloads a full report')
+        ui.evaluate('restoreLinkResults()')
+        ui.get_by_role('button',name='Очередь поставщиков').click()
+
 
         context.route('https://test.en.alibaba.com/**', lambda route: route.fulfill(
             body=(ROOT/'tests/fixtures'/('chat.html' if '/chat' in route.request.url else 'store.html')).read_text(), content_type='text/html'))
@@ -188,15 +215,23 @@ try:
             'https://air.1688.com/captured-shell': 'captured-1688-shell.html',
             'https://example-shop.1688.com/': '1688-metadata.html',
             'https://air.1688.com/rich-composer': 'rich-composer-1688.html',
+            'https://air.1688.com/delayed-composer': 'rich-composer-1688.html',
             'https://chat-test.1688.com/rich-composer': 'rich-composer-1688.html',
             'https://air.1688.com/composer-frame': '1688-composer-frame.html',
         }
         # Every iframe/resource request is intercepted locally. No vendor request
         # or challenge is fetched, even though the fixtures preserve frame URLs.
+        delayed_resources=[]
         def capture_route(route):
+            if route.request.url.endswith("/slow-ready-image"):
+                delayed_resources.append(route)
+                return
             filename=captures.get(route.request.url)
             if filename:
-                route.fulfill(body=(ROOT/'tests/fixtures'/filename).read_text(),content_type='text/html')
+                body=(ROOT/'tests/fixtures'/filename).read_text()
+                if route.request.url.endswith('/delayed-composer'):
+                    body=body.replace('</body>', '<img hidden src="/slow-ready-image"></body>')
+                route.fulfill(body=body,content_type='text/html')
             else:
                 route.fulfill(body='<!doctype html><title>Empty frame fixture</title>',content_type='text/html')
         context.route('**/*',capture_route)
@@ -377,10 +412,21 @@ try:
         passed('trusted 1688 contact lesson transfers between different named subdomains after page reload')
         # The user's draft is visibly present but Send remains inactive until
         # native input updates the editor's model. Include Unicode, markup and a newline.
-        supplier.goto('https://air.1688.com/rich-composer')
+        supplier.goto('https://air.1688.com/delayed-composer',wait_until='domcontentloaded')
         supplier.add_script_tag(path=str(ROOT/'extension/rules-shared.js'))
         supplier.add_script_tag(path=str(ROOT/'extension/supplier-chat.js'))
         supplier.add_script_tag(path=str(ROOT/'extension/content.js'))
+        assert supplier.evaluate('document.readyState')!='complete'
+        assert supplier.evaluate("adapter('PREPARE')")['waiting']
+        assert supplier.locator('pre').inner_text()=='' and supplier.evaluate('mouseClicks')==0
+        for resource in delayed_resources:
+            resource.fulfill(status=204,body='')
+        supplier.wait_for_load_state('load')
+        assert supplier.evaluate("adapter('CHAT_READY')")['waiting']
+        assert supplier.evaluate("adapter('PREPARE')")['waiting']
+        supplier.wait_for_timeout(5100)
+        assert supplier.evaluate("adapter('CHAT_READY')")['ok']
+        passed('1688 input waits for a genuinely pending page load, then a stable editor for five seconds')
         rich_message='Hello <b>供应商</b>!\nWeChat: test & demo'
         # Run the production keyboard routine through a real Chromium CDP
         # session. Only chrome.debugger transport is replaced; input is trusted.
@@ -390,7 +436,7 @@ try:
           window.attaches=0;window.detaches=0;window.nativeCommands=[];window.nativeKeys=[];window.nativeSpaceCodes=[];
           chrome.debugger={attach:async()=>{attaches++},detach:async()=>{detaches++},sendCommand:(target,method,params)=>new Promise(resolve=>{nativeKeys.push(params);nativeCommands.push({method,params,resolve})})};
           window.prepareNative=async(message='Hello, WeChat: demo')=>{
-            const draft=await adapter('PREPARE',{message});
+            const draft=await adapter('PREPARE',{message,reactivate:window.reactivate===true});window.reactivate=false;
             if(!draft.needsNativeInput)return draft;
             await activate1688({platform:'1688',tabId:1,frameId:0,inputUrl:draft.pageUrl},(job,frame,type,extra)=>{window.beforeNativeCheck?.(extra.stage);return adapter(type,{message,...extra})});
             return adapter('PREPARE',{message});
@@ -442,6 +488,18 @@ try:
         expect(supplier.locator('#history .outgoing')).to_have_text(rich_message)
         assert not supplier.evaluate("message=>adapter('SEND',{message,expectedUrl:location.href})",rich_message)['clicked']
         passed('1688 requires a trusted mouse click then Space/Backspace: Chrome activates Send, preserves text, detaches and removes its marker')
+        # A handler can be installed late on the same editor. A retry must
+        # re-run trusted input even though the old preparation marker survived.
+        supplier.evaluate("()=>{document.querySelector('pre').textContent='';window.acceptKeyboard=false;}")
+        assert not prepare_native()['ok']
+        clicks_before=supplier.evaluate('mouseClicks')
+        supplier.evaluate('acceptKeyboard=true')
+        assert not supplier.evaluate("adapter('PREPARE')")['ok']
+        supplier.evaluate('window.reactivate=true')
+        assert prepare_native()['ok']
+        assert supplier.evaluate('mouseClicks')==clicks_before+1
+        assert supplier.evaluate("adapter('SEND',{attemptId:'late-handler',expectedUrl:location.href})")['accepted']
+        passed('retry reactivates the same 1688 editor after late keyboard handlers become ready')
         # The attached capture has a one-character draft followed by &nbsp;.
         # Test that shape and a composer that preserves ordinary spaces.
         for whitespace,message in [('pre-line','1'),('pre','2')]:
@@ -504,6 +562,8 @@ try:
         inner.add_script_tag(path=str(ROOT/'extension/content.js'))
         inner.add_script_tag(content=native_source)
         inner.evaluate(native_transport)
+        assert inner.evaluate("adapter('CHAT_READY')")['waiting']
+        supplier.wait_for_timeout(5100)
         supplier.locator('#outside').fill('Keep this unrelated draft')
         prepared=prepare_native(rich_message,target=inner)
         assert prepared['ok'] and inner.evaluate('lastTrustedKey')=='Backspace'

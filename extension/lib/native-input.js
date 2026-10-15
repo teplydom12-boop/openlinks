@@ -8,7 +8,7 @@ export async function activate1688(job, call, debuggerApi = chrome.debugger) {
   const command=(method,params={})=>debuggerApi.sendCommand(target,method,params);
   const check=async stage=>{
     const reply=await call(job,job.frameId,'NATIVE_INPUT',{token,stage,expectedUrl:job.inputUrl});
-    if(!reply?.ok)throw Object.assign(new Error(reply?.reason || 'Фокус или текст редактора изменился'),{inputFailure:'editor',inputStage:stage});
+    if(!reply?.ok)throw Object.assign(new Error(reply?.reason || 'Фокус или текст редактора изменился'),{inputFailure:reply?.waiting?'waiting':'editor',inputStage:stage});
   };
   const key=async(type,key,code,keyCode,text)=>command('Input.dispatchKeyEvent',{
     type,key,code,windowsVirtualKeyCode:keyCode,...(text?{text,unmodifiedText:text}:{}),

@@ -10,9 +10,9 @@ export const FINAL = new Set(['sent', 'attempted', 'attempt_unknown', 'skipped',
 export const STATUS = {
   pending: 'В очереди', deferred_send:'Отложено до обновления лимита', visiting: 'Открытие магазина', contacting: 'Открытие чата',
   drafting: 'Подготовка сообщения', review: 'Ждёт подтверждения', sending: 'Нажимаю «Отправить»',
-  attempted:'Кнопка отправки нажата', attempt_unknown:'Попытка без ответа вкладки',
+  attempted:'Кнопка отправки нажата', attempt_unknown:'Результат отправки неизвестен',
   sent: 'Отправлено', uncertain: 'Отправка не подтверждена', blocked: 'Нужно вмешательство',
-  failed: 'Ошибка', skipped: 'Пропущено',
+  failed: 'Ошибка — пропущено', skipped: 'Пропущено', retry_wait:'Ожидание автоматической проверки', removed:'Удалено из очереди',
 };
 export function classify(raw) {
   let url;
@@ -174,9 +174,33 @@ export function scheduleText(state, now = Date.now()) {
     '# время\tплощадка\tстатус\tURL\n' +
     plan.map(j => [iso(j.plannedAt), PLATFORMS[j.platform].label, j.status, j.url].join('\t')).join('\n') + '\n';
 }
+export function linkResults(state) {
+  const rows=new Map();
+  for(const e of state.events) {
+    if(!e.jobId || !e.url)continue;
+    const row=rows.get(e.jobId) || {id:e.jobId,url:e.url,status:'pending',errorCount:0};
+    row.at=e.at;
+    if(e.jobStatus || STATUS[e.type])row.status=e.jobStatus || e.type;
+    row.errorCount=Math.max(row.errorCount,e.errorCount || 0);
+    if(e.type==='job_error' || FINAL.has(e.type) || ['blocked','uncertain','retry_scheduled'].includes(e.type))row.reason=e.detail;
+    if(e.type==='remove_job' && !FINAL.has(row.status)){row.status='removed';row.reason=e.detail;}
+    rows.set(e.jobId,row);
+  }
+  for(const job of state.queue) {
+    const previous=rows.get(job.id) || {};
+    rows.set(job.id,{...previous,id:job.id,url:job.url,status:job.status,errorCount:job.errorCount || previous.errorCount || 0,
+      at:job.finishedAt || previous.at || job.createdAt,reason:job.reason || previous.reason || ''});
+  }
+  return [...rows.values()].map(row=>({...row,
+    group:['sent','attempted'].includes(row.status)?'worked':['failed','attempt_unknown','uncertain','blocked'].includes(row.status)?'errors':['skipped','removed'].includes(row.status)?'skipped':'pending',
+    label:row.status==='attempt_unknown'?'Нужна проверка — без повтора':STATUS[row.status] || row.status,
+  })).sort((a,b)=>(b.at || 0)-(a.at || 0));
+}
 export function reportText(state) {
-  return '# OpenLinks — report.txt\n# Время UTC. attempted = нажатие отправки, attempt_unknown = нет ответа вкладки. Для новых attempted на 1688 проверено очищение редактора; uncertain = требуется ручная проверка. Сервер, доставка и прочтение не проверяются. sent = старая или ручная отметка.\n' +
-    '# время\tсобытие\tURL\tподробности\n' + state.events.map(e =>
+  return '# OpenLinks — report.txt\n# Время UTC. attempted = нажатие отправки; attempt_unknown = результат неизвестен, без автоповтора. Для новых attempted на 1688 проверено очищение редактора. Сервер, доставка и прочтение не проверяются. sent = старая или ручная отметка.\n' +
+    '# РЕЗУЛЬТАТЫ ПО ССЫЛКАМ — каждое повторное добавление является отдельной задачей\n# время\tID задачи\tстатус\tошибок\tURL\tпричина\n'+
+    linkResults(state).map(row=>[iso(row.at),row.id,row.status,row.errorCount,clean(row.url),clean(row.reason)].join('\t')).join('\n')+'\n\n'+
+    '# СОБЫТИЯ\n# время\tсобытие\tURL\tподробности\n' + state.events.map(e =>
       [iso(e.at), e.type, clean(e.url), clean(e.detail)].join('\t')).join('\n') + '\n';
 }
 export const EVENT_LABELS = {
@@ -194,6 +218,7 @@ export const EVENT_LABELS = {
   chat_close_scheduled:'Закрытие чата назначено',chat_closed:'Вкладка чата закрыта',chat_close_cancelled:'Закрытие чата отменено',
   chat_discovered:'Открытый чат распознан',
   chat_open_attempt:'Штатный клик открытия чата',
+  chat_loading:'Ожидание готовности чата',job_error:'Ошибка ссылки',retry_scheduled:'Автопроверка назначена',retry_started:'Автоматически проверяю снова',
 };
 export function activityText(state) {
   return '# OpenLinks — activity.log\n# Наблюдаемые действия, результаты проверок и причины решений. Время UTC.\n' +

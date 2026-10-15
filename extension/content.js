@@ -17,7 +17,7 @@
   const supplierChat=globalThis.OpenLinksSupplierChat?.create(site,{all,visible,isInquiry,labels,selectorFor,obstacle,profileFor:effectiveProfile});
   const sentOps = new Set();
   const preparedEditors = new WeakMap();
-  let nativeInput=null, pendingClose=null;
+  let nativeInput=null, pendingClose=null, chatReadiness=null;
   let picker=null;
   let challenge=null;
   const norm = value => String(value || '').replace(/\r\n/g,'\n').trim();
@@ -145,12 +145,25 @@
   const editorSpaces = value => String(value ?? '').replace(/\u00a0/g,' ');
   function draftText(value) {return norm(site==='1688'?editorSpaces(value):value);}
   function textOf(node) { return draftText('value' in node ? node.value : node.innerText); }
+  function chatReady(profile) {
+    if(site!=='1688')return {ok:true};
+    const found=inspect(profile);
+    if(document.readyState!=='complete' || found.kind!=='chat' || found.editor.closest('[aria-busy="true"]')) {
+      chatReadiness=null;
+      return {ok:false,waiting:true,waitMs:1000,reason:'Жду полной загрузки страницы и редактора 1688'};
+    }
+    if(!chatReadiness || chatReadiness.editor!==found.editor || chatReadiness.send!==found.send || chatReadiness.url!==location.href)
+      chatReadiness={editor:found.editor,send:found.send,url:location.href,at:Date.now()};
+    const remaining=5000-(Date.now()-chatReadiness.at);
+    return remaining>0?{ok:false,waiting:true,waitMs:1000,reason:'Чат 1688 загружен; жду 5 секунд готовности редактора перед вводом'}:{ok:true};
+  }
   function nativeEdit(request) {
     if(request.stage==='release') {
       if(nativeInput?.token===request.token){nativeInput.editor.removeAttribute('data-openlinks-input');nativeInput=null;}
       return {ok:true};
     }
     if(site!=='1688' || location.href!==request.expectedUrl)return {ok:false,reason:'Адрес чата изменился'};
+    if(request.stage==='locate') {const ready=chatReady(request.profile);if(!ready.ok)return ready;}
     const found=inspect(request.profile),editor=found.editor;
     if(found.kind!=='chat')return {ok:false,reason:'Редактор чата изменился'};
     // Check the message before the click and after both keys, not halfway
@@ -214,10 +227,12 @@
     return invalid.length ? 'На форме есть незаполненные или неверные обязательные поля. Заполните их вручную.' : '';
   }
   async function prepare(request) {
+    const ready=chatReady(request.profile);if(!ready.ok)return ready;
     const found=inspect(request.profile);
     if(found.kind!=='chat') return {ok:false,reason:found.obstacle || found.reason || 'Не найден однозначный редактор внутри чата. Форма запроса не используется.'};
     const current=textOf(found.editor);
     if(current && current!==draftText(request.message)) return {ok:false,reason:'В поле уже есть другой текст. Расширение не перезаписывает чужой черновик.'};
+    if(site==='1688' && request.reactivate && preparedEditors.has(found.editor))preparedEditors.get(found.editor).native=false;
     let inputMethod=preparedEditors.get(found.editor)?.method || 'existing-draft';
     // Repair an equal draft left by an older version, without touching other text.
     if(!current || (site==='1688' && preparedEditors.get(found.editor)?.text!==draftText(request.message))) {
@@ -329,6 +344,7 @@
   }
   function handle(request) {
     const profile=request.profile || {};
+    if(request.type==='CHAT_READY')return chatReady(profile);
     if(request.type==='NATIVE_INPUT')return nativeEdit(request);
     if(request.type==='ARM_CLOSE') {
       if(location.href!==request.expectedUrl)return {ok:false};
@@ -391,7 +407,7 @@
     return {ok:false,reason:'Неизвестная команда'};
   }
   chrome.runtime.onMessage.addListener((request,sender,respond)=>{
-    if(sender.id!==chrome.runtime.id || !['PROBE','CONTACT','PREPARE','SEND','PICK_START','PICK_STOP','DISMISS_CHALLENGE','OPEN_CHAT','STOP_OPEN_CHAT','NATIVE_INPUT','ARM_CLOSE','CAN_CLOSE'].includes(request.type)) return;
+    if(sender.id!==chrome.runtime.id || !['PROBE','CONTACT','PREPARE','SEND','PICK_START','PICK_STOP','DISMISS_CHALLENGE','OPEN_CHAT','STOP_OPEN_CHAT','NATIVE_INPUT','ARM_CLOSE','CAN_CLOSE','CHAT_READY'].includes(request.type)) return;
     Promise.resolve().then(()=>handle(request)).then(respond,error=>respond({ok:false,kind:'ambiguous',reason:'Ошибка селектора или формы: '+error.message}));
     return true;
   });

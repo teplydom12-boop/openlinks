@@ -9,6 +9,7 @@ const supplierChat=globalThis.OpenLinksSupplierChat;
 
 const KEY = 'openlinksState';
 const CHAT_LOAD_MS = 30000;
+const MAX_ERRORS=3, RETRY_MS=10000, READY_TIMEOUT_MS=60000;
 const CLOSE_PREFIX='openlinks-close:';
 let serial = Promise.resolve();
 const exclusive = task => {
@@ -19,7 +20,7 @@ const exclusive = task => {
 async function load() { return migrateState((await chrome.storage.local.get(KEY))[KEY]); }
 async function save(state) { await chrome.storage.local.set({[KEY]:state}); }
 function event(state, type, job, detail = '', level = 'action') {
-  const entry={id:crypto.randomUUID(), at:Date.now(), type, level, jobId:job?.id, url:job?.url || '', detail};
+  const entry={id:crypto.randomUUID(), at:Date.now(), type, level, jobId:job?.id, url:job?.url || '', detail,jobStatus:job?.status,errorCount:job?.errorCount || 0};
   state.events.push(entry);
   state.activity=entry;
 }
@@ -57,7 +58,15 @@ async function call(job, frameId, type, extra = {}) {
   }, {frameId});
 }
 async function prepareChat(state,job) {
-  const reply=await call(job,job.frameId,'PREPARE');
+  if(job.platform==='1688') {
+    const tab=await chrome.tabs.get(job.tabId);
+    if(tab.status==='loading' || tab.pendingUrl)return {ok:false,waiting:true,reason:'Жду полной загрузки вкладки 1688',waitMs:1000};
+    const readiness=await call(job,job.frameId,'CHAT_READY');
+    if(!readiness?.ok)return {...readiness,ok:false,waiting:true,reason:readiness?.reason || 'Жду готовности редактора 1688'};
+  }
+  const reply=await call(job,job.frameId,'PREPARE',{reactivate:job.reactivate===true});
+  if(reply?.ok)delete job.readyWaitAt;
+  if(!reply?.waiting)delete job.reactivate;
   if(job.platform!=='1688' || !reply?.needsNativeInput)return reply;
   event(state,'editor_input',job,'1688: кликаю мышью в поле сообщения, нажимаю пробел, затем Backspace. Используются настоящие события Chrome; текст проверю после этой последовательности.');
   await save(state);
@@ -68,14 +77,42 @@ async function prepareChat(state,job) {
     if(ready.needsNativeInput)throw Object.assign(new Error('Редактор не сохранил результат ввода клавиш'),{inputFailure:'editor',inputStage:'done'});
     return ready;
   } catch(error) {
+    if(error.inputFailure==='waiting')return {ok:false,waiting:true,reason:error.message,waitMs:1000};
     const stage={locate:'при поиске поля для клика',focus:'после клика в поле',space:'после пробела',done:'после Backspace'}[error.inputStage];
-    const hint=['attach','transport'].includes(error.inputFailure)?'Проверьте разрешение debugger, закройте DevTools этой вкладки и нажмите «Проверить снова».':'Проверьте черновик и нажмите «Проверить снова».';
+    const hint=['attach','transport'].includes(error.inputFailure)?'Проверьте разрешение debugger и закройте DevTools этой вкладки.':'Проверьте черновик.';
     return {ok:false,nativeInputError:true,reason:`Не удалось активировать редактор 1688${stage?' ('+stage+')':''}: ${error.message}. ${hint} Отправка не выполнялась.`};
   }
 }
 async function prepareFailed(state,job,reply) {
-  if(reply?.nativeInputError){halt(state,job,reply.reason);await save(state);}
-  else await askForHelp(state,job,reply?.reason || 'Редактор или кнопка изменились','send');
+  if(reply?.waiting) {
+    job.readyWaitAt ??= Date.now();
+    if(Date.now()-job.readyWaitAt<READY_TIMEOUT_MS) {
+      const reason=reply.reason || 'Жду готовности чата';
+      if(job.reason!==reason){job.reason=reason;event(state,'chat_loading',job,reason,'wait');}
+      await save(state);await alarm(Date.now()+Math.max(1000,reply.waitMs || 1000));return;
+    }
+    return retryFailure(state,job,'Чат не стал готов за 60 секунд. '+(reply.reason || ''),'loading');
+  }
+  await retryFailure(state,job,reply?.reason || 'Редактор или кнопка изменились','prepare');
+}
+async function retryFailure(state,job,reason,stage='chat') {
+  if(job.status==='retry_wait' && job.retryAt>Date.now())return;
+  await stopLearning(state,job);
+  job.errorCount=(job.errorCount || 0)+1;
+  job.lastError=reason;job.failures ||= [];
+  job.failures.push({at:Date.now(),stage,reason});
+  event(state,'job_error',job,`Ошибка ${job.errorCount}/${MAX_ERRORS} (${stage}): ${reason}`,'error');
+  delete job.readyWaitAt;
+  if(job.errorCount>=MAX_ERRORS) {
+    job.autoSkipped=true;
+    await finish(state,job,'failed',`Пропущено автоматически после ${job.errorCount} ошибок. ${reason}`);return;
+  }
+  job.retryStatus=job.status==='visiting' && !job.chatOpened?'visiting':'contacting';
+  if(job.approved && job.reviewUrl)job.retryApprovedUrl=job.reviewUrl;
+  job.status='retry_wait';job.retryAt=Date.now()+RETRY_MS;job.reactivate=true;job.approved=false;
+  job.reason=`Ошибка ${job.errorCount}/${MAX_ERRORS}. Автоматическая проверка через 10 секунд: ${reason}`;
+  state.waiting=null;
+  event(state,'retry_scheduled',job,job.reason,'wait');await save(state);await alarm(job.retryAt);
 }
 async function scheduleClose(state,job) {
   if(job.needsTabCheck || !Number.isInteger(job.tabId) || !Number.isInteger(job.frameId) || !job.reviewUrl)return;
@@ -157,16 +194,19 @@ async function openSupplierChat(state,job,results) {
   const available=results.filter(result=>result.engine===supplierChat.ENGINE);
   const frame=available.find(result=>result.frameId===0) || (available.length===1?available[0]:null);
   if(!frame) {
-    if(Date.now()-job.stepAt>CHAT_LOAD_MS) {halt(state,job,'Новый механизм чата ещё не загрузился. Обновите вкладку магазина и нажмите «Проверить снова».');await save(state);}
+    if(Date.now()-job.stepAt>CHAT_LOAD_MS)await retryFailure(state,job,'Механизм чата ещё не загрузился. Обновите вкладку магазина.','loading');
     else await alarm(Date.now()+2000);
     return;
   }
   let opening=job.chatOpening;
+  if(opening?.status==='stopped' && opening.attempts>=supplierChat.MAX_ATTEMPTS) {
+    await retryFailure(state,job,'Лимит кликов открытия для этой ссылки исчерпан; чат не появился.','contact');return;
+  }
   if(opening?.status==='opening' && Date.now()-opening.at>=supplierChat.TIMEOUT_MS) {
     await askForHelp(state,job,'За 20 секунд окно чата не открылось. Покажите кнопку чата на странице.','contact');return;
   }
   if(!opening || opening.status==='stopped') {
-    opening=job.chatOpening={token:crypto.randomUUID(),tabId:job.tabId,frameId:frame.frameId,at:Date.now(),attempts:0,lastClick:0,status:'opening'};
+    opening=job.chatOpening={token:crypto.randomUUID(),tabId:job.tabId,frameId:frame.frameId,at:Date.now(),attempts:opening?.attempts || 0,lastClick:opening?.lastClick || 0,status:'opening'};
     job.status='contacting';job.stepAt=Date.now();
     event(state,'chat_open',job,'Новый механизм: ищу штатную кнопку каждые 700 мс, до 3 кликов с интервалом 5 секунд, не более 20 секунд. Проверяю видимость окна чата.');
     await save(state);
@@ -174,7 +214,7 @@ async function openSupplierChat(state,job,results) {
   if(opening.tabId!==job.tabId || opening.frameId!==frame.frameId){await stopOpening(job);await save(state);await alarm(Date.now()+1000);return;}
   if(frame.opening?.token!==opening.token) {
     const reply=await call(job,opening.frameId,'OPEN_CHAT',{token:opening.token,at:opening.at,attempts:opening.attempts,lastClick:opening.lastClick});
-    if(!reply?.ok){halt(state,job,reply?.reason || 'Не удалось запустить механизм чата. Обновите вкладку.');await save(state);return;}
+    if(!reply?.ok){await retryFailure(state,job,reply?.reason || 'Не удалось запустить механизм чата. Обновите вкладку.','contact');return;}
   }
   await alarm(opening.at+supplierChat.TIMEOUT_MS+500);
 }
@@ -194,6 +234,7 @@ async function joinLearningFrame(state,job,sender) {
 async function armLearning(state,job,field,automatic=false) {
   if(!['contact','editor','send','chat'].includes(field))throw new Error('Неизвестный этап обучения');
   await stopLearning(state,job);
+  delete job.retryApprovedUrl;
   if(job.status!=='blocked')job.resumeStatus=job.status;
   job.status='blocked';state.running=false;state.waiting=null;
   const list=await frames(job);
@@ -204,15 +245,15 @@ async function armLearning(state,job,field,automatic=false) {
   await Promise.all(list.map(f=>call(job,f.frameId,'PICK_START',{field,token:state.learning.token}).catch(()=>{})));
 }
 async function askForHelp(state,job,reason,field='contact') {
-  halt(state,job,reason);await save(state);
-  try{await armLearning(state,job,field,true);}catch(error){job.reason+=' '+error.message;await save(state);}
+  job.helpField=field;
+  await retryFailure(state,job,reason,field);
 }
 async function finish(state, job, status, detail) {
   await stopLearning(state,job);
   job.status = status;
   job.finishedAt = Date.now();
   job.reason = detail;
-  event(state, status, job, detail);
+  event(state, status, job, detail,['failed','attempt_unknown'].includes(status)?'error':'action');
   state.activeId = null;
   state.waiting = null;
   await save(state);
@@ -220,10 +261,10 @@ async function finish(state, job, status, detail) {
   if (state.running) await alarm(Date.now()+1000);
 }
 async function interruptedSend(state,job,detail) {
-  if(job.platform==='1688') {
-    halt(state,job,detail+' Проверьте переписку вручную. Очередь остановлена; автоматического повтора нет.','uncertain');
-    await save(state);
-  } else await finish(state,job,'attempt_unknown',detail+' Результат неизвестен; автоматически не повторяю.');
+  job.lastError=detail;
+  job.errorCount=(job.errorCount || 0)+1;
+  job.failures ||= [];job.failures.push({at:Date.now(),stage:'send',reason:detail});
+  await finish(state,job,'attempt_unknown',detail+' Результат неизвестен; без повторной отправки перехожу к следующей ссылке. Чат оставлен открытым для ручной проверки.');
 }
 function contactStep(frame) {return JSON.stringify([frame.frameId,frame.pageUrl,frame.key]);}
 function rememberContact(job,frame) {
@@ -265,8 +306,7 @@ async function performSend(state, job) {
   if(!result.clicked){await askForHelp(state,job,result.reason || 'Отправка остановлена до нажатия','send');return;}
   event(state,'clicked',job,'Кнопка чата нажата. Доставка и прочтение не проверяются.');
   if(job.platform==='1688' && result.accepted!==true) {
-    halt(state,job,result.reason || 'Не подтверждено очищение редактора 1688 после нажатия. Проверьте переписку вручную; автоматического повтора нет.','uncertain');
-    await save(state);return;
+    await interruptedSend(state,job,result.reason || 'Редактор 1688 не очистился после нажатия.');return;
   }
   if(job.platform==='1688')event(state,'composer_accepted',job,'Редактор 1688 очистился после нажатия. Это локальная реакция чата; сервер, доставка и прочтение не проверяются.','observation');
   await finish(state,job,'attempted',job.platform==='1688'?'Редактор очистился после нажатия; перехожу к следующей ссылке.':'Нажатие выполнено; перехожу к следующей ссылке без ожидания результата.');
@@ -300,6 +340,13 @@ async function tick() {
   }
   if (!state.running) return;
   await alarm(); // Recovery alarm also survives worker suspension and browser restart.
+  if(job?.status==='retry_wait') {
+    if(Date.now()<job.retryAt){await alarm(job.retryAt);return;}
+    job.status=job.retryStatus || 'contacting';job.stepAt=Date.now();delete job.retryAt;
+    event(state,'retry_started',job,`Автоматическая проверка ${job.errorCount+1}/${MAX_ERRORS}. Проверяю ту же вкладку; новое посещение не создаётся.`);
+    await save(state);
+    if(job.platform==='1688')await reconcile1688Chat(state,job);
+  }
   if (!job) {
     const due = dueJob(state, Date.now());
     if (!due) { state.running = false; event(state, 'complete', null, 'Очередь завершена'); await save(state); return; }
@@ -346,14 +393,14 @@ async function tick() {
       if(cached){job.status='contacting';job.chatOpened=true;job.stepAt=Date.now();}
       event(state,'page_opened',job,`Вкладка ${tab.id} создана. Жду загрузки и ищу веб-чат продавца.`);
       await save(state);
-    } catch (error) { halt(state, job, 'Не удалось открыть вкладку: '+error.message); await save(state); }
+    } catch (error) { await retryFailure(state,job,'Не удалось открыть вкладку: '+error.message,'open'); }
     return;
   }
   if(job.status==='sending') {await interruptedSend(state,job,'Возобновление после прерывания попытки.');return;}
   if (['blocked','uncertain'].includes(job.status)) { state.running=false; await save(state); return; }
   let results;
   try { results = await probe(job); }
-  catch { halt(state, job, 'Вкладка закрыта или недоступна. Проверьте результат вручную; повторная отправка не выполнялась.', job.status==='sending'?'uncertain':'blocked'); await save(state); return; }
+  catch { await retryFailure(state,job,'Вкладка закрыта или недоступна. Отправка не выполнялась.','tab');return; }
   const obstacle = results.find(result => result.obstacle);
   const signature=JSON.stringify(results.map(result=>({frameId:result.frameId,kind:result.kind,diagnostics:result.diagnostics,obstacle:result.obstacle,reason:result.reason})));
   if(job.probeSignature!==signature) {
@@ -374,8 +421,7 @@ async function tick() {
       if(reply.closed)delete job.challengeAttempt;
       await save(state);await alarm(Date.now()+1000);return;
     }
-    halt(state, job, obstacle.obstacle, job.status === 'sending' ? 'uncertain' : 'blocked');
-    await save(state); return;
+    await retryFailure(state,job,obstacle.obstacle,'obstacle');return;
   }
   delete job.challengeAttempt;
   if(supplierChat.supports(job.platform) && results.some(result=>result.opened || result.kind==='chat')) {
@@ -412,9 +458,9 @@ async function tick() {
     const reply = await prepareChat(state,job);
     if (!reply.ok) { await prepareFailed(state,job,reply); return; }
     event(state,'chat_ready',job,`Найдена одна пара «редактор + отправка» внутри области чата, фрейм ${job.frameId}. Форма запроса исключена.`,'decision');
-    job.status = 'review'; job.reviewUrl = reply.pageUrl; job.approved = job.manualSend || !state.settings.review;job.manualSend=false;
-    job.reason = state.settings.review ? 'Проверьте получателя и текст, затем подтвердите отправку.' : '';
-    event(state, 'draft_ready', job, state.settings.review ? 'Текст вставлен в чат. Жду проверки получателя и подтверждения пользователя.' : 'Текст вставлен в чат. Автоматический режим: повторно проверю чат и лимит перед отправкой.');
+    job.status = 'review'; job.reviewUrl = reply.pageUrl; job.approved = job.manualSend || !state.settings.review || job.retryApprovedUrl===reply.pageUrl;job.manualSend=false;delete job.retryApprovedUrl;
+    job.reason = !job.approved ? 'Проверьте получателя и текст, затем подтвердите отправку.' : '';
+    event(state, 'draft_ready', job, !job.approved ? 'Текст вставлен в чат. Жду проверки получателя и подтверждения пользователя.' : 'Текст готов. Повторно проверю чат и лимит перед отправкой.');
     if(reply.inputMethod)event(state,'editor_input',job,'Способ ввода: '+reply.inputMethod+'. Текст в редакторе проверен.','observation');
     await save(state);
     if (job.approved) await performSend(state, job);
@@ -446,10 +492,10 @@ async function tick() {
           if (classify(contact.href).platform !== job.platform) throw new Error('Другая площадка');
           rememberChat(state,job,contact.href,'ссылка штатной кнопки чата');await save(state);
           await chrome.tabs.update(job.tabId, {url:contact.href});
-        } catch { halt(state, job, 'Ссылка ведёт вне поддерживаемой площадки. Откройте чат вручную.'); await save(state); }
+        } catch { await retryFailure(state,job,'Не удалось открыть ссылку чата поддерживаемой площадки.','contact'); }
       } else {
         const reply = await call(job, contact.frameId, 'CONTACT');
-        if (!reply.ok) { halt(state, job, reply.reason); await save(state); }
+        if (!reply.ok)await retryFailure(state,job,reply.reason || 'Кнопка открытия чата недоступна','contact');
       }
       return;
     }
@@ -458,7 +504,7 @@ async function tick() {
   if(inquiry) { await askForHelp(state,job,inquiry.reason,job.chatOpened?'editor':'contact'); return; }
   if (Date.now() - job.stepAt > (job.chatOpened?CHAT_LOAD_MS:15000)) {
     const d=results.find(result=>result.diagnostics?.editors)?.diagnostics;
-    await askForHelp(state,job,job.chatOpened?'Чат уже открыт, но редактор ещё не распознан. Жду его загрузки или вашего указания поля сообщения.':'Не удалось однозначно найти следующий элемент чата. Жду вашего обучающего действия.',d?.editors?(d.sends?'chat':'send'):job.chatOpened?'editor':'contact');
+    await askForHelp(state,job,job.chatOpened?'Чат открыт, но редактор ещё не распознан. Можно показать поле через обучение.':'Не удалось однозначно найти следующий элемент чата. Можно показать элемент через обучение.',d?.editors?(d.sends?'chat':'send'):job.chatOpened?'editor':'contact');
   } else if(job.chatOpened) {
     await alarm(Date.now()+2000);
   }
@@ -469,7 +515,8 @@ async function safeTick() {
     const state=await load();
     const job=state.queue.find(j=>j.id===state.activeId);
     if(job?.status==='sending')await interruptedSend(state,job,'Попытка прервана: '+error.message+'.');
-    else {halt(state,job,'Ошибка доступа к вкладке или форме: '+error.message);await save(state);}
+    else if(job)await retryFailure(state,job,'Ошибка доступа к вкладке или форме: '+error.message,'access');
+    else {halt(state,null,'Ошибка очереди: '+error.message);await save(state);}
   }
 }
 async function dispatch(message, sender) {
@@ -493,7 +540,7 @@ async function dispatch(message, sender) {
     }
     if(['blocked','timeout','error'].includes(message.phase)) {
       await stopOpening(job);
-      if(message.phase==='blocked'){halt(state,job,String(message.reason || 'Нужен вход или проверка сайта').slice(0,700));await save(state);}
+      if(message.phase==='blocked')await retryFailure(state,job,String(message.reason || 'Нужен вход или проверка сайта').slice(0,700),'obstacle');
       else await askForHelp(state,job,String(message.reason || 'Чат не открылся').slice(0,700),'contact');
       return {ok:true};
     }
@@ -578,6 +625,7 @@ async function dispatch(message, sender) {
       if (!job || job.status !== 'blocked') throw new Error('Нет заблокированной задачи');
       if(job.needsTabCheck)throw new Error('Сначала выберите и привяжите вкладку чата: её старый номер мог измениться после перезапуска');
       await stopLearning(state,job);
+      job.reactivate=true;delete job.readyWaitAt;
       if(supplierChat.supports(job.platform)){delete job.chatOpening;job.chatOpened=false;}
       job.status=job.resumeStatus==='visiting'?'visiting':'contacting'; job.stepAt=Date.now(); job.reason=''; state.running=true;
       event(state,'recheck',job,'Повторная проверка существующей вкладки без нового посещения');
@@ -643,6 +691,7 @@ async function dispatch(message, sender) {
       await save(state);if(state.running)await alarm(Date.now()+1000);return {ok:true};
     }
     case 'REMOVE_PENDING':
+      for(const item of state.queue.filter(j=>j.status==='pending'))event(state,'remove_job',item,'Ожидающая ссылка удалена из очереди');
       state.queue=state.queue.filter(j=>j.status!=='pending');
       event(state,'remove_pending',null,'Удалены только ожидающие задачи; история и лимиты сохранены');
       await save(state); return {ok:true};
@@ -709,7 +758,7 @@ async function reconcile1688Chat(state,job) {
 }
 async function adoptChatTab(state,tab,allowKnownRecipient=false) {
   const job=state.queue.find(j=>j.id===state.activeId);
-  if(!job || !['contacting','visiting','blocked','review'].includes(job.status))return;
+  if(!job || !['contacting','visiting','blocked','review','retry_wait'].includes(job.status))return;
   if(tab.id===job.tabId) {
     const before=state.chatRoutes[routes1688.storeKey(job.url)]?.url;
     rememberChat(state,job,tab.pendingUrl || tab.url,'переход текущей вкладки в чат');
@@ -744,7 +793,7 @@ async function adoptChatTab(state,tab,allowKnownRecipient=false) {
     } else {
       if(watchingSupplierChat(state,job))await resumeChatDiscovery(state,job,'Открылась вкладка мессенджера. Перехожу к редактору.');
       else await stopLearning(state,job);
-      job.chatOpened=true;job.status='contacting';
+      job.chatOpened=true;if(job.status!=='retry_wait')job.status='contacting';
     }
     job.tabId=tab.id; job.stepAt=Date.now(); event(state,'chat_tab',job,'Открыта вкладка чата площадки');
     if(job.status==='blocked')job.resumeStatus='contacting';
@@ -782,7 +831,7 @@ chrome.runtime.onStartup.addListener(()=>exclusive(async()=>{
   if(state.running || state.activeId || deferred.length) {
     const job=state.queue.find(j=>j.id===state.activeId);
     state.learning=null;
-    if(job)job.needsTabCheck=true;
+    if(job){job.needsTabCheck=true;delete job.retryApprovedUrl;}
     if(job?.status==='sending'){state.running=false;await interruptedSend(state,job,'Chrome перезапущен во время попытки.');return;}
     halt(state,job,'Chrome перезапущен. Проверьте вкладку перед продолжением.',job?.status==='uncertain'?'uncertain':'blocked');
     await save(state);
@@ -798,7 +847,7 @@ chrome.runtime.onInstalled.addListener((details={})=>exclusive(async()=>{
     await stopLearning(state,job);
     if(job?.status==='sending'){state.running=false;await interruptedSend(state,job,'Расширение обновлено во время попытки.');return;}
     if(state.running || job) halt(state,job,'Расширение обновлено. Обновите вкладку магазина/чата перед продолжением.',job?.status==='uncertain'?'uncertain':'blocked');
-    if(job) job.approved=false;
+    if(job){job.approved=false;delete job.retryApprovedUrl;}
   }
   await save(state); await alarm();
 }));

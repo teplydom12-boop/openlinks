@@ -27,3 +27,11 @@ test('input command errors release only our debugger session and do not retry',a
  assert.equal(attached,1);assert.equal(detached,1);assert.equal(commands,1);
  await assert.rejects(activate1688({platform:'alibaba'},()=>{},api),/только/);assert.equal(attached,1);
 });
+test('editor becoming unready before the click releases debugger and requests waiting without typing',async()=>{
+ const stages=[];let detached=false,commands=0;
+ const api={attach:async()=>{},detach:async()=>{detached=true},sendCommand:async()=>{commands++;}};
+ await assert.rejects(activate1688({platform:'1688',tabId:1},async(job,frame,type,data)=>{
+  stages.push(data.stage);return data.stage==='locate'?{ok:false,waiting:true,reason:'Editor loading'}:{ok:true};
+ },api),{inputFailure:'waiting',inputStage:'locate'});
+ assert.equal(commands,0);assert.equal(detached,true);assert.deepEqual(stages,['locate','release']);
+});

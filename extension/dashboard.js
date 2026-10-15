@@ -1,8 +1,8 @@
-import {PLATFORMS, STATUS, EVENT_LABELS, FINAL, makePlan, WINDOW_MS, scheduleText, reportText, activityText, nextAllowed} from './lib/core.js';
+import {PLATFORMS, STATUS, EVENT_LABELS, FINAL, makePlan, WINDOW_MS, scheduleText, reportText, activityText, nextAllowed, linkResults} from './lib/core.js';
 import {getFolder,rememberFolder,writeFile,writeLog,download} from './lib/files.js';
 import './routes-1688-shared.js';
 const $=selector=>document.querySelector(selector);
-let state, folder, settingsDirty=false, fileWrites=Promise.resolve(), toastTimer;
+let state, folder, settingsDirty=false, fileWrites=Promise.resolve(), toastTimer, selectedResult=null;
 const approvedFolders=new WeakSet();
 const time=at=>at ? new Date(at).toLocaleString('ru-RU',{month:'short',day:'numeric',hour:'2-digit',minute:'2-digit',second:'2-digit'}) : '—';
 function toast(text,error=false) {
@@ -53,7 +53,7 @@ function fillSettings() {
 function render() {
   if(!state) return;
   const now=Date.now(), active=state.queue.find(j=>j.id===state.activeId);
-  $('#run-state').textContent=state.learning?'Ждёт обучающего клика':state.running ? (state.waiting ? 'Ожидание интервала / лимита' : active?.status==='review'&&!active.approved?'Ждёт подтверждения':'Очередь работает') : 'На паузе';
+  $('#run-state').textContent=state.learning?'Ждёт обучающего клика':state.running ? (active?.status==='retry_wait'?`Автопроверка через ${Math.max(0,Math.ceil((active.retryAt-now)/1000))} с`:state.waiting ? 'Ожидание интервала / лимита' : active?.status==='review'&&!active.approved?'Ждёт подтверждения':'Очередь работает') : 'На паузе';
   $('#run-state').classList.toggle('running',state.running);
   $('#start').disabled=state.running; $('#pause').disabled=!state.running;
   $('#nav-count').textContent=state.queue.filter(j=>!FINAL.has(j.status)).length;
@@ -129,10 +129,24 @@ function render() {
     row.append(element('td',String(index+1)),urlCell,element('td',PLATFORMS[job.platform].label),element('td',time(job.plannedAt)),status,action); body.append(row);
   }
   $('#empty').hidden=state.queue.length>0;
+  const results=linkResults(state),resultsBody=$('#results-body');resultsBody.replaceChildren();
+  const counts=Object.fromEntries(['worked','errors','pending','skipped'].map(group=>[group,results.filter(row=>row.group===group).length]));
+  $('#result-summary').textContent=`Всего: ${results.length} · Отработали: ${counts.worked} · Ошибки / нужна проверка: ${counts.errors} · В работе / ожидают: ${counts.pending} · Пропущены / удалены: ${counts.skipped}`;
+  const group=$('#result-group').value,search=$('#result-search').value.toLowerCase();
+  for(const result of results.filter(row=>(group==='all' || row.group===group) && [row.url,row.reason,row.label].join(' ').toLowerCase().includes(search))) {
+    const row=element('tr'),urlCell=element('td'),link=element('a',result.url),action=element('td'),details=element('button','События','link-button');
+    link.href=result.url;link.target='_blank';link.rel='noreferrer';urlCell.append(link);
+    details.type='button';details.addEventListener('click',()=>{selectedResult=result.id;$('#log-filter').value='';render();$('#selected-result').scrollIntoView({block:'center'});});action.append(details);
+    row.append(urlCell,element('td',result.label,'result-'+result.group),element('td',String(result.errorCount)),element('td',time(result.at)),element('td',result.reason || '—'),action);resultsBody.append(row);
+  }
+  $('#results-empty').hidden=resultsBody.children.length>0;
+  const selected=results.find(row=>row.id===selectedResult);
+  $('#selected-result').textContent=selected?`${selected.url} · задача ${selected.id}`:'Последние 500 событий. Полный журнал доступен в файле.';
+  $('#all-events').hidden=!selectedResult;
   const report=$('#report-body'); report.replaceChildren();
   const filter=$('#log-filter').value.toLowerCase();
-  const levels={action:'Действие',observation:'Наблюдение',decision:'Решение',wait:'Ожидание',error:'Остановка'};
-  for(const entry of [...state.events].reverse().filter(entry=>[entry.url,entry.detail,EVENT_LABELS[entry.type],entry.type].join(' ').toLowerCase().includes(filter)).slice(0,500)) {
+  const levels={action:'Действие',observation:'Наблюдение',decision:'Решение',wait:'Ожидание',error:'Ошибка'};
+  for(const entry of [...state.events].reverse().filter(entry=>(!selectedResult || entry.jobId===selectedResult) && [entry.url,entry.detail,EVENT_LABELS[entry.type],entry.type].join(' ').toLowerCase().includes(filter)).slice(0,500)) {
     const row=element('tr'); row.append(element('td',time(entry.at)),element('td',levels[entry.level] || 'Действие'),element('td',EVENT_LABELS[entry.type] || entry.type),element('td',[entry.url,entry.detail].filter(Boolean).join(' · '))); report.append(row);
   }
   fillSettings();
@@ -230,6 +244,9 @@ button('#export-log',()=>download('activity.log',activityText(state)));
 button('#log-download',()=>download('activity.log',activityText(state)));
 button('#show-log',()=>showView('report'));
 $('#log-filter').addEventListener('input',render);
+$('#result-search').addEventListener('input',render);
+$('#result-group').addEventListener('change',render);
+button('#all-events',()=>{selectedResult=null;render();});
 button('#export-json',()=>download('openlinks-snapshot.json',JSON.stringify(state,null,2),'application/json'));
 chrome.storage.onChanged.addListener((changes,area)=>{
   if(area==='local' && changes.openlinksState?.newValue) {
