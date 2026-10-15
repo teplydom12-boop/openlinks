@@ -46,7 +46,7 @@
     const p=platform(url);
     if(p!==expectedPlatform || !fields.has(data.field) || typeof data.selector!=='string' || !data.selector.trim() || data.selector.length>500) throw new Error('Неверное правило обучения');
     const selectors=[...new Set([data.selector,...(Array.isArray(data.selectors)?data.selectors:[])])].filter(value=>typeof value==='string' && value.trim() && value.length<=500).slice(0,12);
-    return {id:crypto.randomUUID(),platform:p,field:data.field,selector:data.selector,selectors,tag:String(data.tag||'').toLowerCase().slice(0,30),
+    return {id:crypto.randomUUID(),platform:p,...(p==='1688'?{}:{engine:'supplier-chat-v2'}),field:data.field,selector:data.selector,selectors,tag:String(data.tag||'').toLowerCase().slice(0,30),
       label:String(data.label||'').slice(0,80),scope:scopeFor(url),createdAt:Date.now()};
   }
   function direct1688(raw) {

@@ -4,7 +4,7 @@
   const CONTACT = /^(chat now|chat with supplier|start chat|live chat|online chat|chat online|chat|talk to supplier|联系卖家|联系供应商|立即咨询|在线咨询|在线洽谈|在线交谈|立即沟通|联系商家|Написать в чат|Чат с продавцом|Пообщаться сейчас|Начать чат)$/iu;
   const SEND = /^(send|send message|发送|发送消息|立即发送|Отправить|Отправить сообщение)$/iu;
   const INQUIRY = /inquir|inquer|enquir|quotation|request[\s_-]*(?:a[\s_-]*)?quote|\brfq\b|msgsend|询盘|询价|запрос|заявк/iu;
-  const EDITORS = 'textarea,[contenteditable="true"],[role="textbox"][contenteditable]';
+  const EDITORS = 'textarea,[contenteditable="true"],[contenteditable="plaintext-only"],[role="textbox"][contenteditable]';
   const ACTIONS = 'a,button,[role="button"],input[type="submit"],input[type="button"]';
   const CHAT_ROOT = '[data-chat-root],[data-chat],[class~="chat"],[id*="chat" i],[class*="chat-panel" i],[class*="chat-window" i],[class*="chat-container" i],[class*="conversation" i],[class*="messenger" i],[role="dialog"][aria-label*="chat" i]';
   const host=location.hostname;
@@ -12,10 +12,9 @@
   // Public structural hooks observed in the supplied saved pages. Prefer the
   // storefront header over repeated toolbars; never merge different recipients.
   const CONTACT_REGIONS={
-    alibaba:['.shop-sign-container a.icbu-alitalk','.bc-shop-shopsign-new a.icbu-alitalk','#J_Toolbar a.icbu-alitalk'],
-    mic:['.shop-sign__btns-wrap a.J-open-tm','.details-footer a.J-open-tm','.info-block.bottom a.J-open-tm'],
     '1688':['#pcV2WangWang'],
   };
+  const supplierChat=globalThis.OpenLinksSupplierChat?.create(site,{all,visible,isInquiry,labels,selectorFor,obstacle,profileFor:effectiveProfile});
   const sentOps = new Set();
   const preparedEditors = new WeakMap();
   let picker=null;
@@ -26,14 +25,14 @@
     const rect=node.getBoundingClientRect(), style=getComputedStyle(node);
     return rect.width>2 && rect.height>2 && style.visibility!=='hidden' && style.display!=='none' && style.opacity!=='0' && !node.closest('[hidden],[aria-hidden="true"],[inert]');
   }
-  function all(selector) {
+  function all(selector,includeHidden=false) {
     // Search open shadow roots as well as the document, without relying on generated classes.
     const result=[];
     function visit(root) {
       result.push(...root.querySelectorAll(selector));
       for(const element of root.querySelectorAll('*')) if(element.shadowRoot) visit(element.shadowRoot);
     }
-    visit(document); return result.filter(visible);
+    visit(document); return includeHidden?result:result.filter(visible);
   }
   function labels(node) { return [node.getAttribute('aria-label'),node.getAttribute('title'),node.value,node.innerText].filter(Boolean).map(norm); }
   function candidates(selector, fallback, regex) {
@@ -46,8 +45,7 @@
       const found=all(selector).filter(node=>!isInquiry(node));
       if(found.length) return found;
     }
-    // Made-in-China's tm-placeholder is an unbound visual stub, not a chat action.
-    const basic=candidates('',ACTIONS,CONTACT).filter(node=>!(site==='mic' && node.classList.contains('tm-placeholder')));
+    const basic=candidates('',ACTIONS,CONTACT);
     if(basic.length || site!=='1688') return basic;
     const service=all('a,button,[role="button"],div,span').filter(node=>norm(node.innerText)==='客服' && ![...node.children].some(child=>visible(child)&&norm(child.innerText)==='客服'));
     return [...new Set(service.map(node=>node.closest('a,button,[role="button"],#pcV2WangWang') || node))];
@@ -95,6 +93,7 @@
     return '';
   }
   function inspect(profile) {
+    if(supplierChat)return supplierChat.inspect(profile);
     profile=effectiveProfile(profile);
     const blocked=obstacle();
     if(blocked) return {kind:'obstacle',obstacle:blocked};
@@ -191,6 +190,9 @@
     const profile={...raw},seen=new Set(),resolved={};
     const learning={saved:(raw.rules || []).length,scoped:0,applied:[],rejected:[]};
     for(const rule of [...(raw.rules || [])].reverse()) {
+      if(['alibaba','mic'].includes(site) && rule.field==='contact' && rule.engine!=='supplier-chat-v2') {
+        learning.rejected.push('contact: правило прежнего механизма сохранено, но отключено');continue;
+      }
       if(!globalThis.OpenLinksRules?.matches(rule,location.href))continue;
       learning.scoped++;
       if(seen.has(rule.field))continue;
@@ -238,6 +240,7 @@
     document.removeEventListener('click',picker.listener,true);document.removeEventListener('pointerdown',picker.guard,true);picker.host.remove();picker=null;
   }
   function startPicker(request) {
+    supplierChat?.stop();
     stopPicker();
     const host=document.createElement('div');host.dataset.openlinksPicker='true';host.style.pointerEvents='none';
     const shadow=host.attachShadow({mode:'open'}),box=document.createElement('div');
@@ -283,8 +286,10 @@
     if(request.type==='PROBE') {
       const found=inspect(profile);
       const close=dismissal();
-      return {kind:found.kind,obstacle:found.obstacle,canDismiss:!!close,dismissKey:close?.key,reason:found.reason,href:found.href,key:found.key,diagnostics:found.diagnostics,chatRoute:found.obstacle?null:storeChatRoute()};
+      return {kind:found.kind,obstacle:found.obstacle,canDismiss:!!close,dismissKey:close?.key,reason:found.reason,href:found.href,key:found.key,diagnostics:found.diagnostics,chatRoute:found.obstacle?null:storeChatRoute(),engine:found.engine,opened:found.opened,frames:found.frames,opening:supplierChat?.status()};
     }
+    if(request.type==='OPEN_CHAT')return supplierChat?supplierChat.start(request):{ok:false,reason:'Новый механизм доступен только Alibaba и Made-in-China'};
+    if(request.type==='STOP_OPEN_CHAT'){supplierChat?.stop(request.token);return {ok:true};}
     if(request.type==='PICK_START')return startPicker(request);
     if(request.type==='PICK_STOP'){stopPicker();return {ok:true};}
     if(request.type==='DISMISS_CHALLENGE')return (async()=>{
@@ -300,6 +305,7 @@
     if(request.type==='CONTACT') {
       const found=inspect(profile);
       if(found.kind!=='contact') return {ok:false,reason:found.reason || found.obstacle || 'Контакт изменился'};
+      if(supplierChat)return {ok:supplierChat.click(found),key:found.key};
       const href=found.contact.getAttribute('href') || '';
       if(href && !/^(https?:|#|javascript:)/i.test(href)) return {ok:false,reason:'Контакт открывается во внешнем приложении. Откройте веб-чат вручную.'};
       found.contact.click(); return {ok:true,key:found.key};
@@ -330,9 +336,10 @@
     return {ok:false,reason:'Неизвестная команда'};
   }
   chrome.runtime.onMessage.addListener((request,sender,respond)=>{
-    if(sender.id!==chrome.runtime.id || !['PROBE','CONTACT','PREPARE','SEND','PICK_START','PICK_STOP','DISMISS_CHALLENGE'].includes(request.type)) return;
+    if(sender.id!==chrome.runtime.id || !['PROBE','CONTACT','PREPARE','SEND','PICK_START','PICK_STOP','DISMISS_CHALLENGE','OPEN_CHAT','STOP_OPEN_CHAT'].includes(request.type)) return;
     Promise.resolve().then(()=>handle(request)).then(respond,error=>respond({ok:false,kind:'ambiguous',reason:'Ошибка селектора или формы: '+error.message}));
     return true;
   });
+  addEventListener('pagehide',()=>supplierChat?.stop());
   chrome.runtime.sendMessage({type:'PAGE_READY',chatRoute:obstacle()?null:storeChatRoute()}).catch(()=>{});
 })();

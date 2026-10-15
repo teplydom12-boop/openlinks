@@ -131,13 +131,15 @@ try:
         supplier.goto('https://test.en.alibaba.com/')
         supplier.add_script_tag(path=str(ROOT/'extension/rules-shared.js'))
         supplier.add_script_tag(path=str(ROOT/'extension/routes-1688-shared.js'))
+        supplier.add_script_tag(path=str(ROOT/'extension/supplier-chat.js'))
         supplier.add_script_tag(path=str(ROOT/'extension/content.js'))
         result = supplier.evaluate("adapter('PROBE')")
-        assert result['kind']=='contact' and result['href']=='https://test.en.alibaba.com/chat'
+        assert result['kind']=='contact' and result['href'] is None
         passed('semantic contact discovery')
         supplier.goto('https://test.en.alibaba.com/chat')
         supplier.add_script_tag(path=str(ROOT/'extension/rules-shared.js'))
         supplier.add_script_tag(path=str(ROOT/'extension/routes-1688-shared.js'))
+        supplier.add_script_tag(path=str(ROOT/'extension/supplier-chat.js'))
         supplier.add_script_tag(path=str(ROOT/'extension/content.js'))
         assert supplier.evaluate("adapter('PROBE')")['kind']=='chat'
         result = supplier.evaluate("adapter('PREPARE')")
@@ -198,25 +200,29 @@ try:
         supplier.goto('https://test.en.made-in-china.com/captured')
         supplier.add_script_tag(path=str(ROOT/'extension/rules-shared.js'))
         supplier.add_script_tag(path=str(ROOT/'extension/routes-1688-shared.js'))
+        supplier.add_script_tag(path=str(ROOT/'extension/supplier-chat.js'))
         supplier.add_script_tag(path=str(ROOT/'extension/content.js'))
         result=supplier.evaluate("adapter('PROBE')")
         assert result['kind']=='contact' and result['diagnostics']['adapter']=='mic'
         assert supplier.evaluate("adapter('CONTACT')")['ok']
-        assert supplier.evaluate('headerClicks')==1 and supplier.evaluate('otherClicks')==0
+        assert supplier.evaluate('headerClicks')==0 and supplier.evaluate('otherClicks')==1
         expect(supplier.locator('#inquiryContent')).to_have_value('')
         assert supplier.evaluate('inquiryClicks')==0
-        passed('captured MIC structure: selects storefront chat and ignores repeated actions, stubs and inquiry')
+        passed('MIC reference order: first visible J-open-tm is selected; inquiry remains untouched')
         supplier.evaluate("document.querySelector('#inqueryForm').removeAttribute('action')")
         assert not supplier.evaluate("adapter('PREPARE',{profile:{chat:'body',editor:'#inquiryContent',send:'#inquirySend'}})")['ok']
         expect(supplier.locator('#inquiryContent')).to_have_value('')
         passed('MIC inqueryForm and inquiry markers stay blocked even when action URL is absent')
         supplier.evaluate("document.querySelector('.shop-sign__btns-wrap').insertAdjacentHTML('beforeend','<a class=J-open-tm href=javascript:;>Chat Now</a>')")
-        assert supplier.evaluate("adapter('PROBE')")['kind']=='ambiguous'
-        passed('competing header chat targets are still rejected rather than arbitrarily deduplicated')
+        assert supplier.evaluate("adapter('PROBE')")['kind']=='contact'
+        assert supplier.evaluate("adapter('CONTACT')")['ok']
+        assert supplier.evaluate('otherClicks')==2 and supplier.evaluate('headerClicks')==0
+        passed('repeated MIC chat controls follow the reference selector/DOM order without stopping on duplicate hooks')
 
         supplier.goto('https://test.en.alibaba.com/captured')
         supplier.add_script_tag(path=str(ROOT/'extension/rules-shared.js'))
         supplier.add_script_tag(path=str(ROOT/'extension/routes-1688-shared.js'))
+        supplier.add_script_tag(path=str(ROOT/'extension/supplier-chat.js'))
         supplier.add_script_tag(path=str(ROOT/'extension/content.js'))
         assert supplier.evaluate("adapter('PROBE')")['kind']=='chat'
         assert supplier.evaluate("adapter('PREPARE')")['ok']
@@ -242,6 +248,7 @@ try:
         supplier.goto('https://test.1688.com/captured')
         supplier.add_script_tag(path=str(ROOT/'extension/rules-shared.js'))
         supplier.add_script_tag(path=str(ROOT/'extension/routes-1688-shared.js'))
+        supplier.add_script_tag(path=str(ROOT/'extension/supplier-chat.js'))
         supplier.add_script_tag(path=str(ROOT/'extension/content.js'))
         assert 'CAPTCHA' in supplier.evaluate("adapter('PROBE')")['obstacle']
         assert not supplier.evaluate("adapter('CONTACT')")['ok']
@@ -269,6 +276,7 @@ try:
         supplier.goto('https://air.1688.com/captured-shell')
         supplier.add_script_tag(path=str(ROOT/'extension/rules-shared.js'))
         supplier.add_script_tag(path=str(ROOT/'extension/routes-1688-shared.js'))
+        supplier.add_script_tag(path=str(ROOT/'extension/supplier-chat.js'))
         supplier.add_script_tag(path=str(ROOT/'extension/content.js'))
         result=supplier.evaluate("adapter('PROBE')")
         assert result['kind']=='waiting' and result['diagnostics']['chatFrames']==1
@@ -278,6 +286,7 @@ try:
         supplier.goto('https://example-shop.1688.com/')
         supplier.add_script_tag(path=str(ROOT/'extension/rules-shared.js'))
         supplier.add_script_tag(path=str(ROOT/'extension/routes-1688-shared.js'))
+        supplier.add_script_tag(path=str(ROOT/'extension/supplier-chat.js'))
         supplier.add_script_tag(path=str(ROOT/'extension/content.js'))
         metadata=supplier.evaluate("adapter('PROBE')")
         assert metadata['kind']=='contact' and 'touid=cnalichn' in metadata['chatRoute']
@@ -293,6 +302,7 @@ try:
         supplier.goto('https://test.en.alibaba.com/captured')
         supplier.add_script_tag(path=str(ROOT/'extension/rules-shared.js'))
         supplier.add_script_tag(path=str(ROOT/'extension/routes-1688-shared.js'))
+        supplier.add_script_tag(path=str(ROOT/'extension/supplier-chat.js'))
         supplier.add_script_tag(path=str(ROOT/'extension/content.js'))
         supplier.evaluate("""document.body.innerHTML='<div class=dm-compose><textarea class=dm-draft></textarea><button class=dm-submit><span>Deliver</span></button></div><button class=vendor-contact>Talk to our team</button>';window.unknownClicks=0;window.earlyPointerDown=0;document.querySelector('.dm-submit').addEventListener('pointerdown',()=>earlyPointerDown++);document.querySelector('.dm-submit').addEventListener('click',()=>unknownClicks++);document.querySelector('.dm-draft').value='Private draft must not be recorded';""")
         assert supplier.evaluate("adapter('PICK_START',{field:'editor',token:'editor-lesson'})")['ok']
@@ -330,6 +340,7 @@ try:
         restored.goto('https://second.en.alibaba.com/')
         restored.add_script_tag(path=str(ROOT/'extension/rules-shared.js'))
         restored.add_script_tag(path=str(ROOT/'extension/routes-1688-shared.js'))
+        restored.add_script_tag(path=str(ROOT/'extension/supplier-chat.js'))
         restored.add_script_tag(path=str(ROOT/'extension/content.js'))
         restored.evaluate("rules=>{window.restoredRules=JSON.parse(rules);restoredRules.push(OpenLinksRules.makeRule({field:'send',selector:'.missing-template'},location.href,'alibaba'));}",persisted_rules)
         replay=restored.evaluate("adapter('PROBE',{profile:{rules:restoredRules}})")
@@ -343,6 +354,7 @@ try:
         supplier.goto('https://first-named.1688.com/')
         supplier.add_script_tag(path=str(ROOT/'extension/rules-shared.js'))
         supplier.add_script_tag(path=str(ROOT/'extension/routes-1688-shared.js'))
+        supplier.add_script_tag(path=str(ROOT/'extension/supplier-chat.js'))
         supplier.add_script_tag(path=str(ROOT/'extension/content.js'))
         supplier.evaluate("document.body.innerHTML='<button class=vendor-contact>Talk to our team</button>'")
         assert supplier.evaluate("adapter('PICK_START',{field:'contact',token:'named-shop'})")['ok']
@@ -352,6 +364,7 @@ try:
         supplier.goto('https://second-named.1688.com/')
         supplier.add_script_tag(path=str(ROOT/'extension/rules-shared.js'))
         supplier.add_script_tag(path=str(ROOT/'extension/routes-1688-shared.js'))
+        supplier.add_script_tag(path=str(ROOT/'extension/supplier-chat.js'))
         supplier.add_script_tag(path=str(ROOT/'extension/content.js'))
         supplier.evaluate("rule=>{window.namedRule=JSON.parse(rule);document.body.innerHTML='<button class=vendor-contact>Talk to our team</button>';window.namedClicks=0;document.querySelector('button').onclick=()=>namedClicks++;}",named_rule)
         result=supplier.evaluate("adapter('PROBE',{profile:{rules:[namedRule]}})")
@@ -363,6 +376,7 @@ try:
         # native input updates the editor's model. Include Unicode, markup and a newline.
         supplier.goto('https://air.1688.com/rich-composer')
         supplier.add_script_tag(path=str(ROOT/'extension/rules-shared.js'))
+        supplier.add_script_tag(path=str(ROOT/'extension/supplier-chat.js'))
         supplier.add_script_tag(path=str(ROOT/'extension/content.js'))
         rich_message='Hello <b>供应商</b>!\nWeChat: test & demo'
         supplier.evaluate("message=>{document.querySelector('pre').textContent=message;}",rich_message)
@@ -396,6 +410,7 @@ try:
         # storefront action. It must transfer to another shop and survive reload.
         supplier.goto('https://first.en.made-in-china.com/')
         supplier.add_script_tag(path=str(ROOT/'extension/rules-shared.js'))
+        supplier.add_script_tag(path=str(ROOT/'extension/supplier-chat.js'))
         supplier.add_script_tag(path=str(ROOT/'extension/content.js'))
         supplier.evaluate("document.body.innerHTML='<div class=webtm-min-box aria-label=tm data-testid=min-first style=width:100px;height:40px>Supplier One</div>'")
         assert supplier.evaluate("adapter('PICK_START',{field:'contact',token:'mic-minimized'})")['ok']
@@ -405,6 +420,7 @@ try:
         assert 'Supplier One' not in mic_rule
         supplier.goto('https://second.en.made-in-china.com/')
         supplier.add_script_tag(path=str(ROOT/'extension/rules-shared.js'))
+        supplier.add_script_tag(path=str(ROOT/'extension/supplier-chat.js'))
         supplier.add_script_tag(path=str(ROOT/'extension/content.js'))
         supplier.evaluate("rule=>{window.micRule=JSON.parse(rule);document.body.innerHTML='<div class=webtm-min-box aria-label=tm data-testid=min-second style=width:100px;height:40px>Supplier Two</div>';window.minimizedClicks=0;document.querySelector('[aria-label=tm]').onclick=()=>minimizedClicks++;}",mic_rule)
         result=supplier.evaluate("adapter('PROBE',{profile:{rules:[micRule]}})")

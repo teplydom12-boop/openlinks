@@ -95,7 +95,8 @@ function render() {
   for(const rule of state.rules || []) {
     const item=element('p'),remove=element('button','Забыть','link-button');
     remove.type='button';
-    item.append(element('span',`${PLATFORMS[rule.platform].label} · ${fieldNames[rule.field]} · ${rule.scope.host}${rule.scope.path} · ${rule.selector} `),remove);
+    const archived=['alibaba','mic'].includes(rule.platform) && rule.field==='contact' && rule.engine!=='supplier-chat-v2';
+    item.append(element('span',`${PLATFORMS[rule.platform].label} · ${fieldNames[rule.field]}${archived?' · прежний механизм, отключено':''} · ${rule.scope.host}${rule.scope.path} · ${rule.selector} `),remove);
     remove.addEventListener('click',()=>command('FORGET_RULE',{id:rule.id}).catch(e=>toast(e.message,true)));learned.append(item);
   }
   if(!(state.rules || []).length)learned.append(element('p','Правил пока нет. При остановке задачи покажите нужный элемент на странице.','hint'));

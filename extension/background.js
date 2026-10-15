@@ -1,8 +1,10 @@
 import {migrateState, validateSettings, classify, parseList, dueJob, eligibility, PLATFORMS, FINAL} from './lib/core.js';
 import './rules-shared.js';
 import './routes-1688-shared.js';
+import './supplier-chat.js';
 const {makeRule,mergeRule}=globalThis.OpenLinksRules;
 const routes1688=globalThis.OpenLinks1688;
+const supplierChat=globalThis.OpenLinksSupplierChat;
 
 const KEY = 'openlinksState';
 const CHAT_LOAD_MS = 30000;
@@ -54,15 +56,70 @@ async function call(job, frameId, type, extra = {}) {
 }
 async function probe(job) {
   const results = await Promise.all((await frames(job)).map(async frame => {
-    try { return {...await call(job, frame.frameId, 'PROBE'), frameId:frame.frameId,pageUrl:frame.url}; }
+    try { return {...await call(job, frame.frameId, 'PROBE'), frameId:frame.frameId,parentFrameId:frame.parentFrameId ?? 0,pageUrl:frame.url}; }
     catch { return null; }
   }));
-  return results.filter(Boolean);
+  const present=results.filter(Boolean);
+  function accessible(result,seen=new Set()) {
+    if(!supplierChat.supports(job.platform) || result.frameId===0)return true;
+    if(seen.has(result.frameId))return false;
+    seen.add(result.frameId);
+    const parent=present.find(item=>item.frameId===result.parentFrameId);
+    if(!parent?.frames || !accessible(parent,seen))return false;
+    let candidates=parent.frames.filter(frame=>frame.url===result.pageUrl);
+    if(!candidates.length)candidates=parent.frames.filter(frame=>{
+      try {const a=new URL(frame.url),b=new URL(result.pageUrl);return a.origin+a.pathname===b.origin+b.pathname;}catch{return false;}
+    });
+    return candidates.length===1 && candidates[0].visible;
+  }
+  return present.filter(result=>accessible(result));
+}
+async function stopOpening(job) {
+  const opening=job?.chatOpening;if(!opening || opening.status==='stopped')return;
+  opening.status='stopped';
+  await call({...job,tabId:opening.tabId},opening.frameId,'STOP_OPEN_CHAT',{token:opening.token}).catch(()=>{});
+}
+function watchingSupplierChat(state,job) {
+  return supplierChat.supports(job?.platform) && job.status==='blocked' && !job.needsTabCheck &&
+    state.learning?.jobId===job.id && state.learning.automatic===true && ['contact','editor','chat'].includes(state.learning.field);
+}
+async function openSupplierChat(state,job,results) {
+  const available=results.filter(result=>result.engine===supplierChat.ENGINE);
+  const frame=available.find(result=>result.frameId===0) || (available.length===1?available[0]:null);
+  if(!frame) {
+    if(Date.now()-job.stepAt>CHAT_LOAD_MS) {halt(state,job,'Новый механизм чата ещё не загрузился. Обновите вкладку магазина и нажмите «Проверить снова».');await save(state);}
+    else await alarm(Date.now()+2000);
+    return;
+  }
+  let opening=job.chatOpening;
+  if(opening?.status==='opening' && Date.now()-opening.at>=supplierChat.TIMEOUT_MS) {
+    await askForHelp(state,job,'За 20 секунд окно чата не открылось. Покажите кнопку чата на странице.','contact');return;
+  }
+  if(!opening || opening.status==='stopped') {
+    opening=job.chatOpening={token:crypto.randomUUID(),tabId:job.tabId,frameId:frame.frameId,at:Date.now(),attempts:0,lastClick:0,status:'opening'};
+    job.status='contacting';job.stepAt=Date.now();
+    event(state,'chat_open',job,'Новый механизм: ищу штатную кнопку каждые 700 мс, до 3 кликов с интервалом 5 секунд, не более 20 секунд. Проверяю видимость окна чата.');
+    await save(state);
+  }
+  if(opening.tabId!==job.tabId || opening.frameId!==frame.frameId){await stopOpening(job);await save(state);await alarm(Date.now()+1000);return;}
+  if(frame.opening?.token!==opening.token) {
+    const reply=await call(job,opening.frameId,'OPEN_CHAT',{token:opening.token,at:opening.at,attempts:opening.attempts,lastClick:opening.lastClick});
+    if(!reply?.ok){halt(state,job,reply?.reason || 'Не удалось запустить механизм чата. Обновите вкладку.');await save(state);return;}
+  }
+  await alarm(opening.at+supplierChat.TIMEOUT_MS+500);
 }
 async function stopLearning(state,job) {
+  await stopOpening(job);
   const learning=state.learning;state.learning=null;
   if(!learning || !job)return;
   await Promise.all(learning.frameIds.map(id=>call({...job,tabId:learning.tabId},id,'PICK_STOP').catch(()=>{})));
+}
+async function joinLearningFrame(state,job,sender) {
+  const learning=state.learning;
+  if(!job || !learning || sender.tab?.id!==learning.tabId || learning.frameIds.includes(sender.frameId))return;
+  try {if(classify(sender.url).platform!==job.platform)return;}catch{return;}
+  learning.frameIds.push(sender.frameId);await save(state);
+  await call(job,sender.frameId,'PICK_START',{field:learning.field,token:learning.token}).catch(()=>{});
 }
 async function armLearning(state,job,field,automatic=false) {
   if(!['contact','editor','send','chat'].includes(field))throw new Error('Неизвестный этап обучения');
@@ -147,6 +204,16 @@ async function performSend(state, job) {
 async function tick() {
   const state = await load();
   let job = state.queue.find(j => j.id === state.activeId);
+  if(supplierChat.supports(job?.platform) && watchingSupplierChat(state,job)) {
+    const results=await probe(job).catch(()=>[]);
+    if(!results.some(result=>result.obstacle)) {
+      const ready=results.filter(result=>result.kind==='chat').length===1;
+      if(ready || (state.learning.field==='contact' && results.some(result=>result.opened))) {
+        job.chatOpened=true;await resumeChatDiscovery(state,job,'Чат загрузился. Завершаю автоматический запрос обучения и проверяю редактор.');
+      }
+    }
+    if(!state.running){await alarm();return;}
+  }
   // A delayed popup/frame can finish loading while automatic teaching has paused
   // the queue. Keep observing only that unresolved pre-send stage, never a user pause.
   if(job?.platform==='1688' && !job.needsTabCheck &&
@@ -241,6 +308,14 @@ async function tick() {
     await save(state); return;
   }
   delete job.challengeAttempt;
+  if(supplierChat.supports(job.platform) && results.some(result=>result.opened || result.kind==='chat')) {
+    await stopOpening(job);
+    if(!job.chatOpened) {
+      job.chatOpened=true;job.stepAt=Date.now();
+      event(state,'chat_discovered',job,'Новый механизм распознал открытое окно чата. Кнопки открытия больше не нажимаются; проверяю редактор.','observation');
+      await save(state);
+    }
+  }
   if(job.platform==='1688') {
     let learned=false;
     const store=routes1688.storeKey(job.url);
@@ -276,10 +351,18 @@ async function tick() {
     return;
   }
   const ambiguous = results.find(result => result.kind === 'ambiguous');
+  if(supplierChat.supports(job.platform)) {
+    if(job.chatOpened) {
+      if(ambiguous){await askForHelp(state,job,ambiguous.reason,'editor');return;}
+      if(Date.now()-job.stepAt>CHAT_LOAD_MS) {
+        const d=results.find(result=>result.diagnostics?.editors)?.diagnostics;
+        await askForHelp(state,job,'Окно чата открыто. Покажите недостающий элемент внутри диалога.',d?.editors?(d.sends?'chat':'send'):'editor');
+      } else await alarm(Date.now()+2000);
+    } else await openSupplierChat(state,job,results);
+    return;
+  }
   if (ambiguous) { await askForHelp(state,job,ambiguous.reason,ambiguous.diagnostics?.editors || job.chatOpened?'editor':'contact'); return; }
-  // Alibaba/MIC may expose another learned control after opening their widget.
-  // 1688 has its separate storefront -> messenger routing flow.
-  if ((job.status==='visiting' && !job.chatOpened) || (job.status==='contacting' && job.platform!=='1688')) {
+  if (job.status==='visiting' && !job.chatOpened) {
     // Prefer the main frame. Never arbitrarily choose between different contacts.
     const contactFrames = results.filter(result => result.kind === 'contact');
     const contact = contactFrames.find(result => result.frameId === 0) || (contactFrames.length === 1 ? contactFrames[0] : null);
@@ -320,6 +403,31 @@ async function safeTick() {
   }
 }
 async function dispatch(message, sender) {
+  if(message.type==='CHAT_OPEN_EVENT') {
+    const state=await load(),job=state.queue.find(item=>item.id===state.activeId),opening=job?.chatOpening;
+    if(!job || !supplierChat.supports(job.platform) || !state.running || job.status!=='contacting' || job.chatOpened ||
+      opening?.status!=='opening' || message.jobId!==job.id || message.token!==opening.token || sender.tab?.id!==opening.tabId || sender.frameId!==opening.frameId || classify(sender.url).platform!==job.platform)return {ok:false};
+    if(message.phase==='attempt') {
+      const now=Date.now();
+      if(message.attempt!==opening.attempts+1 || message.attempt>supplierChat.MAX_ATTEMPTS || now-opening.at>=supplierChat.TIMEOUT_MS ||
+        (opening.lastClick && now-opening.lastClick<supplierChat.RETRY_MS))return {ok:false};
+      opening.attempts=message.attempt;opening.lastClick=now;
+      event(state,'chat_open_attempt',job,`Открытие чата: попытка ${opening.attempts}/3; ${String(message.selector || '').slice(0,500)}${message.hidden?' (скрытая штатная кнопка)':''}. Прокрутка, наведение и штатный клик; отправка сообщения не выполняется.`);
+      await save(state);return {ok:true};
+    }
+    if(message.phase==='opened') {
+      job.chatOpened=true;job.stepAt=Date.now();await stopOpening(job);
+      event(state,'chat_discovered',job,'Окно чата открылось. Завершаю поиск кнопки и проверяю редактор.','observation');
+      await save(state);await safeTick();return {ok:true};
+    }
+    if(['blocked','timeout','error'].includes(message.phase)) {
+      await stopOpening(job);
+      if(message.phase==='blocked'){halt(state,job,String(message.reason || 'Нужен вход или проверка сайта').slice(0,700));await save(state);}
+      else await askForHelp(state,job,String(message.reason || 'Чат не открылся').slice(0,700),'contact');
+      return {ok:true};
+    }
+    return {ok:false};
+  }
   if(message.type==='LEARN_PICK' || message.type==='LEARN_CANCEL') {
     const state=await load(),job=state.queue.find(item=>item.id===state.activeId),learning=state.learning;
     if(!job || !learning || message.token!==learning.token || sender.tab?.id!==learning.tabId || !learning.frameIds.includes(sender.frameId))throw new Error('Обучающий клик устарел или пришёл из другой вкладки');
@@ -338,9 +446,12 @@ async function dispatch(message, sender) {
     if(rule.field==='send')job.manualSend=true;
     await save(state);
     if(rule.field==='contact') {
-      const reply=await call(job,sender.frameId,'CONTACT');
-      if(!reply.ok)await askForHelp(state,job,reply.reason || 'Кнопка изменилась после выбора','contact');
-      else {rememberContact(job,{frameId:sender.frameId,pageUrl:sender.url,key:reply.key || rule.selector});await save(state);}
+      if(supplierChat.supports(job.platform)){delete job.chatOpening;job.chatOpened=false;await save(state);}
+      else {
+        const reply=await call(job,sender.frameId,'CONTACT');
+        if(!reply.ok)await askForHelp(state,job,reply.reason || 'Кнопка изменилась после выбора','contact');
+        else {rememberContact(job,{frameId:sender.frameId,pageUrl:sender.url,key:reply.key || rule.selector});await save(state);}
+      }
     }
     await alarm(Date.now()+1000);return {ok:true};
   }
@@ -355,15 +466,12 @@ async function dispatch(message, sender) {
       else if(sender.frameId===0)await adoptChatTab(state,{...sender.tab,url:sender.url});
     }
     if (sender.tab?.id === job?.tabId) {
-      if(watchingChat(state,job)){await safeTick();return {ok:true};}
-      if(state.learning && !state.learning.frameIds.includes(sender.frameId)) {
-        try {
-          if(classify(sender.url).platform===job.platform) {
-            state.learning.frameIds.push(sender.frameId);await save(state);
-            await call(job,sender.frameId,'PICK_START',{field:state.learning.field,token:state.learning.token});
-          }
-        } catch { /* Only accessible frames on the selected platform are taught. */ }
-      } else await safeTick();
+      if(watchingChat(state,job) || watchingSupplierChat(state,job)) {
+        await safeTick();
+        const latest=await load();
+        await joinLearningFrame(latest,latest.queue.find(item=>item.id===latest.activeId),sender);
+      } else if(state.learning)await joinLearningFrame(state,job,sender);
+      else await safeTick();
     }
     return {ok:true};
   }
@@ -399,6 +507,7 @@ async function dispatch(message, sender) {
       if (!job || job.status !== 'blocked') throw new Error('Нет заблокированной задачи');
       if(job.needsTabCheck)throw new Error('Сначала выберите и привяжите вкладку чата: её старый номер мог измениться после перезапуска');
       await stopLearning(state,job);
+      if(supplierChat.supports(job.platform)){delete job.chatOpening;job.chatOpened=false;}
       job.status=job.resumeStatus==='visiting'?'visiting':'contacting'; job.stepAt=Date.now(); job.reason=''; state.running=true;
       event(state,'recheck',job,'Повторная проверка существующей вкладки без нового посещения');
       await save(state); await alarm(Date.now()+1000); return {ok:true};
@@ -410,7 +519,8 @@ async function dispatch(message, sender) {
     case 'FORGET_RULE':
       state.rules=state.rules.filter(rule=>rule.id!==message.id);
       if(job)job.profile.rules=state.rules.filter(rule=>rule.platform===job.platform);
-      event(state,'rule_removed',job,'Выбранное правило удалено.');await save(state);return {ok:true};
+      if(supplierChat.supports(job?.platform))await stopOpening(job);
+      event(state,'rule_removed',job,'Выбранное правило удалено.');await save(state);if(state.running)await alarm(Date.now()+1000);return {ok:true};
     case 'FORGET_CHAT_ROUTE': {
       const key=routes1688.storeKey(message.store);if(!key)throw new Error('Некорректный адрес магазина');
       for(const saved of Object.keys(state.chatRoutes))if(routes1688.storeKey(saved)===key)delete state.chatRoutes[saved];
@@ -426,6 +536,7 @@ async function dispatch(message, sender) {
       const tab=await chrome.tabs.get(Number(message.tabId));
       if(classify(tab.url).platform!==job.platform)throw new Error('Вкладка другой площадки');
       await stopLearning(state,job);job.tabId=tab.id;
+      if(supplierChat.supports(job.platform)){delete job.chatOpening;job.chatOpened=false;}
       if(job.status!=='uncertain'){job.status='contacting';job.stepAt=Date.now();job.reason='';state.running=true;}
       delete job.needsTabCheck;
       rememberChat(state,job,tab.url);event(state,'chat_tab',job,'Вкладка явно выбрана пользователем. Проверьте получателя.');await save(state);await alarm(Date.now()+1000);return {ok:true};
@@ -530,6 +641,11 @@ async function adoptChatTab(state,tab,allowKnownRecipient=false) {
     rememberChat(state,job,tab.pendingUrl || tab.url,'переход текущей вкладки в чат');
     if(before!==state.chatRoutes[routes1688.storeKey(job.url)]?.url)await save(state);
     if(routes1688.isMessenger(tab.pendingUrl || tab.url))await note1688Chat(state,job);
+    if(supplierChat.supports(job.platform) && supplierChat.isMessenger(tab.pendingUrl || tab.url,job.platform) && (state.running || watchingSupplierChat(state,job))) {
+      job.chatOpened=true;
+      if(watchingSupplierChat(state,job))await resumeChatDiscovery(state,job,'Открылась страница мессенджера. Перехожу к редактору.');
+      await stopOpening(job);await save(state);
+    }
     return;
   }
   if(job.status==='review')return;
@@ -545,12 +661,17 @@ async function adoptChatTab(state,tab,allowKnownRecipient=false) {
       job.popupCandidates=job.popupCandidates.filter(id=>id!==tab.id);
       job.ignoredPopupIds=[...(job.ignoredPopupIds || []),tab.id];await save(state);return;
     }
+    if(supplierChat.supports(job.platform) && (!supplierChat.isMessenger(tab.pendingUrl || tab.url,job.platform) || job.needsTabCheck || (!state.running && !watchingSupplierChat(state,job)))) {await save(state);return;}
     if(job.platform==='1688') {
       if((expected && observed && expected!==observed) || job.needsTabCheck || (!state.running && !watchingChat(state,job))) {await save(state);return;}
       // Editor/chat lessons belong to the old document. Resume discovery in
       // this related new tab; the next probe will teach only if still necessary.
       if(watchingChat(state,job))await resumeChatDiscovery(state,job,'Открылась вкладка чата 1688. Завершаю устаревший запрос обучения и проверяю редактор в новой вкладке.');
-    } else await stopLearning(state,job);
+    } else {
+      if(watchingSupplierChat(state,job))await resumeChatDiscovery(state,job,'Открылась вкладка мессенджера. Перехожу к редактору.');
+      else await stopLearning(state,job);
+      job.chatOpened=true;job.status='contacting';
+    }
     job.tabId=tab.id; job.stepAt=Date.now(); event(state,'chat_tab',job,'Открыта вкладка чата площадки');
     if(job.status==='blocked')job.resumeStatus='contacting';
     rememberChat(state,job,tab.pendingUrl || tab.url);
