@@ -33,7 +33,7 @@ export function classify(raw) {
 }
 export function initialState() {
   return {
-    version: 4, running: false, activeId: null, waiting: null, activity: null, learning:null, rules:[], chatRoutes:{}, queue: [], events: [], slots: [],
+    version: 5, running: false, activeId: null, waiting: null, activity: null, learning:null, rules:[], chatRoutes:{}, queue: [], events: [], slots: [],
     settings: {message: '', review: true, intervals: { '1688': 180, alibaba: 420, mic: 60 },
       profiles: Object.fromEntries(Object.keys(PLATFORMS).map(key => [key, {
         chat: '', contact: '', editor: '', send: '', success: '',
@@ -42,21 +42,22 @@ export function initialState() {
 }
 export function migrateState(saved) {
   if (!saved) return initialState();
-  if (saved.version === 4) return saved;
+  if (saved.version === 5) return saved;
   const state = structuredClone(saved);
-  state.version = 4; state.running = false; state.waiting = null; state.activity = null; state.learning=null; state.rules=(state.rules || []).map(upgradeRule);state.chatRoutes||={};
+  state.version = 5; state.running = false; state.waiting = null; state.activity = null; state.learning=null; state.rules=(state.rules || []).map(upgradeRule);state.chatRoutes||={};
   state.settings.review = true;
   for (const profile of Object.values(state.settings.profiles)) profile.chat ||= '';
   const active = state.queue.find(job => job.id === state.activeId);
   for(const job of state.queue) if(job.profile) job.profile.rules=state.rules.filter(rule=>rule.platform===job.platform);
   if (active) {
     const started=active.status==='sending' || active.status==='uncertain';
-    active.status = started ? 'attempt_unknown' : 'blocked';
-    if(started){active.finishedAt=Date.now();state.activeId=null;}
+    active.status = started ? (active.platform==='1688'?'uncertain':'attempt_unknown') : 'blocked';
+    if(started && active.status==='attempt_unknown'){active.finishedAt=Date.now();state.activeId=null;}
+    active.needsTabCheck=true;
     active.reason = 'Расширение обновлено. Обновите вкладки и продолжите задачу; обучение и лимиты сохранены.';
     active.approved = false;
   }
-  state.events.push({id:crypto.randomUUID(),at:Date.now(),type:'upgrade',level:'decision',detail:`Правила магазинов перенесены между поддоменами (${state.rules.length} сохранено). Добавлен обход исчерпанной квоты; история и лимиты сохранены.`});
+  state.events.push({id:crypto.randomUUID(),at:Date.now(),type:'upgrade',level:'decision',detail:`Сохранено правил: ${state.rules.length}. Область Alibaba TrustPass расширена на другие магазины; добавлены этапы открытия чата и проверка редактора 1688. История и лимиты сохранены.`});
   return state;
 }
 export function validateSettings(value) {
@@ -174,7 +175,7 @@ export function scheduleText(state, now = Date.now()) {
     plan.map(j => [iso(j.plannedAt), PLATFORMS[j.platform].label, j.status, j.url].join('\t')).join('\n') + '\n';
 }
 export function reportText(state) {
-  return '# OpenLinks — report.txt\n# Время UTC. attempted = нажатие отправки, attempt_unknown = нет ответа вкладки. Успех, доставка и прочтение не проверяются. sent = старая или ручная отметка.\n' +
+  return '# OpenLinks — report.txt\n# Время UTC. attempted = нажатие отправки, attempt_unknown = нет ответа вкладки. Для новых attempted на 1688 проверено очищение редактора; uncertain = требуется ручная проверка. Сервер, доставка и прочтение не проверяются. sent = старая или ручная отметка.\n' +
     '# время\tсобытие\tURL\tподробности\n' + state.events.map(e =>
       [iso(e.at), e.type, clean(e.url), clean(e.detail)].join('\t')).join('\n') + '\n';
 }
@@ -189,6 +190,7 @@ export const EVENT_LABELS = {
   challenge_close:'Закрываю окно проверки',direct_chat:'Прямой переход в чат',chat_route:'Адрес чата сохранён',
   chat_lookup:'Определяю получателя 1688',chat_lookup_fallback:'Перехожу к обычному открытию чата',chat_route_removed:'Адрес чата забыт',
   quota_deferred:'Площадка отложена из-за лимита',quota_resume:'Возврат к отложенной задаче',
+  remove_job:'Строка удалена',manual_retry:'Повтор по решению пользователя',editor_input:'Ввод текста',composer_accepted:'Редактор 1688 очистился',
 };
 export function activityText(state) {
   return '# OpenLinks — activity.log\n# Наблюдаемые действия, результаты проверок и причины решений. Время UTC.\n' +

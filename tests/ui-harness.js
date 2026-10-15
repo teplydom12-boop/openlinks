@@ -17,6 +17,7 @@ window.chrome={
     if(message.type==='START') state.running=true;
     if(message.type==='PAUSE') state.running=false;
     if(message.type==='REMOVE_PENDING') state.queue=state.queue.filter(j=>j.status!=='pending');
+    if(message.type==='REMOVE_JOB') state.queue=state.queue.filter(j=>j.id!==message.id);
     if(message.type==='FORGET_CHAT_ROUTE')delete state.chatRoutes[message.store];
     const snapshot=structuredClone(state);
     queueMicrotask(()=>storageListeners.forEach(listener=>listener({openlinksState:{newValue:snapshot}},'local')));

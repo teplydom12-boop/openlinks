@@ -17,6 +17,7 @@
     '1688':['#pcV2WangWang'],
   };
   const sentOps = new Set();
+  const preparedEditors = new WeakMap();
   let picker=null;
   let challenge=null;
   const norm = value => String(value || '').replace(/\r\n/g,'\n').trim();
@@ -141,15 +142,27 @@
   function textOf(node) { return norm('value' in node ? node.value : node.innerText); }
   function fill(editor,message) {
     editor.focus();
+    let method='native-value';
     if(editor instanceof HTMLTextAreaElement || editor instanceof HTMLInputElement) {
       const proto=editor instanceof HTMLTextAreaElement ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
       Object.getOwnPropertyDescriptor(proto,'value').set.call(editor,message);
     } else {
-      // Plain text only. Never interpret the message as markup.
-      editor.textContent=message;
+      // Native editing updates rich-editor models; textContent alone only paints
+      // a draft and can leave 1688's Send button inactive. insertText never parses HTML.
+      const selection=getSelection(),range=document.createRange();
+      range.selectNodeContents(editor);selection.removeAllRanges();selection.addRange(range);
+      method='native-insertText';
+      if(!document.execCommand('insertText',false,message)) {
+        editor.textContent=message;method='input-events';
+      }
     }
-    editor.dispatchEvent(new InputEvent('input',{bubbles:true,inputType:'insertText',data:message}));
-    editor.dispatchEvent(new Event('change',{bubbles:true}));
+    editor.dispatchEvent(new InputEvent('input',{bubbles:true,composed:true,inputType:'insertText',data:message}));
+    editor.dispatchEvent(new Event('change',{bubbles:true,composed:true}));
+    // Some legacy composers recalculate availability on keyup. Never synthesize
+    // Enter or another shortcut that could submit the draft.
+    editor.dispatchEvent(new KeyboardEvent('keyup',{bubbles:true,composed:true,key:'Unidentified'}));
+    preparedEditors.set(editor,{text:norm(message),method});
+    return method;
   }
   function validation(send) {
     if(!send.form) return '';
@@ -161,14 +174,18 @@
     if(found.kind!=='chat') return {ok:false,reason:found.obstacle || found.reason || 'Не найден однозначный редактор внутри чата. Форма запроса не используется.'};
     const current=textOf(found.editor);
     if(current && current!==norm(request.message)) return {ok:false,reason:'В поле уже есть другой текст. Расширение не перезаписывает чужой черновик.'};
-    if(!current) { fill(found.editor,request.message); await new Promise(resolve=>setTimeout(resolve,350)); }
+    let inputMethod=preparedEditors.get(found.editor)?.method || 'existing-draft';
+    // Repair an equal draft left by an older version, without touching other text.
+    if(!current || (site==='1688' && preparedEditors.get(found.editor)?.text!==norm(request.message))) {
+      inputMethod=fill(found.editor,request.message);await new Promise(resolve=>setTimeout(resolve,350));
+    }
     const fresh=inspect(request.profile);
-    if(fresh.kind!=='chat' || fresh.editor!==found.editor || fresh.send!==found.send) return {ok:false,reason:fresh.reason || fresh.obstacle || 'Интерфейс чата изменился при заполнении'};
-    if(textOf(found.editor)!==norm(request.message)) return {ok:false,reason:'Сайт не принял текст. Проверьте редактор вручную.'};
-    const reason=validation(found.send);
+    if(fresh.kind!=='chat' || fresh.editor!==found.editor) return {ok:false,reason:fresh.reason || fresh.obstacle || 'Интерфейс чата изменился при заполнении'};
+    if(textOf(fresh.editor)!==norm(request.message)) return {ok:false,reason:'Сайт не принял текст. Проверьте редактор вручную.'};
+    const reason=validation(fresh.send);
     if(reason) return {ok:false,reason};
-    if(unavailable(found.send)) return {ok:false,reason:'Кнопка отправки недоступна. Проверьте обязательные поля или ограничения сайта.'};
-    return {ok:true,pageUrl:location.href};
+    if(unavailable(fresh.send)) return {ok:false,reason:'Кнопка отправки недоступна. Проверьте обязательные поля или ограничения сайта.'};
+    return {ok:true,pageUrl:location.href,inputMethod};
   }
   function effectiveProfile(raw={}) {
     const profile={...raw},seen=new Set(),resolved={};
@@ -177,11 +194,11 @@
       if(!globalThis.OpenLinksRules?.matches(rule,location.href))continue;
       learning.scoped++;
       if(seen.has(rule.field))continue;
-      try {
-        const nodes=all(rule.selector);
+      for(const selector of rule.selectors || [rule.selector])try {
+        const nodes=all(selector);
         if(nodes.length===1 && (!rule.tag || nodes[0].localName===rule.tag) && (!rule.label || norm(nodes[0].getAttribute('aria-label') || nodes[0].innerText).toLowerCase()===rule.label.toLowerCase())) {
-          profile[rule.field]=rule.selector;seen.add(rule.field);resolved[rule.field]=nodes[0];learning.applied.push(rule.field+': '+rule.selector);
-        } else learning.rejected.push(rule.field+': '+rule.selector+' — '+(nodes.length!==1?`видимых совпадений ${nodes.length}`:'изменился тип или текст элемента'));
+          profile[rule.field]=selector;seen.add(rule.field);resolved[rule.field]=nodes[0];learning.applied.push(rule.field+': '+selector);break;
+        } else learning.rejected.push(rule.field+': '+selector+' — '+(nodes.length!==1?`видимых совпадений ${nodes.length}`:'изменился тип или текст элемента'));
       } catch {learning.rejected.push(rule.field+': некорректный селектор');}
     }
     // A positional root learned on one template can shift on the next shop.
@@ -194,26 +211,28 @@
     profile._learning=learning;
     return profile;
   }
-  function selectorFor(node) {
+  function selectorsFor(node) {
     const unique=selector=>{try{return all(selector).length===1 && all(selector)[0]===node;}catch{return false;}};
+    const choices=[];
+    const add=selector=>{if(unique(selector) && !choices.includes(selector))choices.push(selector);};
     const tag=node.localName;
-    if(node.id && /^[a-z_][\w:-]{0,70}$/i.test(node.id) && !/\d{4}|[a-f0-9]{10}|:r\d/i.test(node.id)) {
-      const selector='#'+CSS.escape(node.id);if(unique(selector))return selector;
-    }
     for(const attr of ['data-testid','data-action','name','aria-label','placeholder']) {
       const value=node.getAttribute(attr);
-      if(value && value.length<=80) {const selector=`${tag}[${attr}="${CSS.escape(value)}"]`;if(unique(selector))return selector;}
+      if(value && value.length<=80)add(`${tag}[${attr}="${CSS.escape(value)}"]`);
     }
     const classes=[...node.classList].filter(c=>!/^(gray|active|disabled|selected|focus|hover|hide|show|undefined)$|^(css|sc|jsx)[-_]|\d{4}|[a-f0-9]{10}/i.test(c)).slice(0,4);
-    for(let count=1;count<=classes.length;count++) {const selector=tag+classes.slice(0,count).map(c=>'.'+CSS.escape(c)).join('');if(unique(selector))return selector;}
+    for(let count=1;count<=classes.length;count++)add(tag+classes.slice(0,count).map(c=>'.'+CSS.escape(c)).join(''));
+    if(node.id && /^[a-z_][\w:-]{0,70}$/i.test(node.id) && !/\d{4}|[a-f0-9]{10}|:r\d/i.test(node.id))add('#'+CSS.escape(node.id));
+    if(choices.length)return choices.slice(0,12);
     let path='',current=node;
     for(let depth=0;current?.localName && depth<5;depth++,current=current.parentElement) {
       const siblings=current.parentElement?[...current.parentElement.children].filter(n=>n.localName===current.localName):[current];
       path=current.localName+`:nth-of-type(${siblings.indexOf(current)+1})`+(path?' > '+path:'');
-      if(unique(path))return path;
+      if(unique(path))return [path];
     }
     throw new Error('Не удалось составить однозначное правило. Выберите саму кнопку или поле.');
   }
+  function selectorFor(node) {return selectorsFor(node)[0];}
   function stopPicker() {
     if(!picker)return;
     document.removeEventListener('click',picker.listener,true);document.removeEventListener('pointerdown',picker.guard,true);picker.host.remove();picker=null;
@@ -237,7 +256,7 @@
         if(!node || isInquiry(node))throw new Error('Это элемент формы запроса. Укажите элемент именно чата.');
         if(request.field==='chat' && node.matches('body,html'))throw new Error('Укажите контейнер диалога, а не всю страницу.');
         if(request.field==='editor' && !node.matches(EDITORS))throw new Error('Укажите само поле сообщения.');
-        const selector=selectorFor(node),profile=effectiveProfile(request.profile),data={type:'LEARN_PICK',token:request.token,field:request.field,selector,tag:node.localName,label:''};
+        const selectors=selectorsFor(node),selector=selectors[0],profile=effectiveProfile(request.profile),data={type:'LEARN_PICK',token:request.token,field:request.field,selector,selectors,tag:node.localName,label:''};
         if(['contact','send'].includes(request.field))data.label=norm(node.getAttribute('aria-label') || node.innerText).slice(0,80);
         if(['editor','send'].includes(request.field)) {
           const editor=request.field==='editor'?node:all(profile.editor || EDITORS).filter(n=>!isInquiry(n));
@@ -283,11 +302,12 @@
       if(found.kind!=='contact') return {ok:false,reason:found.reason || found.obstacle || 'Контакт изменился'};
       const href=found.contact.getAttribute('href') || '';
       if(href && !/^(https?:|#|javascript:)/i.test(href)) return {ok:false,reason:'Контакт открывается во внешнем приложении. Откройте веб-чат вручную.'};
-      found.contact.click(); return {ok:true};
+      found.contact.click(); return {ok:true,key:found.key};
     }
     if(request.type==='PREPARE') return prepare(request);
-    if(request.type==='SEND') {
-      if(sentOps.has(request.jobId)) return {clicked:false,reason:'Эта попытка уже выполнялась. Повтор запрещён.'};
+    if(request.type==='SEND') return (async()=>{
+      const operation=request.attemptId || request.jobId;
+      if(sentOps.has(operation)) return {clicked:false,reason:'Эта попытка уже выполнялась. Повтор запрещён.'};
       if(location.href!==request.expectedUrl) return {clicked:false,reason:'Адрес страницы изменился. Проверьте получателя.'};
       const found=inspect(profile);
       if(found.kind!=='chat') return {clicked:false,reason:found.reason || found.obstacle || 'Чат больше не доступен; форма запроса не используется'};
@@ -295,9 +315,18 @@
       const reason=validation(found.send);
       if(reason) return {clicked:false,reason};
       if(unavailable(found.send)) return {clicked:false,reason:'Кнопка отправки недоступна'};
-      sentOps.add(request.jobId);
-      found.send.click(); return {clicked:true};
-    }
+      sentOps.add(operation);
+      found.send.click();
+      if(site!=='1688')return {clicked:true};
+      // Check only the local composer consuming the draft, not delivery/read
+      // receipts. A missing editor/navigation is not proof that sending worked.
+      for(let i=0;i<12;i++) {
+        await new Promise(resolve=>setTimeout(resolve,100));
+        if(location.href!==request.expectedUrl || obstacle())break;
+        if(found.editor.isConnected && visible(found.editor) && !textOf(found.editor))return {clicked:true,accepted:true};
+      }
+      return {clicked:true,accepted:false,reason:'После нажатия редактор 1688 не очистился либо чат изменился. Проверьте сообщение вручную; очередь остановлена, автоматического повтора нет.'};
+    })();
     return {ok:false,reason:'Неизвестная команда'};
   }
   chrome.runtime.onMessage.addListener((request,sender,respond)=>{

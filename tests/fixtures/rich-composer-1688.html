@@ -1,0 +1,21 @@
+<!doctype html><html><head><meta charset="utf-8"><title>Synthetic 1688 editor regression</title>
+<style>pre.edit{min-height:80px;min-width:300px;border:1px solid} .disabled{opacity:.6}</style></head><body>
+<!-- Synthetic behavior fixture using the user's reported pre.edit hook.
+     The actual inner 1688 messenger document was not supplied. -->
+<section data-chat-root><pre class="edit" contenteditable="true"></pre><button class="disabled" aria-disabled="true">发送</button><div id="history"></div></section>
+<script>
+window.sendClicks=0;window.nativeEdits=0;window.ignoreSend=false;window.model='';
+const editor=document.querySelector('pre.edit'),send=document.querySelector('button');
+// A DOM-only draft must not update the framework model. Native editing emits
+// a trusted input event, including when invoked via execCommand('insertText').
+editor.addEventListener('input',event=>{if(event.isTrusted){nativeEdits++;model=editor.innerText;}});
+editor.addEventListener('keyup',()=>{
+  const enabled=!!model.trim();send.setAttribute('aria-disabled',String(!enabled));send.classList.toggle('disabled',!enabled);
+});
+send.onclick=()=>{
+  sendClicks++;
+  if(ignoreSend || send.getAttribute('aria-disabled')==='true')return;
+  const row=document.createElement('p');row.className='outgoing';row.textContent=model;document.querySelector('#history').append(row);
+  editor.textContent='';model='';send.setAttribute('aria-disabled','true');
+};
+</script></body></html>

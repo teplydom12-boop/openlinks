@@ -91,6 +91,17 @@ async function finish(state, job, status, detail) {
   // Do not close the conversation. It can contain a reply or a manually completed form.
   if (state.running) await alarm(Date.now()+1000);
 }
+async function interruptedSend(state,job,detail) {
+  if(job.platform==='1688') {
+    halt(state,job,detail+' Проверьте переписку вручную. Очередь остановлена; автоматического повтора нет.','uncertain');
+    await save(state);
+  } else await finish(state,job,'attempt_unknown',detail+' Результат неизвестен; автоматически не повторяю.');
+}
+function contactStep(frame) {return JSON.stringify([frame.frameId,frame.pageUrl,frame.key]);}
+function rememberContact(job,frame) {
+  job.contactSteps ||= [];
+  const step=contactStep(frame);if(!job.contactSteps.includes(step))job.contactSteps.push(step);
+}
 async function performSend(state, job) {
   const now = Date.now();
   const allowed = eligibility(state, job.platform, 'send', now);
@@ -110,20 +121,27 @@ async function performSend(state, job) {
   }
   // Persist BEFORE the side effect. Never retry a send after a disconnect/restart.
   job.status = 'sending';
+  job.attemptId = crypto.randomUUID();
   job.sendAt = Date.now();
   state.slots.push({platform:job.platform, kind:'send', at:job.sendAt, jobId:job.id});
   event(state, 'send_attempt', job, 'Редактор чата и текст проверены повторно. Лимит отправки зарезервирован; нажимаю кнопку ровно один раз. Формы Inquiry не используются.');
   await save(state);
   let result;
-  try {result=await call(job, job.frameId, 'SEND', {expectedUrl:job.reviewUrl});}
+  try {result=await call(job, job.frameId, 'SEND', {expectedUrl:job.reviewUrl,attemptId:job.attemptId});}
   catch {
     event(state,'send_disconnect',job,'Ответ вкладки потерян после начала попытки. Нажатие могло сработать; повтор и ожидание результата отключены.','observation');
-    await finish(state,job,'attempt_unknown','Попытка зарегистрирована без ответа вкладки. Продолжаю очередь; автоматически не повторяю.');
+    await interruptedSend(state,job,'Попытка зарегистрирована без ответа вкладки.');
     return;
   }
+  if(result?.clicked!==true && result?.clicked!==false){await interruptedSend(state,job,'Вкладка не сообщила, было ли выполнено нажатие.');return;}
   if(!result.clicked){await askForHelp(state,job,result.reason || 'Отправка остановлена до нажатия','send');return;}
-  event(state,'clicked',job,'Кнопка чата нажата. Успех, доставка и прочтение не проверяются.');
-  await finish(state,job,'attempted','Нажатие выполнено; перехожу к следующей ссылке без ожидания результата.');
+  event(state,'clicked',job,'Кнопка чата нажата. Доставка и прочтение не проверяются.');
+  if(job.platform==='1688' && result.accepted!==true) {
+    halt(state,job,result.reason || 'Не подтверждено очищение редактора 1688 после нажатия. Проверьте переписку вручную; автоматического повтора нет.','uncertain');
+    await save(state);return;
+  }
+  if(job.platform==='1688')event(state,'composer_accepted',job,'Редактор 1688 очистился после нажатия. Это локальная реакция чата; сервер, доставка и прочтение не проверяются.','observation');
+  await finish(state,job,'attempted',job.platform==='1688'?'Редактор очистился после нажатия; перехожу к следующей ссылке.':'Нажатие выполнено; перехожу к следующей ссылке без ожидания результата.');
 }
 async function tick() {
   const state = await load();
@@ -178,7 +196,7 @@ async function tick() {
     } catch (error) { halt(state, job, 'Не удалось открыть вкладку: '+error.message); await save(state); }
     return;
   }
-  if(job.status==='sending') {await finish(state,job,'attempt_unknown','Возобновление после прерывания попытки. Результат не проверяется, повтор не выполняется.');return;}
+  if(job.status==='sending') {await interruptedSend(state,job,'Возобновление после прерывания попытки.');return;}
   if (['blocked','uncertain'].includes(job.status)) { state.running=false; await save(state); return; }
   let results;
   try { results = await probe(job); }
@@ -236,17 +254,21 @@ async function tick() {
     job.status = 'review'; job.reviewUrl = reply.pageUrl; job.approved = job.manualSend || !state.settings.review;job.manualSend=false;
     job.reason = state.settings.review ? 'Проверьте получателя и текст, затем подтвердите отправку.' : '';
     event(state, 'draft_ready', job, state.settings.review ? 'Текст вставлен в чат. Жду проверки получателя и подтверждения пользователя.' : 'Текст вставлен в чат. Автоматический режим: повторно проверю чат и лимит перед отправкой.');
+    if(reply.inputMethod)event(state,'editor_input',job,'Способ ввода: '+reply.inputMethod+'. Текст в редакторе проверен.','observation');
     await save(state);
     if (job.approved) await performSend(state, job);
     return;
   }
   const ambiguous = results.find(result => result.kind === 'ambiguous');
   if (ambiguous) { await askForHelp(state,job,ambiguous.reason,ambiguous.diagnostics?.editors?'editor':'contact'); return; }
-  if (job.status === 'visiting') {
+  // Alibaba/MIC may expose another learned control after opening their widget.
+  // 1688 has its separate storefront -> messenger routing flow.
+  if (job.status==='visiting' || (job.status==='contacting' && job.platform!=='1688')) {
     // Prefer the main frame. Never arbitrarily choose between different contacts.
     const contactFrames = results.filter(result => result.kind === 'contact');
     const contact = contactFrames.find(result => result.frameId === 0) || (contactFrames.length === 1 ? contactFrames[0] : null);
-    if (contact) {
+    if (contact && !job.contactSteps?.includes(contactStep(contact)) && (job.contactSteps?.length || 0)<8) {
+      rememberContact(job,contact);
       event(state,'chat_open',job,`Выбрана единственная кнопка чата во фрейме ${contact.frameId}. ${contact.href ? 'Открываю её HTTPS-ссылку в текущей вкладке.' : 'Нажимаю кнопку открытия диалога.'}`,'decision');
       job.status = 'contacting'; job.stepAt = Date.now();
       await save(state);
@@ -275,7 +297,7 @@ async function safeTick() {
   catch (error) {
     const state=await load();
     const job=state.queue.find(j=>j.id===state.activeId);
-    if(job?.status==='sending')await finish(state,job,'attempt_unknown','Попытка прервана: '+error.message+'. Не проверяю результат и не повторяю.');
+    if(job?.status==='sending')await interruptedSend(state,job,'Попытка прервана: '+error.message+'.');
     else {halt(state,job,'Ошибка доступа к вкладке или форме: '+error.message);await save(state);}
   }
 }
@@ -300,6 +322,7 @@ async function dispatch(message, sender) {
     if(rule.field==='contact') {
       const reply=await call(job,sender.frameId,'CONTACT');
       if(!reply.ok)await askForHelp(state,job,reply.reason || 'Кнопка изменилась после выбора','contact');
+      else {rememberContact(job,{frameId:sender.frameId,pageUrl:sender.url,key:reply.key || rule.selector});await save(state);}
     }
     await alarm(Date.now()+1000);return {ok:true};
   }
@@ -357,7 +380,7 @@ async function dispatch(message, sender) {
       event(state,'recheck',job,'Повторная проверка существующей вкладки без нового посещения');
       await save(state); await alarm(Date.now()+1000); return {ok:true};
     case 'TEACH':
-      if(!job || FINAL.has(job.status) || job.status==='sending')throw new Error('Нет задачи для обучения');
+      if(!job || FINAL.has(job.status) || ['sending','uncertain'].includes(job.status))throw new Error('Сначала проверьте результат начатой отправки');
       await armLearning(state,job,message.field);return {ok:true};
     case 'CANCEL_TEACH':
       await stopLearning(state,job);event(state,'learning_cancel',job,'Обучение отменено; задача остаётся на паузе.');await save(state);return {ok:true};
@@ -379,13 +402,21 @@ async function dispatch(message, sender) {
       if(!job || job.status==='sending' || FINAL.has(job.status))throw new Error('Нет задачи для привязки');
       const tab=await chrome.tabs.get(Number(message.tabId));
       if(classify(tab.url).platform!==job.platform)throw new Error('Вкладка другой площадки');
-      await stopLearning(state,job);job.tabId=tab.id;job.status='contacting';job.stepAt=Date.now();job.reason='';state.running=true;
+      await stopLearning(state,job);job.tabId=tab.id;
+      if(job.status!=='uncertain'){job.status='contacting';job.stepAt=Date.now();job.reason='';state.running=true;}
       delete job.needsTabCheck;
       rememberChat(state,job,tab.url);event(state,'chat_tab',job,'Вкладка явно выбрана пользователем. Проверьте получателя.');await save(state);await alarm(Date.now()+1000);return {ok:true};
     }
     case 'MARK_SENT':
       if (!job || job.status !== 'uncertain') throw new Error('Нет неподтверждённой отправки');
+      state.running=true;
       await finish(state,job,'sent','Пользователь вручную подтвердил наличие отправленного сообщения'); return {ok:true};
+    case 'RETRY_SEND':
+      if(!job || job.status!=='uncertain')throw new Error('Нет попытки для ручного повтора');
+      if(job.needsTabCheck)throw new Error('Сначала выберите и привяжите вкладку чата после перезапуска');
+      job.status='contacting';job.stepAt=Date.now();job.reason='';job.approved=false;job.manualSend=true;state.running=true;
+      event(state,'manual_retry',job,'Пользователь указал, что сообщение не отправлено, и запросил новую попытку. Повторно проверю редактор и лимит; прежняя попытка остаётся в счётчике.','decision');
+      await save(state);await alarm(Date.now()+1000);return {ok:true};
     case 'SKIP': {
       const target=state.queue.find(j=>j.id===message.id);
       if (!target || FINAL.has(target.status)) throw new Error('Нечего пропускать');
@@ -393,6 +424,18 @@ async function dispatch(message, sender) {
       if (target.id===state.activeId) await finish(state,target,'skipped','Пропущено пользователем');
       else { target.status='skipped'; event(state,'skipped',target,'Пропущено пользователем'); await save(state); }
       return {ok:true};
+    }
+    case 'REMOVE_JOB': {
+      const target=state.queue.find(item=>item.id===message.id);
+      if(!target)throw new Error('Строка уже удалена');
+      if(target.status==='sending')throw new Error('Дождитесь завершения уже начатого нажатия');
+      if(target.id===state.activeId) {
+        await stopLearning(state,target);state.activeId=null;state.waiting=null;
+      }
+      if(state.waiting?.jobId===target.id)state.waiting=null;
+      state.queue=state.queue.filter(item=>item.id!==target.id);
+      event(state,'remove_job',target,'Строка удалена из очереди. Ссылку можно добавить повторно; история, обучение и счётчики лимитов сохранены.');
+      await save(state);if(state.running)await alarm(Date.now()+1000);return {ok:true};
     }
     case 'REMOVE_PENDING':
       state.queue=state.queue.filter(j=>j.status!=='pending');
@@ -463,8 +506,9 @@ chrome.runtime.onStartup.addListener(()=>exclusive(async()=>{
   if(state.running || state.activeId || deferred.length) {
     const job=state.queue.find(j=>j.id===state.activeId);
     state.learning=null;
-    if(job?.status==='sending'){state.running=false;await finish(state,job,'attempt_unknown','Chrome перезапущен во время попытки. Результат не проверяется; повтор отключён.');return;}
-    halt(state,job,'Chrome перезапущен. Проверьте вкладку перед продолжением.');
+    if(job)job.needsTabCheck=true;
+    if(job?.status==='sending'){state.running=false;await interruptedSend(state,job,'Chrome перезапущен во время попытки.');return;}
+    halt(state,job,'Chrome перезапущен. Проверьте вкладку перед продолжением.',job?.status==='uncertain'?'uncertain':'blocked');
     await save(state);
   }
 }));
@@ -475,8 +519,8 @@ chrome.runtime.onInstalled.addListener((details={})=>exclusive(async()=>{
     for(const deferred of state.queue.filter(item=>item.status==='deferred_send')){deferred.approved=false;deferred.needsTabCheck=true;}
     const job=state.queue.find(item=>item.id===state.activeId);
     await stopLearning(state,job);
-    if(job?.status==='sending'){state.running=false;await finish(state,job,'attempt_unknown','Расширение обновлено во время попытки. Результат не проверяется; повтор отключён.');return;}
-    if(state.running || job) halt(state,job,'Расширение обновлено. Обновите вкладку магазина/чата перед продолжением.');
+    if(job?.status==='sending'){state.running=false;await interruptedSend(state,job,'Расширение обновлено во время попытки.');return;}
+    if(state.running || job) halt(state,job,'Расширение обновлено. Обновите вкладку магазина/чата перед продолжением.',job?.status==='uncertain'?'uncertain':'blocked');
     if(job) job.approved=false;
   }
   await save(state); await alarm();

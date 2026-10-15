@@ -15,7 +15,7 @@
   function scopeFor(url) {
     const u=new URL(url),p=platform(url);
     if(!p) throw new Error('Площадка не поддерживается');
-    const suffix=p==='alibaba'?'.en.alibaba.com':p==='mic'?'.en.made-in-china.com':null;
+    const suffix=p==='alibaba'?(u.hostname.endsWith('.trustpass.alibaba.com')?'.trustpass.alibaba.com':'.en.alibaba.com'):p==='mic'?'.en.made-in-china.com':null;
     const storefront=(suffix && u.hostname.endsWith(suffix)) || (p==='1688' && is1688Storefront(u.hostname));
     return {host:storefront?(suffix?'*'+suffix:'*.shop.1688.com'):u.hostname,
       path:storefront?'/':u.pathname.slice(0,u.pathname.lastIndexOf('/')+1)||'/'};
@@ -45,7 +45,8 @@
   function makeRule(data,url,expectedPlatform) {
     const p=platform(url);
     if(p!==expectedPlatform || !fields.has(data.field) || typeof data.selector!=='string' || !data.selector.trim() || data.selector.length>500) throw new Error('Неверное правило обучения');
-    return {id:crypto.randomUUID(),platform:p,field:data.field,selector:data.selector,tag:String(data.tag||'').toLowerCase().slice(0,30),
+    const selectors=[...new Set([data.selector,...(Array.isArray(data.selectors)?data.selectors:[])])].filter(value=>typeof value==='string' && value.trim() && value.length<=500).slice(0,12);
+    return {id:crypto.randomUUID(),platform:p,field:data.field,selector:data.selector,selectors,tag:String(data.tag||'').toLowerCase().slice(0,30),
       label:String(data.label||'').slice(0,80),scope:scopeFor(url),createdAt:Date.now()};
   }
   function direct1688(raw) {

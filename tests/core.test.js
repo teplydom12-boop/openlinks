@@ -1,6 +1,15 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {initialState, migrateState, classify, parseList, WINDOW_MS, nextAllowed, makePlan, dueJob, scheduleText, reportText, activityText, validateSettings} from '../extension/lib/core.js';
+test('v4 migration upgrades TrustPass learning and keeps an interrupted 1688 send unresolved',()=>{
+ const saved=initialState();saved.version=4;saved.activeId='send';saved.running=true;
+ saved.rules=[{id:'lesson',platform:'alibaba',field:'contact',selector:'a.action-alitalk',scope:{host:'first.trustpass.alibaba.com',path:'/'}}];
+ saved.queue=[{id:'send',platform:'1688',status:'sending',profile:{rules:[]}}];
+ saved.slots=[{platform:'1688',kind:'send',at:123}];
+ const state=migrateState(saved);
+ assert.equal(state.version,5);assert.equal(state.rules[0].id,'lesson');assert.equal(state.rules[0].scope.host,'*.trustpass.alibaba.com');
+ assert.equal(state.queue[0].status,'uncertain');assert.equal(state.activeId,'send');assert.equal(state.running,false);assert.ok(state.queue[0].needsTabCheck);assert.deepEqual(state.slots,saved.slots);
+});
 
 test('URL validation rejects lookalike domains, credential URLs and unsafe protocols',()=>{
   for(const url of ['http://a.1688.com','https://1688.com.evil.test','https://evil1688.com','javascript:alert(1)','https://user:secret@a.alibaba.com','https://a.alibaba.com:444/']) assert.throws(()=>classify(url));
@@ -111,7 +120,7 @@ test('v3 migration keeps persisted lessons, chat routes and reservations and bro
  state.rules=[{id:'retained',platform:'1688',field:'contact',selector:'.service',scope:{host:'keyangjixie.1688.com',path:'/'}}];
  state.chatRoutes={'https://shop.1688.com/':{url:'saved'}};state.slots=[{platform:'1688',kind:'visit',at:123}];
  const upgraded=migrateState(JSON.parse(JSON.stringify(state)));
- assert.equal(upgraded.version,4);assert.equal(upgraded.rules[0].id,'retained');assert.equal(upgraded.rules[0].scope.host,'*.shop.1688.com');
+ assert.equal(upgraded.version,5);assert.equal(upgraded.rules[0].id,'retained');assert.equal(upgraded.rules[0].scope.host,'*.shop.1688.com');
  assert.deepEqual(upgraded.chatRoutes,state.chatRoutes);assert.deepEqual(upgraded.slots,state.slots);
  assert.deepEqual(migrateState(upgraded),upgraded);
 });

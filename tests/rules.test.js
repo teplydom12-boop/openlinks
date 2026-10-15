@@ -2,6 +2,18 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import '../extension/rules-shared.js';
 const {makeRule,matches,direct1688,upgradeRule,mergeRule}=globalThis.OpenLinksRules;
+test('TrustPass supplier scopes migrate and transfer without including login or messenger hosts',()=>{
+ const rule=makeRule({field:'contact',selector:'a.action-item.action-alitalk'},'https://first.trustpass.alibaba.com/','alibaba');
+ assert.equal(rule.scope.host,'*.trustpass.alibaba.com');
+ assert.ok(matches(rule,'https://second.trustpass.alibaba.com/store.html'));
+ for(const host of ['login.alibaba.com','onetalk.alibaba.com','trustpass.alibaba.com','first.en.alibaba.com','first.trustpass.alibaba.com.evil.test'])assert.ok(!matches(rule,'https://'+host+'/'));
+ const old={...rule,scope:{host:'first.trustpass.alibaba.com',path:'/'}};
+ const migrated=upgradeRule(old);assert.equal(migrated.id,rule.id);assert.ok(matches(migrated,'https://second.trustpass.alibaba.com/'));
+});
+test('alternative selectors survive serialization and reject unbounded input',()=>{
+ const rule=makeRule({field:'editor',selector:'textarea[name="draft"]',selectors:['textarea[name="draft"]','textarea.compose',null,'a'.repeat(501)]},'https://webim.made-in-china.com/super-tm/','mic');
+ assert.deepEqual(JSON.parse(JSON.stringify(rule)).selectors,['textarea[name="draft"]','textarea.compose']);
+});
 test('learned storefront rule transfers across suppliers only within its platform',()=>{
  const rule=makeRule({field:'send',selector:'button.dm-submit',tag:'button',label:'Deliver'},'https://first.en.alibaba.com/','alibaba');
  assert.ok(matches(rule,'https://second.en.alibaba.com/'));

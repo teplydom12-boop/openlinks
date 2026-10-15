@@ -184,6 +184,7 @@ try:
             'https://test.1688.com/captured': 'captured-1688-store.html',
             'https://air.1688.com/captured-shell': 'captured-1688-shell.html',
             'https://example-shop.1688.com/': '1688-metadata.html',
+            'https://air.1688.com/rich-composer': 'rich-composer-1688.html',
         }
         # Every iframe/resource request is intercepted locally. No vendor request
         # or challenge is fetched, even though the fixtures preserve frame URLs.
@@ -358,6 +359,76 @@ try:
         assert supplier.evaluate("adapter('CONTACT',{profile:{rules:[namedRule]}})")['ok']
         assert supplier.evaluate('namedClicks')==1
         passed('trusted 1688 contact lesson transfers between different named subdomains after page reload')
+        # The user's draft is visibly present but Send remains inactive until
+        # native input updates the editor's model. Include Unicode, markup and a newline.
+        supplier.goto('https://air.1688.com/rich-composer')
+        supplier.add_script_tag(path=str(ROOT/'extension/rules-shared.js'))
+        supplier.add_script_tag(path=str(ROOT/'extension/content.js'))
+        rich_message='Hello <b>供应商</b>!\nWeChat: test & demo'
+        supplier.evaluate("message=>{document.querySelector('pre').textContent=message;}",rich_message)
+        assert supplier.evaluate('model')==''
+        prepared=supplier.evaluate("message=>adapter('PREPARE',{message})",rich_message)
+        assert prepared['ok'] and prepared['inputMethod']=='native-insertText', prepared
+        assert supplier.evaluate('model')==rich_message and supplier.evaluate('nativeEdits')>0
+        assert supplier.locator('pre b').count()==0
+        edits=supplier.evaluate('nativeEdits')
+        assert supplier.evaluate("message=>adapter('PREPARE',{message})",rich_message)['ok']
+        assert supplier.evaluate('nativeEdits')==edits
+        sent=supplier.evaluate("message=>adapter('SEND',{message,expectedUrl:location.href})",rich_message)
+        assert sent['clicked'] and sent['accepted'] and supplier.evaluate('sendClicks')==1
+        expect(supplier.locator('#history .outgoing')).to_have_text(rich_message)
+        assert not supplier.evaluate("message=>adapter('SEND',{message,expectedUrl:location.href})",rich_message)['clicked']
+        passed('1688 equal DOM-only draft is repaired by native editing; Unicode/plain text preserved; duplicate preparation does not rewrite it')
+        supplier.evaluate('ignoreSend=true')
+        assert supplier.evaluate("adapter('PREPARE')")['ok']
+        ignored=supplier.evaluate("adapter('SEND',{attemptId:'ignored',expectedUrl:location.href})")
+        assert ignored['clicked'] and not ignored['accepted']
+        assert supplier.locator('pre').inner_text()=='Hello, WeChat: demo'
+        assert supplier.evaluate('sendClicks')==2
+        assert not supplier.evaluate("adapter('SEND',{attemptId:'ignored',expectedUrl:location.href})")['clicked']
+        passed('1688 ignored click is reported as unaccepted with draft intact and no automatic retry')
+        supplier.evaluate("document.querySelector('pre').textContent='User draft'")
+        assert not supplier.evaluate("adapter('PREPARE')")['ok']
+        assert supplier.locator('pre').inner_text()=='User draft'
+        passed('1688 native editing never overwrites a different user draft')
+
+        # A MIC lesson describes the minimized chat control, not the initial
+        # storefront action. It must transfer to another shop and survive reload.
+        supplier.goto('https://first.en.made-in-china.com/')
+        supplier.add_script_tag(path=str(ROOT/'extension/rules-shared.js'))
+        supplier.add_script_tag(path=str(ROOT/'extension/content.js'))
+        supplier.evaluate("document.body.innerHTML='<div class=webtm-min-box aria-label=tm data-testid=min-first style=width:100px;height:40px>Supplier One</div>'")
+        assert supplier.evaluate("adapter('PICK_START',{field:'contact',token:'mic-minimized'})")['ok']
+        supplier.locator('[aria-label=tm]').click()
+        supplier.wait_for_function('lessonMessages.length===1')
+        mic_rule=supplier.evaluate("JSON.stringify(OpenLinksRules.makeRule(lessonMessages[0],location.href,'mic'))")
+        assert 'Supplier One' not in mic_rule
+        supplier.goto('https://second.en.made-in-china.com/')
+        supplier.add_script_tag(path=str(ROOT/'extension/rules-shared.js'))
+        supplier.add_script_tag(path=str(ROOT/'extension/content.js'))
+        supplier.evaluate("rule=>{window.micRule=JSON.parse(rule);document.body.innerHTML='<div class=webtm-min-box aria-label=tm data-testid=min-second style=width:100px;height:40px>Supplier Two</div>';window.minimizedClicks=0;document.querySelector('[aria-label=tm]').onclick=()=>minimizedClicks++;}",mic_rule)
+        result=supplier.evaluate("adapter('PROBE',{profile:{rules:[micRule]}})")
+        assert result['kind']=='contact' and result['diagnostics']['learning']['applied']
+        assert any('min-first' in reason for reason in result['diagnostics']['learning']['rejected'])
+        assert supplier.evaluate("adapter('CONTACT',{profile:{rules:[micRule]}})")['ok']
+        assert supplier.evaluate('minimizedClicks')==1
+        # All selectors now match multiple controls, so the rule must not choose
+        # an arbitrary supplier from a minimized-conversations list.
+        supplier.evaluate("document.body.append(document.querySelector('[aria-label=tm]').cloneNode(true))")
+        assert supplier.evaluate("adapter('PROBE',{profile:{rules:[micRule]}})")['kind']!='contact'
+        passed('MIC minimized-chat lesson survives supplier/test-ID changes via saved alternatives; ambiguous recipients are rejected')
+
+        ui.get_by_role('button',name='Очередь поставщиков').click()
+        row=ui.locator('#queue-body tr').filter(has_text='jcnyjxsb.en.alibaba.com')
+        row.get_by_role('button',name='Удалить',exact=True).click()
+        expect(ui.locator('#queue-count')).to_have_text('11')
+        expect(row).to_have_count(0)
+        ui.locator('#supplier-input').fill('https://jcnyjxsb.en.alibaba.com/')
+        ui.locator('#add').click()
+        expect(ui.locator('#queue-count')).to_have_text('12')
+        expect(ui.locator('#import-result')).to_contain_text('Добавлено: 1')
+        expect(ui.locator('#queue-body tr').last).to_contain_text('jcnyjxsb.en.alibaba.com')
+        passed('individual delete button removes one supplier and reimport places it at the end of the queue')
         assert not errors, errors
         passed('no browser JavaScript errors')
         browser.close()

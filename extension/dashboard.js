@@ -83,6 +83,9 @@ function render() {
     $('#active-message').textContent=active.message || '';
     $('#approve').hidden=active.status!=='review' || active.approved===true;
     $('#recheck').hidden=active.status!=='blocked';
+    $('#mark-sent').hidden=active.status!=='uncertain';
+    $('#retry-send').hidden=active.status!=='uncertain';
+    for(const field of ['contact','editor','send','chat'])$('#teach-'+field).disabled=['sending','uncertain'].includes(active.status);
     $('#skip-active').disabled=active.status==='sending';
     $('#cancel-teach').hidden=!state.learning;
   }
@@ -119,6 +122,9 @@ function render() {
       const skip=element('button','Пропустить','link-button');
       skip.addEventListener('click',()=>command('SKIP',{id:job.id}).catch(e=>toast(e.message,true))); action.append(skip);
     }
+    const remove=element('button','Удалить','link-button danger');remove.type='button';
+    remove.disabled=job.status==='sending';remove.title='Удалить строку; историю и лимиты сохранить';
+    remove.addEventListener('click',()=>command('REMOVE_JOB',{id:job.id}).catch(e=>toast(e.message,true)));action.append(remove);
     row.append(element('td',String(index+1)),urlCell,element('td',PLATFORMS[job.platform].label),element('td',time(job.plannedAt)),status,action); body.append(row);
   }
   $('#empty').hidden=state.queue.length>0;
@@ -185,6 +191,8 @@ $('#import-file').addEventListener('change',async event=>{
 button('#examples',async()=>{ $('#supplier-input').value=await (await fetch('examples.txt')).text(); });
 button('#approve',()=>command('APPROVE'));
 button('#recheck',()=>command('RECHECK'));
+button('#mark-sent',()=>command('MARK_SENT'));
+button('#retry-send',()=>command('RETRY_SEND'));
 for(const field of ['contact','editor','send','chat'])button('#teach-'+field,async()=>{
   await command('TEACH',{field});
   const active=state.queue.find(job=>job.id===state.activeId);

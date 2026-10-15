@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import {readFileSync} from 'node:fs';
 import {initialState} from '../extension/lib/core.js';
 const listener=()=>{const list=[];return {list,addListener(fn){list.push(fn);}};};
-let stored,clicks,contactClicks,commands,requests,beforeClick,probeKind,sendResult,frameUrl,tabCount,opened,missing,obstacle,prepareOk,lookupPages,fetches,probeRoute,updated;
+let stored,clicks,contactClicks,commands,requests,beforeClick,probeKind,sendResult,frameUrl,tabCount,opened,missing,obstacle,prepareOk,lookupPages,fetches,probeRoute,updated,probeKey;
 const metadataFixture=readFileSync(new URL('./fixtures/1688-metadata.html',import.meta.url),'utf8');
 globalThis.fetch=async(url,options)=>{fetches.push({url,credentials:options.credentials});const html=lookupPages.get(url);if(html===undefined)throw new Error('No local metadata fixture');return new Response(html,{headers:{'content-type':'text/html'}});};
 const runtime={onMessage:listener(),onStartup:listener(),onInstalled:listener(),getURL:path=>'chrome-extension://test/'+path};
@@ -13,10 +13,10 @@ globalThis.chrome={runtime,alarms,storage:{local:{get:async()=>({openlinksState:
  sendMessage:async(tab,data)=>{
   commands.push(data.type);
   requests.push(structuredClone(data));
-  if(data.type==='PROBE')return {kind:probeKind,chatRoute:probeRoute,obstacle:obstacle?.text,canDismiss:obstacle?.dismiss,dismissKey:obstacle?.key,reason:probeKind==='inquiry'?'Форма запроса, нужен чат':undefined};
+  if(data.type==='PROBE')return {kind:probeKind,key:probeKey,chatRoute:probeRoute,obstacle:obstacle?.text,canDismiss:obstacle?.dismiss,dismissKey:obstacle?.key,reason:probeKind==='inquiry'?'Форма запроса, нужен чат':undefined};
   if(data.type==='PREPARE')return {ok:prepareOk,pageUrl:frameUrl,reason:prepareOk?undefined:'Редактор изменился'};
-  if(data.type==='SEND'){clicks++;beforeClick=structuredClone(stored);if(sendResult==='disconnect')throw new Error('Disconnected');return {clicked:sendResult!==false,reason:'Кнопка изменилась'};}
-  if(data.type==='CONTACT'){contactClicks++;return {ok:true};}
+  if(data.type==='SEND'){clicks++;beforeClick=structuredClone(stored);if(sendResult==='disconnect')throw new Error('Disconnected');if(sendResult==='malformed')return {ok:false};return {clicked:sendResult!==false,accepted:sendResult===true,reason:'Кнопка изменилась'};}
+  if(data.type==='CONTACT'){contactClicks++;return {ok:true,key:probeKey};}
   if(data.type==='DISMISS_CHALLENGE'){if(obstacle?.stuck)return {clicked:true,closed:false};obstacle=null;return {clicked:true,closed:true};}
   return {ok:true};
  }},webNavigation:{getAllFrames:async()=>{if(missing)throw new Error('No tab');return [{frameId:0,url:frameUrl}];}},action:{onClicked:listener()},windows:{}};
@@ -24,7 +24,7 @@ await import('../extension/background.js');
 const ui={id:'test',url:'chrome-extension://test/dashboard.html'};
 const message=(type,extra={},sender=ui)=>new Promise(resolve=>runtime.onMessage.list[0]({type,...extra},sender,resolve));
 async function tick(){alarms.onAlarm.list[0]({name:'openlinks-tick'});await message('GET');}
-function reset(){stored=initialState();stored.settings.message='Hello';clicks=0;contactClicks=0;commands=[];requests=[];beforeClick=null;probeKind='chat';sendResult=true;frameUrl='https://a.en.alibaba.com/chat';tabCount=0;opened=[];missing=false;obstacle=null;prepareOk=true;lookupPages=new Map();fetches=[];probeRoute=null;updated=[];}
+function reset(){stored=initialState();stored.settings.message='Hello';clicks=0;contactClicks=0;commands=[];requests=[];beforeClick=null;probeKind='chat';sendResult=true;frameUrl='https://a.en.alibaba.com/chat';tabCount=0;opened=[];missing=false;obstacle=null;prepareOk=true;lookupPages=new Map();fetches=[];probeRoute=null;updated=[];probeKey='#contact';}
 async function review(url='https://a.en.alibaba.com/'){await message('IMPORT',{text:url});await message('START');await tick();await tick();}
 
 test('click is persisted before side effect; completion does not wait for success or read receipt',async()=>{
@@ -208,4 +208,63 @@ test('quota wait performs no background supplier lookup or tab opening',async()=
 test('update during sending finalizes an unknown attempt and preserves quota',async()=>{
  reset();stored.running=true;stored.activeId='x';stored.queue=[{id:'x',platform:'alibaba',url:frameUrl,status:'sending'}];stored.slots=[{platform:'alibaba',kind:'send',at:Date.now()}];
  runtime.onInstalled.list[0]({reason:'update'});await message('GET');assert.equal(stored.queue[0].status,'attempt_unknown');assert.equal(stored.slots.length,1);assert.equal(stored.activeId,null);assert.equal(stored.running,false);
+});
+
+test('1688 ignored click stops the queue and cannot be resumed by START, RECHECK or teaching',async()=>{
+ reset();frameUrl='https://air.1688.com/chat';sendResult='unchanged';await review('https://shop.1688.com/');
+ await message('IMPORT',{text:'https://next.en.made-in-china.com/'});await message('APPROVE');await tick();
+ assert.equal(stored.queue[0].status,'uncertain');assert.equal(stored.running,false);assert.equal(stored.activeId,stored.queue[0].id);
+ for(const [type,extra] of [['START',{}],['RECHECK',{}],['TEACH',{field:'send'}]])assert.equal((await message(type,extra)).ok,false);
+ await message('BIND_TAB',{tabId:1});assert.equal(stored.queue[0].status,'uncertain');assert.equal(stored.running,false);
+ await tick();assert.equal(clicks,1);assert.equal(opened.length,1);
+ const firstAttempt=requests.find(r=>r.type==='SEND').attemptId;
+ sendResult=true;assert.equal((await message('RETRY_SEND')).ok,true);await tick();
+ assert.equal(stored.queue[0].status,'attempted');assert.equal(clicks,2);assert.notEqual(requests.filter(r=>r.type==='SEND').at(-1).attemptId,firstAttempt);
+ assert.equal(stored.slots.filter(s=>s.kind==='send').length,2);
+ await tick();assert.equal(opened.at(-1),'https://next.en.made-in-china.com/');
+});
+test('1688 manual confirmation continues without another click and interrupted sends stay paused across restart',async()=>{
+ reset();frameUrl='https://air.1688.com/chat';sendResult='disconnect';await review('https://shop.1688.com/');await message('APPROVE');await tick();
+ assert.equal(stored.queue[0].status,'uncertain');assert.equal(stored.running,false);
+ runtime.onStartup.list[0]();await message('GET');assert.equal(stored.queue[0].status,'uncertain');assert.ok(stored.queue[0].needsTabCheck);
+ assert.equal((await message('RETRY_SEND')).ok,false);assert.equal((await message('MARK_SENT')).ok,true);
+ assert.equal(stored.queue[0].status,'sent');assert.equal(stored.activeId,null);assert.equal(stored.running,true);assert.equal(clicks,1);
+});
+test('1688 worker recovery retains uncertain operation without opening another supplier',async()=>{
+ reset();stored.running=true;stored.activeId='x';stored.queue=[{id:'x',platform:'1688',url:'https://shop.1688.com/',status:'sending'}];
+ await tick();assert.equal(stored.queue[0].status,'uncertain');assert.equal(stored.activeId,'x');assert.equal(stored.running,false);assert.equal(clicks,0);
+});
+test('subsequent learned contact steps run once each on Alibaba and Made-in-China',async()=>{
+ for(const url of ['https://a.trustpass.alibaba.com/','https://a.en.made-in-china.com/']) {
+  reset();frameUrl=url;probeKind='contact';probeKey='a.shop-chat';await review(url);assert.equal(contactClicks,1);
+  await tick();assert.equal(contactClicks,1);
+  probeKey='div[aria-label="tm"]';await tick();assert.equal(contactClicks,2);assert.equal(stored.queue[0].status,'contacting');
+  await tick();assert.equal(contactClicks,2);assert.equal(stored.learning,null);
+  probeKind='chat';await tick();assert.equal(stored.queue[0].status,'review');
+ }
+});
+test('single-row removal preserves history, quotas and rules and allows reimport of a completed URL',async()=>{
+ reset();await review();await message('APPROVE');await tick();
+ const old=structuredClone(stored.queue[0]),slots=structuredClone(stored.slots),events=structuredClone(stored.events);
+ stored.rules=[{id:'keep'}];assert.equal((await message('REMOVE_JOB',{id:old.id})).ok,true);
+ assert.equal(stored.queue.length,0);assert.deepEqual(stored.slots,slots);assert.deepEqual(stored.events.slice(0,-1),events);assert.deepEqual(stored.rules,[{id:'keep'}]);
+ const result=await message('IMPORT',{text:old.url});assert.equal(result.added,1);assert.equal(stored.queue[0].status,'pending');assert.notEqual(stored.queue[0].id,old.id);
+ await tick();assert.equal(opened.length,1);assert.ok(stored.waiting);
+});
+test('removing a blocked active row cancels its lesson but not other rows or quota reservations',async()=>{
+ reset();probeKind='inquiry';await review();await message('IMPORT',{text:'https://next.en.made-in-china.com/'});
+ const target=stored.activeId,slots=structuredClone(stored.slots);
+ assert.equal((await message('REMOVE_JOB',{id:target})).ok,true);assert.equal(stored.activeId,null);assert.equal(stored.learning,null);
+ assert.equal(stored.queue.length,1);assert.equal(stored.queue[0].status,'pending');assert.deepEqual(stored.slots,slots);assert.ok(commands.includes('PICK_STOP'));
+});
+test('sending row cannot be deleted, and deleting an awaited pending row clears its timer display',async()=>{
+ reset();stored.queue=[{id:'sending',url:frameUrl,platform:'alibaba',status:'sending'}];stored.activeId='sending';
+ assert.equal((await message('REMOVE_JOB',{id:'sending'})).ok,false);assert.equal(stored.queue.length,1);
+ reset();stored.slots=[{platform:'alibaba',kind:'visit',at:Date.now()}];await message('IMPORT',{text:'https://a.en.alibaba.com/'});await message('START');await tick();
+ assert.ok(stored.waiting);await message('REMOVE_JOB',{id:stored.queue[0].id});assert.equal(stored.waiting,null);assert.equal(stored.queue.length,0);assert.equal(stored.slots.length,1);
+});
+
+test('1688 unexpected reply after SEND is uncertain and never starts send teaching',async()=>{
+ reset();frameUrl='https://air.1688.com/chat';sendResult='malformed';await review('https://shop.1688.com/');await message('APPROVE');await tick();
+ assert.equal(stored.queue[0].status,'uncertain');assert.equal(stored.running,false);assert.equal(stored.learning,null);assert.equal(clicks,1);
 });
