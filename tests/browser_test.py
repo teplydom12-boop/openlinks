@@ -164,6 +164,73 @@ try:
         assert supplier.evaluate("adapter('PROBE')")['kind']!='chat'
         assert not supplier.evaluate("adapter('PREPARE')")['ok']
         passed('generic textarea and Send without conversation context are not a chat')
+
+        captures={
+            'https://test.en.made-in-china.com/captured': 'captured-mic-store.html',
+            'https://test.en.alibaba.com/captured': 'captured-alibaba.html',
+            'https://test.1688.com/captured': 'captured-1688-store.html',
+            'https://air.1688.com/captured-shell': 'captured-1688-shell.html',
+        }
+        # Every iframe/resource request is intercepted locally. No vendor request
+        # or challenge is fetched, even though the fixtures preserve frame URLs.
+        def capture_route(route):
+            filename=captures.get(route.request.url)
+            if filename:
+                route.fulfill(body=(ROOT/'tests/fixtures'/filename).read_text(),content_type='text/html')
+            else:
+                route.fulfill(body='<!doctype html><title>Empty frame fixture</title>',content_type='text/html')
+        context.route('**/*',capture_route)
+        supplier.goto('https://test.en.made-in-china.com/captured')
+        supplier.add_script_tag(path=str(ROOT/'extension/content.js'))
+        result=supplier.evaluate("adapter('PROBE')")
+        assert result['kind']=='contact' and result['diagnostics']['adapter']=='mic'
+        assert supplier.evaluate("adapter('CONTACT')")['ok']
+        assert supplier.evaluate('headerClicks')==1 and supplier.evaluate('otherClicks')==0
+        expect(supplier.locator('#inquiryContent')).to_have_value('')
+        assert supplier.evaluate('inquiryClicks')==0
+        passed('captured MIC structure: selects storefront chat and ignores repeated actions, stubs and inquiry')
+        supplier.evaluate("document.querySelector('#inqueryForm').removeAttribute('action')")
+        assert not supplier.evaluate("adapter('PREPARE',{profile:{chat:'body',editor:'#inquiryContent',send:'#inquirySend'}})")['ok']
+        expect(supplier.locator('#inquiryContent')).to_have_value('')
+        passed('MIC inqueryForm and inquiry markers stay blocked even when action URL is absent')
+        supplier.evaluate("document.querySelector('.shop-sign__btns-wrap').insertAdjacentHTML('beforeend','<a class=J-open-tm href=javascript:;>Chat Now</a>')")
+        assert supplier.evaluate("adapter('PROBE')")['kind']=='ambiguous'
+        passed('competing header chat targets are still rejected rather than arbitrarily deduplicated')
+
+        supplier.goto('https://test.en.alibaba.com/captured')
+        supplier.add_script_tag(path=str(ROOT/'extension/content.js'))
+        assert supplier.evaluate("adapter('PROBE')")['kind']=='chat'
+        assert supplier.evaluate("adapter('PREPARE')")['ok']
+        expect(supplier.locator('textarea.send-textarea')).to_have_value('Hello, WeChat: demo')
+        assert supplier.evaluate("adapter('SEND',{expectedUrl:location.href})")['clicked']
+        assert supplier.evaluate('sendClicks')==1
+        assert not supplier.evaluate("adapter('CHECK_SENT',{evidence:{successes:[],outgoing:0}})")['confirmed']
+        passed('captured Alibaba composer: fills and clicks once, but does not invent send confirmation')
+        supplier.evaluate("document.querySelector('.send-box-container').remove()")
+        assert supplier.evaluate("adapter('PROBE')")['kind']=='contact'
+        assert supplier.evaluate("adapter('CONTACT')")['ok']
+        assert supplier.evaluate('headerClicks')==1 and supplier.evaluate('toolbarClicks')==0
+        supplier.evaluate("document.querySelector('.shop-sign-container').remove()")
+        assert supplier.evaluate("adapter('CONTACT')")['ok']
+        assert supplier.evaluate('toolbarClicks')==1
+        passed('captured Alibaba contacts: Russian storefront action first, Chat Now! toolbar fallback')
+
+        supplier.goto('https://test.1688.com/captured')
+        supplier.add_script_tag(path=str(ROOT/'extension/content.js'))
+        assert 'CAPTCHA' in supplier.evaluate("adapter('PROBE')")['obstacle']
+        assert not supplier.evaluate("adapter('CONTACT')")['ok']
+        assert supplier.evaluate('contactClicks')==0
+        supplier.evaluate("document.querySelector('.J_MIDDLEWARE_FRAME_WIDGET').remove()")
+        assert supplier.evaluate("adapter('CONTACT')")['ok']
+        assert supplier.evaluate('contactClicks')==1
+        passed('captured 1688 storefront: visible middleware challenge blocks customer-service action')
+
+        supplier.goto('https://air.1688.com/captured-shell')
+        supplier.add_script_tag(path=str(ROOT/'extension/content.js'))
+        result=supplier.evaluate("adapter('PROBE')")
+        assert result['kind']=='waiting' and result['diagnostics']['chatFrames']==1
+        assert not supplier.evaluate("adapter('PREPARE')")['ok']
+        passed('captured 1688 shell: waits for real iframe editor and ignores feedback textarea')
         assert not errors, errors
         passed('no browser JavaScript errors')
         browser.close()

@@ -1,0 +1,11 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8"><title>Sanitized MIC storefront structure</title></head><body>
+<!-- Structural hooks from 434096135.txt / 220146650.txt; supplier/account data removed. -->
+<div class="details-footer"><a class="J-open-tm tm-status-on" href="javascript:void('Chat Now')" title="Chat with supplier online now!">Chat Now</a><a class="tm-placeholder" href="javascript:void(0)">Chat Now</a></div>
+<div class="shop-sign__btns-wrap"><a class="option-item" href="/sendInquiry/test.html">Send Inquiry</a><a class="J-open-tm tm-status-on" href="javascript:void('Chat Now')" title="Chat with supplier online now!">Chat Now</a><a class="tm-placeholder" href="javascript:void(0)">Chat Now</a></div>
+<div class="info-block bottom"><a class="J-open-tm tm-status-on" href="javascript:void('Chat Now')">Chat Now</a></div>
+<form id="inqueryForm" action="/sendInquiry/test.html"><textarea class="input-textarea sr-sendMsg-area" id="inquiryContent" name="content"></textarea><button fun-inquiry-supplier type="submit" class="btn btn-main sr-sendMsg-btn" id="inquirySend">Send</button></form>
+<script>
+window.headerClicks=0;window.otherClicks=0;window.inquiryClicks=0;
+document.querySelectorAll('.J-open-tm,.tm-placeholder').forEach(node=>node.addEventListener('click',event=>{event.preventDefault();if(node.closest('.shop-sign__btns-wrap') && node.matches('.J-open-tm'))headerClicks++;else otherClicks++;}));
+document.querySelector('form').addEventListener('submit',event=>{event.preventDefault();inquiryClicks++;});
+</script></body></html>

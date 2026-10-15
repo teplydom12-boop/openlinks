@@ -103,3 +103,12 @@ test('successful chat lifecycle logs decisions, observations, approval and send 
     assert.ok(stored.events.some(event=>event.type===type),`missing ${type}`);
   }
 });
+test('extension update pauses an in-flight send without losing its reservation',async()=>{
+  stored=initialState();stored.running=true;stored.settings.review=false;
+  stored.activeId='active';stored.queue=[{id:'active',status:'sending',approved:true,url:'https://a.alibaba.com/'}];
+  stored.slots=[{platform:'alibaba',kind:'send',at:Date.now(),jobId:'active'}];
+  runtime.onInstalled.list[0]({reason:'update'});await message('GET');
+  assert.equal(stored.running,false);assert.equal(stored.settings.review,true);
+  assert.equal(stored.queue[0].status,'uncertain');assert.equal(stored.queue[0].approved,false);
+  assert.equal(stored.slots.length,1);
+});

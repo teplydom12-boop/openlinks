@@ -133,7 +133,7 @@ async function tick() {
     job.probeSignature=signature;
     const findings=results.map(result=>{
       const d=result.diagnostics;
-      return `Фрейм ${result.frameId}: ${result.kind}${d ? `; полей ${d.editors}, кнопок отправки ${d.sends}, областей чата ${d.chatRoots}, кнопок чата ${d.contacts}, исключено запросов ${d.inquiriesIgnored}` : ''}${result.reason ? '; '+result.reason : ''}`;
+      return `Фрейм ${result.frameId}: ${result.kind}${d ? `; адаптер ${d.adapter || 'общий'}, полей ${d.editors}, кнопок отправки ${d.sends}, областей чата ${d.chatRoots}, кнопок чата ${d.contacts}, встроенных чатов ${d.chatFrames || 0}, исключено запросов ${d.inquiriesIgnored}` : ''}${result.reason ? '; '+result.reason : ''}`;
     }).join(' | ') || 'Страница ещё не отвечает: жду загрузки контентного скрипта.';
     event(state,'dom_scan',job,findings,'observation'); await save(state);
   }
@@ -308,8 +308,15 @@ chrome.runtime.onStartup.addListener(()=>exclusive(async()=>{
     await save(state);
   }
 }));
-chrome.runtime.onInstalled.addListener(()=>exclusive(async()=>{
-  const state=await load(); await save(state); await alarm();
+chrome.runtime.onInstalled.addListener((details={})=>exclusive(async()=>{
+  const state=await load();
+  if(details.reason==='update') {
+    state.settings.review=true;
+    const job=state.queue.find(item=>item.id===state.activeId);
+    if(state.running || job) halt(state,job,'Расширение обновлено. Обновите вкладку магазина/чата и проверьте состояние сообщения перед продолжением.',job?.status==='sending' || job?.status==='uncertain' ? 'uncertain' : 'blocked');
+    if(job) job.approved=false;
+  }
+  await save(state); await alarm();
 }));
 chrome.action.onClicked.addListener(async()=>{
   const url=chrome.runtime.getURL('dashboard.html');

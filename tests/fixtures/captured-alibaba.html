@@ -1,0 +1,13 @@
+<!doctype html><html lang="ru"><head><meta charset="utf-8"><title>Sanitized Alibaba Alitalk structure</title></head><body>
+<!-- Structural hooks from 390833943.txt / 407597383.txt; no captured scripts or conversations. -->
+<div class="shop-sign-container"><div class="bc-shop-shopsign-new new-golden"><div class="im-alitalk-container"><a class="action-item icbu-alitalk" href="javascript:;">Пообщаться сейчас</a></div></div></div>
+<div id="J_Toolbar"><div class="module-toolbar J_module"><a class="action-item action-alitalk icbu-alitalk" href="javascript:;">Chat Now!</a></div></div>
+<div class="send-box-container"><div class="send-box-wrapper" id="send-box-wrapper"><div class="send-input-areas" style="display:block"><div class="send-textarea-box undefined"><textarea class="send-textarea" placeholder="Введите ваше сообщение здесь"></textarea></div><div class="send-btn-bar"><div class="send-btn-wrapper"><button type="button" class="im-next-btn im-next-medium im-next-btn-primary send-tool-button gray"><span>отправить</span></button></div></div></div></div></div>
+<script>
+// Test double for site event handlers. This is not captured Alibaba code.
+window.headerClicks=0;window.toolbarClicks=0;window.sendClicks=0;
+document.querySelector('.shop-sign-container a').addEventListener('click',event=>{event.preventDefault();headerClicks++;});
+document.querySelector('#J_Toolbar a').addEventListener('click',event=>{event.preventDefault();toolbarClicks++;});
+document.querySelector('textarea').addEventListener('input',event=>document.querySelector('.send-tool-button').classList.toggle('gray',!event.target.value.trim()));
+document.querySelector('.send-tool-button').addEventListener('click',()=>sendClicks++);
+</script></body></html>
