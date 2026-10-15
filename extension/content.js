@@ -145,22 +145,31 @@
   const editorSpaces = value => String(value ?? '').replace(/\u00a0/g,' ');
   function draftText(value) {return norm(site==='1688'?editorSpaces(value):value);}
   function textOf(node) { return draftText('value' in node ? node.value : node.innerText); }
-  function rawText(node) {return 'value' in node ? node.value : node.innerText;}
   function nativeEdit(request) {
+    if(request.stage==='release') {
+      if(nativeInput?.token===request.token){nativeInput.editor.removeAttribute('data-openlinks-input');nativeInput=null;}
+      return {ok:true};
+    }
     if(site!=='1688' || location.href!==request.expectedUrl)return {ok:false,reason:'Адрес чата изменился'};
     const found=inspect(request.profile),editor=found.editor;
-    if(found.kind!=='chat' || textOf(editor)!==draftText(request.message))return {ok:false,reason:'Редактор или черновик изменился'};
-    if(request.stage==='focus') {
-      editor.focus();
-      if('selectionStart' in editor)editor.setSelectionRange(editor.value.length,editor.value.length);
-      else {const range=document.createRange();range.selectNodeContents(editor);range.collapse(false);const selection=getSelection();selection.removeAllRanges();selection.addRange(range);}
-      nativeInput={token:request.token,editor,text:editorSpaces(rawText(editor))};
+    if(found.kind!=='chat')return {ok:false,reason:'Редактор чата изменился'};
+    // Check the message before the click and after both keys, not halfway
+    // through the browser's temporary representation of the inserted space.
+    if(request.stage!=='space' && textOf(editor)!==draftText(request.message))return {ok:false,reason:'Черновик изменился'};
+    if(request.stage==='locate') {
+      nativeInput?.editor.removeAttribute('data-openlinks-input');
+      nativeInput={token:request.token,editor};
+      editor.setAttribute('data-openlinks-input',request.token);
+      editor.scrollIntoView({block:'center',inline:'center',behavior:'instant'});
+      return {ok:true};
     }
     const operation=nativeInput;
     let active=document.activeElement;while(active?.shadowRoot?.activeElement)active=active.shadowRoot.activeElement;
     if(!operation || operation.token!==request.token || editor!==operation.editor || active!==editor)return {ok:false,reason:'Фокус ушёл из редактора чата'};
-    const expected=operation.text+(request.stage==='space'?' ':'');
-    if(editorSpaces(rawText(editor))!==expected)return {ok:false,reason:'Текст изменился при вводе клавиш; проверьте черновик'};
+    if(request.stage==='focus') {
+      if('selectionStart' in editor)editor.setSelectionRange(editor.value.length,editor.value.length);
+      else {const range=document.createRange();range.selectNodeContents(editor);range.collapse(false);const selection=getSelection();selection.removeAllRanges();selection.addRange(range);}
+    }
     // Do not delete a character after the user moved the caret or selected text.
     if('selectionStart' in editor) {
       if(editor.selectionStart!==editor.value.length || editor.selectionEnd!==editor.value.length)return {ok:false,reason:'Курсор перемещён'};
@@ -171,7 +180,7 @@
       if(tail.toString())return {ok:false,reason:'Курсор перемещён'};
     }
     if(request.stage==='done') {
-      preparedEditors.set(editor,{text:draftText(request.message),method:'chrome-keyboard',native:true});nativeInput=null;
+      preparedEditors.set(editor,{text:draftText(request.message),method:'chrome-mouse-keyboard',native:true});
     }
     return {ok:true};
   }

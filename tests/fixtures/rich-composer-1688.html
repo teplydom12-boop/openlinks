@@ -5,15 +5,16 @@
      Framework behavior is synthetic; no captured conversations or scripts. -->
 <section data-chat-root><pre class="edit" contenteditable="true"></pre><button class="disabled" aria-disabled="true">发送</button><div id="history"></div></section>
 <script>
-window.sendClicks=0;window.nativeEdits=0;window.ignoreSend=false;window.model='';
+window.sendClicks=0;window.nativeEdits=0;window.ignoreSend=false;window.model='';window.mouseClicks=0;window.clickedEditor=false;
 const editor=document.querySelector('pre.edit'),send=document.querySelector('button');
+editor.addEventListener('click',event=>{if(event.isTrusted){mouseClicks++;clickedEditor=true;}});
 // A DOM-only draft must not update the framework model. Native editing emits
 // a trusted input event, including when invoked via execCommand('insertText').
 editor.addEventListener('input',event=>{if(event.isTrusted){nativeEdits++;model=editor.innerText;}});
 editor.addEventListener('keyup',event=>{
   // Reproduce the remaining bug: synthetic keyup/execCommand alone cannot
   // activate Send. The user reports that a real space key activates it.
-  if(!event.isTrusted || !['Space','Backspace'].includes(event.code))return;
+  if(!clickedEditor || !event.isTrusted || !['Space','Backspace'].includes(event.code))return;
   window.lastTrustedKey=event.code;
   const enabled=!!model.trim();send.setAttribute('aria-disabled',String(!enabled));send.classList.toggle('disabled',!enabled);
 });
@@ -21,6 +22,6 @@ send.onclick=()=>{
   sendClicks++;
   if(ignoreSend || send.getAttribute('aria-disabled')==='true')return;
   const row=document.createElement('p');row.className='outgoing';row.textContent=model;document.querySelector('#history').append(row);
-  editor.textContent='';model='';send.setAttribute('aria-disabled','true');
+  editor.textContent='';model='';clickedEditor=false;send.setAttribute('aria-disabled','true');
 };
 </script></body></html>

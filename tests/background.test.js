@@ -2,6 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import {readFileSync} from 'node:fs';
 import {initialState} from '../extension/lib/core.js';
+import {domReply} from './debugger-harness.js';
 const listener=()=>{const list=[];return {list,addListener(fn){list.push(fn);}};};
 let stored,clicks,contactClicks,commands,requests,beforeClick,probeKind,sendResult,frameUrl,tabCount,opened,missing,obstacle,prepareOk,lookupPages,fetches,probeRoute,updated,probeKey,listedTabs,frameList,tabReplies,frameProbes,deliveries;
 let scheduled,removed,canClose,nativeRequired,debuggerFailure,debuggerCalls,nativeFailure;
@@ -30,7 +31,7 @@ await import('../extension/background.js');
 chrome.debugger={
  attach:async target=>{debuggerCalls.push({type:'attach',target});if(debuggerFailure)throw new Error(debuggerFailure);},
  detach:async target=>{debuggerCalls.push({type:'detach',target});},
- sendCommand:async(target,method,params)=>{debuggerCalls.push({target,method,params});},
+ sendCommand:async(target,method,params)=>{debuggerCalls.push({target,method,params});return domReply(method);},
 };
 const ui={id:'test',url:'chrome-extension://test/dashboard.html'};
 const message=(type,extra={},sender=ui)=>new Promise(resolve=>runtime.onMessage.list[0]({type,...extra},sender,resolve));
@@ -91,7 +92,7 @@ test('1688 activates the selected frame before reserving send quota and does not
  assert.equal(stored.queue[0].status,'review');assert.equal(clicks,0);assert.equal(stored.slots.filter(s=>s.kind==='send').length,0);
  assert.equal(debuggerCalls[0].type,'attach');assert.equal(debuggerCalls.at(-1).type,'detach');
  const inputCalls=debuggerCalls.length;
- assert.deepEqual(requests.filter(r=>r.type==='NATIVE_INPUT').map(r=>r.stage),['focus','before','space','done']);
+ assert.deepEqual(requests.filter(r=>r.type==='NATIVE_INPUT').map(r=>r.stage),['locate','focus','space','done','release']);
  await message('APPROVE');await tick();assert.equal(clicks,1);assert.equal(debuggerCalls.length,inputCalls);
 });
 test('debugger attach failure pauses without clicking, reserving quota or teaching the wrong button',async()=>{

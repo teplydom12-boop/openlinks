@@ -59,7 +59,7 @@ async function call(job, frameId, type, extra = {}) {
 async function prepareChat(state,job) {
   const reply=await call(job,job.frameId,'PREPARE');
   if(job.platform!=='1688' || !reply?.needsNativeInput)return reply;
-  event(state,'editor_input',job,'1688: фокусирую редактор, ввожу пробел настоящими событиями Chrome и удаляю его Backspace. Enter не нажимается.');
+  event(state,'editor_input',job,'1688: кликаю мышью в поле сообщения, нажимаю пробел, затем Backspace. Используются настоящие события Chrome; текст проверю после этой последовательности.');
   await save(state);
   try {
     await activate1688({...job,inputUrl:reply.pageUrl},call);
@@ -68,7 +68,7 @@ async function prepareChat(state,job) {
     if(ready.needsNativeInput)throw Object.assign(new Error('Редактор не сохранил результат ввода клавиш'),{inputFailure:'editor',inputStage:'done'});
     return ready;
   } catch(error) {
-    const stage={focus:'при фокусировке',before:'перед вводом пробела',space:'после пробела',done:'после Backspace'}[error.inputStage];
+    const stage={locate:'при поиске поля для клика',focus:'после клика в поле',space:'после пробела',done:'после Backspace'}[error.inputStage];
     const hint=['attach','transport'].includes(error.inputFailure)?'Проверьте разрешение debugger, закройте DevTools этой вкладки и нажмите «Проверить снова».':'Проверьте черновик и нажмите «Проверить снова».';
     return {ok:false,nativeInputError:true,reason:`Не удалось активировать редактор 1688${stage?' ('+stage+')':''}: ${error.message}. ${hint} Отправка не выполнялась.`};
   }

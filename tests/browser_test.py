@@ -406,10 +406,10 @@ try:
             while time.monotonic()<deadline:
                 command=target.evaluate('nativeCommands[0] && {method:nativeCommands[0].method,params:nativeCommands[0].params}')
                 if command:
-                    cdp.send(command['method'],command['params'])
-                    if command['params']['type']=='char':
+                    reply=cdp.send(command['method'],command['params'])
+                    if command['method']=='Input.dispatchKeyEvent' and command['params']['type']=='char':
                         target.evaluate("()=>{nativeSpaceCodes.push(document.querySelector('pre').textContent.slice(-1).charCodeAt(0));}")
-                    target.evaluate('()=>{nativeCommands.shift().resolve();}')
+                    target.evaluate('reply=>{nativeCommands.shift().resolve(reply);}',reply)
                 result=target.evaluate('nativeResult')
                 if result:
                     if expect_error:
@@ -425,7 +425,9 @@ try:
         assert not prepared['ok'] and prepared['needsNativeInput'], prepared
         assert supplier.locator('button').get_attribute('aria-disabled')=='true'
         prepared=prepare_native(rich_message)
-        assert prepared['ok'] and prepared['inputMethod']=='chrome-keyboard', prepared
+        assert prepared['ok'] and prepared['inputMethod']=='chrome-mouse-keyboard', prepared
+        assert supplier.evaluate('mouseClicks')==1
+        assert supplier.locator('[data-openlinks-input]').count()==0
         assert supplier.evaluate('lastTrustedKey')=='Backspace'
         assert supplier.evaluate('nativeSpaceCodes')==[0xA0]
         assert supplier.locator('pre').inner_text()==rich_message
@@ -439,7 +441,7 @@ try:
         assert sent['clicked'] and sent['accepted'] and supplier.evaluate('sendClicks')==1
         expect(supplier.locator('#history .outgoing')).to_have_text(rich_message)
         assert not supplier.evaluate("message=>adapter('SEND',{message,expectedUrl:location.href})",rich_message)['clicked']
-        passed('1688 requires real Space/Backspace: Chrome keyboard activates Send, preserves multiline Unicode text and detaches; duplicate preparation does not type again')
+        passed('1688 requires a trusted mouse click then Space/Backspace: Chrome activates Send, preserves text, detaches and removes its marker')
         # The attached capture has a one-character draft followed by &nbsp;.
         # Test that shape and a composer that preserves ordinary spaces.
         for whitespace,message in [('pre-line','1'),('pre','2')]:
@@ -452,17 +454,18 @@ try:
             assert supplier.evaluate("message=>adapter('SEND',{message,attemptId:'space-'+getComputedStyle(document.querySelector('pre')).whiteSpace,expectedUrl:location.href})",message)['accepted']
         passed('captured 1688 NBSP draft recovers; both NBSP and ordinary native spaces complete without altering the message')
 
-        # NBSP equivalence must not accept an extra space or a changed letter.
+        # Validation runs after the click and both keys. A changed message still
+        # cannot be sent, but temporary browser whitespace is not inspected.
         sends=supplier.evaluate('sendClicks')
-        for replacement in ['1\u00a0\u00a0','2\u00a0']:
-            supplier.evaluate("text=>{let e=document.querySelector('pre');e.textContent='';window.nativeKeys=[];window.beforeNativeCheck=stage=>{if(stage==='space')e.textContent=text;};}",replacement)
+        for replacement in ['12','2']:
+            supplier.evaluate("text=>{let e=document.querySelector('pre');e.textContent='';window.nativeKeys=[];window.beforeNativeCheck=stage=>{if(stage==='done')e.textContent=text;};}",replacement)
             failed=prepare_native('1',expect_error=True)
-            assert failed['inputFailure']=='editor' and failed['inputStage']=='space',failed
-            assert not supplier.evaluate("nativeKeys.some(k=>k.key==='Backspace')")
+            assert failed['inputFailure']=='editor' and failed['inputStage']=='done',failed
+            assert supplier.evaluate("nativeKeys.some(k=>k.key==='Backspace')")
             assert supplier.evaluate('sendClicks')==sends
             assert supplier.evaluate('attaches')==supplier.evaluate('detaches')
         supplier.evaluate("()=>{window.beforeNativeCheck=null;document.querySelector('pre').textContent='';}")
-        passed('genuine letter changes and extra whitespace stop before Backspace or sending, with an editor error and debugger released')
+        passed('final message validation stops a changed draft after the input sequence, without sending and with debugger released')
         supplier.evaluate('ignoreSend=true')
         assert prepare_native()['ok']
         ignored=supplier.evaluate("adapter('SEND',{attemptId:'ignored',expectedUrl:location.href})")
@@ -504,6 +507,7 @@ try:
         supplier.locator('#outside').fill('Keep this unrelated draft')
         prepared=prepare_native(rich_message,target=inner)
         assert prepared['ok'] and inner.evaluate('lastTrustedKey')=='Backspace'
+        assert inner.evaluate('mouseClicks')==1
         assert inner.locator('pre').inner_text()==rich_message
         assert supplier.locator('#outside').input_value()=='Keep this unrelated draft'
         assert inner.evaluate('model')==rich_message
