@@ -191,6 +191,7 @@ export const EVENT_LABELS = {
   chat_lookup:'Определяю получателя 1688',chat_lookup_fallback:'Перехожу к обычному открытию чата',chat_route_removed:'Адрес чата забыт',
   quota_deferred:'Площадка отложена из-за лимита',quota_resume:'Возврат к отложенной задаче',
   remove_job:'Строка удалена',manual_retry:'Повтор по решению пользователя',editor_input:'Ввод текста',composer_accepted:'Редактор 1688 очистился',
+  chat_discovered:'Открытый чат распознан',
 };
 export function activityText(state) {
   return '# OpenLinks — activity.log\n# Наблюдаемые действия, результаты проверок и причины решений. Время UTC.\n' +

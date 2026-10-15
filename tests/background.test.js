@@ -3,28 +3,29 @@ import assert from 'node:assert/strict';
 import {readFileSync} from 'node:fs';
 import {initialState} from '../extension/lib/core.js';
 const listener=()=>{const list=[];return {list,addListener(fn){list.push(fn);}};};
-let stored,clicks,contactClicks,commands,requests,beforeClick,probeKind,sendResult,frameUrl,tabCount,opened,missing,obstacle,prepareOk,lookupPages,fetches,probeRoute,updated,probeKey;
+let stored,clicks,contactClicks,commands,requests,beforeClick,probeKind,sendResult,frameUrl,tabCount,opened,missing,obstacle,prepareOk,lookupPages,fetches,probeRoute,updated,probeKey,listedTabs,frameList,tabReplies,frameProbes,deliveries;
 const metadataFixture=readFileSync(new URL('./fixtures/1688-metadata.html',import.meta.url),'utf8');
 globalThis.fetch=async(url,options)=>{fetches.push({url,credentials:options.credentials});const html=lookupPages.get(url);if(html===undefined)throw new Error('No local metadata fixture');return new Response(html,{headers:{'content-type':'text/html'}});};
 const runtime={onMessage:listener(),onStartup:listener(),onInstalled:listener(),getURL:path=>'chrome-extension://test/'+path};
 const alarms={onAlarm:listener(),create:async()=>{}};
 globalThis.chrome={runtime,alarms,storage:{local:{get:async()=>({openlinksState:structuredClone(stored)}),set:async data=>{stored=structuredClone(data.openlinksState);}}},
- tabs:{onUpdated:listener(),onCreated:listener(),create:async data=>{opened.push(data.url);return {id:++tabCount};},update:async(id,data)=>{updated.push({id,...data});},query:async()=>[],get:async id=>({id,url:frameUrl}),
- sendMessage:async(tab,data)=>{
+ tabs:{onUpdated:listener(),onCreated:listener(),create:async data=>{opened.push(data.url);return {id:++tabCount};},update:async(id,data)=>{updated.push({id,...data});},query:async()=>structuredClone(listedTabs),get:async id=>tabReplies.get(id) || ({id,url:frameUrl}),
+ sendMessage:async(tab,data,options)=>{
+  deliveries.push({tabId:tab,frameId:options.frameId,type:data.type});
   commands.push(data.type);
   requests.push(structuredClone(data));
-  if(data.type==='PROBE')return {kind:probeKind,key:probeKey,chatRoute:probeRoute,obstacle:obstacle?.text,canDismiss:obstacle?.dismiss,dismissKey:obstacle?.key,reason:probeKind==='inquiry'?'Форма запроса, нужен чат':undefined};
-  if(data.type==='PREPARE')return {ok:prepareOk,pageUrl:frameUrl,reason:prepareOk?undefined:'Редактор изменился'};
+  if(data.type==='PROBE')return {kind:probeKind,key:probeKey,chatRoute:probeRoute,obstacle:obstacle?.text,canDismiss:obstacle?.dismiss,dismissKey:obstacle?.key,reason:probeKind==='inquiry'?'Форма запроса, нужен чат':undefined,...frameProbes.get(options.frameId)};
+  if(data.type==='PREPARE')return {ok:prepareOk,pageUrl:frameList?.find(frame=>frame.frameId===options.frameId)?.url || frameUrl,reason:prepareOk?undefined:'Редактор изменился'};
   if(data.type==='SEND'){clicks++;beforeClick=structuredClone(stored);if(sendResult==='disconnect')throw new Error('Disconnected');if(sendResult==='malformed')return {ok:false};return {clicked:sendResult!==false,accepted:sendResult===true,reason:'Кнопка изменилась'};}
   if(data.type==='CONTACT'){contactClicks++;return {ok:true,key:probeKey};}
   if(data.type==='DISMISS_CHALLENGE'){if(obstacle?.stuck)return {clicked:true,closed:false};obstacle=null;return {clicked:true,closed:true};}
   return {ok:true};
- }},webNavigation:{getAllFrames:async()=>{if(missing)throw new Error('No tab');return [{frameId:0,url:frameUrl}];}},action:{onClicked:listener()},windows:{}};
+ }},webNavigation:{onCreatedNavigationTarget:listener(),getAllFrames:async()=>{if(missing)throw new Error('No tab');return frameList || [{frameId:0,url:frameUrl}];}},action:{onClicked:listener()},windows:{}};
 await import('../extension/background.js');
 const ui={id:'test',url:'chrome-extension://test/dashboard.html'};
 const message=(type,extra={},sender=ui)=>new Promise(resolve=>runtime.onMessage.list[0]({type,...extra},sender,resolve));
 async function tick(){alarms.onAlarm.list[0]({name:'openlinks-tick'});await message('GET');}
-function reset(){stored=initialState();stored.settings.message='Hello';clicks=0;contactClicks=0;commands=[];requests=[];beforeClick=null;probeKind='chat';sendResult=true;frameUrl='https://a.en.alibaba.com/chat';tabCount=0;opened=[];missing=false;obstacle=null;prepareOk=true;lookupPages=new Map();fetches=[];probeRoute=null;updated=[];probeKey='#contact';}
+function reset(){stored=initialState();stored.settings.message='Hello';clicks=0;contactClicks=0;commands=[];requests=[];beforeClick=null;probeKind='chat';sendResult=true;frameUrl='https://a.en.alibaba.com/chat';tabCount=0;opened=[];missing=false;obstacle=null;prepareOk=true;lookupPages=new Map();fetches=[];probeRoute=null;updated=[];probeKey='#contact';listedTabs=[];frameList=null;tabReplies=new Map();frameProbes=new Map();deliveries=[];}
 async function review(url='https://a.en.alibaba.com/'){await message('IMPORT',{text:url});await message('START');await tick();await tick();}
 
 test('click is persisted before side effect; completion does not wait for success or read receipt',async()=>{
@@ -267,4 +268,104 @@ test('sending row cannot be deleted, and deleting an awaited pending row clears 
 test('1688 unexpected reply after SEND is uncertain and never starts send teaching',async()=>{
  reset();frameUrl='https://air.1688.com/chat';sendResult='malformed';await review('https://shop.1688.com/');await message('APPROVE');await tick();
  assert.equal(stored.queue[0].status,'uncertain');assert.equal(stored.running,false);assert.equal(stored.learning,null);assert.equal(clicks,1);
+});
+
+const messenger1688='https://air.1688.com/app/ocms-fusion-components-1688/def_cbu_web_im/index.html?touid=cnalichncurrent&siteid=cnalichn';
+async function waitingFor1688Contact() {
+ reset();frameUrl='https://current.1688.com/';probeKind='waiting';await review(frameUrl);
+ stored.queue[0].stepAt=Date.now()-16000;await tick();
+ assert.equal(stored.learning.field,'contact');assert.equal(stored.learning.automatic,true);assert.equal(stored.running,false);
+}
+test('1688 popup automatically ends stale contact teaching and advances to the editor without a contact click',async()=>{
+ await waitingFor1688Contact();const token=stored.learning.token;
+ chrome.tabs.onCreated.list[0]({id:20,openerTabId:1,url:messenger1688});await message('GET');
+ assert.equal(stored.learning,null);assert.equal(stored.running,true);assert.equal(stored.queue[0].status,'contacting');assert.equal(stored.queue[0].tabId,20);
+ assert.ok(deliveries.some(item=>item.type==='PICK_STOP' && item.tabId===1));
+ assert.equal((await message('LEARN_PICK',{token,field:'contact',selector:'.go-shop'},{id:'test',url:frameUrl,tab:{id:1},frameId:0})).ok,false);
+ frameUrl=messenger1688;probeKind='chat';await tick();
+ assert.equal(stored.queue[0].status,'review');assert.equal(stored.learning,null);assert.equal(contactClicks,0);assert.equal(clicks,0);
+ assert.equal(stored.slots.filter(slot=>slot.kind==='visit').length,1);assert.equal(stored.slots.filter(slot=>slot.kind==='send').length,0);
+});
+test('1688 about:blank popup can finish navigation after automatic teaching has started',async()=>{
+ await waitingFor1688Contact();
+ chrome.tabs.onCreated.list[0]({id:20,openerTabId:1,url:'about:blank'});await message('GET');assert.equal(stored.learning.field,'contact');
+ chrome.tabs.onUpdated.list[0](20,{url:messenger1688},{id:20,url:messenger1688});await message('GET');
+ assert.equal(stored.queue[0].tabId,20);assert.equal(stored.queue[0].status,'contacting');assert.equal(stored.learning,null);assert.equal(stored.running,true);
+});
+test('1688 same-tab messenger and PAGE_READY remove contact teaching without propagating it into the inner frame',async()=>{
+ await waitingFor1688Contact();frameUrl=messenger1688;probeKind='waiting';
+ chrome.tabs.onUpdated.list[0](1,{url:frameUrl},{id:1,url:frameUrl});await message('GET');
+ assert.equal(stored.learning,null);assert.equal(stored.running,true);assert.ok(stored.queue[0].chatOpened);
+ await waitingFor1688Contact();
+ const core=messenger1688.replace('def_cbu_web_im/','def_cbu_web_im_core/');
+ frameList=[{frameId:0,url:frameUrl},{frameId:4,url:core}];frameProbes.set(4,{kind:'chat'});
+ const picks=commands.filter(type=>type==='PICK_START').length;
+ await message('PAGE_READY',{}, {id:'test',url:core,tab:{id:1},frameId:4});
+ assert.equal(stored.learning,null);assert.equal(stored.queue[0].status,'review');assert.equal(stored.queue[0].frameId,4);
+ assert.equal(commands.filter(type=>type==='PICK_START').length,picks);assert.equal(contactClicks,0);
+});
+test('1688 direct chat waits for its editor and never asks for the open-chat button',async()=>{
+ reset();const store='https://current.1688.com/';stored.chatRoutes[store]={url:messenger1688};frameUrl=messenger1688;probeKind='waiting';
+ await review(store);assert.ok(stored.queue[0].chatOpened);
+ stored.queue[0].stepAt=Date.now()-16000;await tick();assert.equal(stored.learning,null);assert.equal(stored.running,true);
+ stored.queue[0].stepAt=Date.now()-31000;await tick();assert.equal(stored.learning.field,'editor');assert.equal(stored.running,false);
+ probeKind='chat';await message('PAGE_READY',{}, {id:'test',url:messenger1688,tab:{id:1},frameId:0});
+ assert.equal(stored.learning,null);assert.equal(stored.queue[0].status,'review');assert.equal(contactClicks,0);
+});
+test('1688 delayed editor can recover on an alarm without another page-load event',async()=>{
+ reset();const store='https://current.1688.com/';stored.chatRoutes[store]={url:messenger1688};frameUrl=messenger1688;probeKind='waiting';
+ await review(store);stored.queue[0].stepAt=Date.now()-31000;await tick();assert.equal(stored.learning.field,'editor');
+ probeKind='chat';await tick();assert.equal(stored.queue[0].status,'review');assert.equal(stored.learning,null);assert.equal(clicks,0);
+});
+test('a pre-opened 1688 chat is found before asking for contact teaching even if popup events were missed',async()=>{
+ reset();frameUrl='https://current.1688.com/';probeKind='waiting';await review(frameUrl);
+ tabReplies.set(1,{id:1,url:frameUrl});listedTabs=[{id:30,openerTabId:1,url:messenger1688}];
+ stored.queue[0].stepAt=Date.now()-16000;frameUrl=messenger1688;probeKind='chat';await tick();
+ assert.equal(stored.queue[0].tabId,30);assert.equal(stored.queue[0].status,'review');assert.equal(stored.learning,null);assert.ok(!commands.includes('PICK_START'));
+});
+test('a reused 1688 chat without opener is adopted only with a matching known recipient',async()=>{
+ await waitingFor1688Contact();const store=stored.queue[0].url;stored.chatRoutes[store]={url:messenger1688};
+ tabReplies.set(1,{id:1,url:store});listedTabs=[{id:30,url:messenger1688},{id:31,url:messenger1688.replace('cnalichncurrent','cnalichnother')}];
+ frameUrl=messenger1688;probeKind='chat';await tick();
+ assert.equal(stored.queue[0].tabId,30);assert.equal(stored.queue[0].status,'review');assert.equal(stored.learning,null);
+});
+test('ambiguous or unrelated 1688 tabs never pick another supplier, including older tasks without supplierTabId',async()=>{
+ await waitingFor1688Contact();delete stored.queue[0].supplierTabId;
+ listedTabs=[{id:30,url:messenger1688}];await tick();assert.equal(stored.queue[0].tabId,1);assert.equal(stored.learning.field,'contact');
+ listedTabs=[{id:30,openerTabId:1,url:messenger1688},{id:31,openerTabId:1,url:messenger1688.replace('cnalichncurrent','cnalichnother')}];
+ await tick();assert.equal(stored.queue[0].tabId,1);assert.equal(stored.learning.field,'contact');
+ assert.equal(Object.keys(stored.chatRoutes).length,0);assert.equal(contactClicks,0);assert.equal(clicks,0);
+});
+test('navigation target source identifies a 1688 popup whose tabs event lacks openerTabId',async()=>{
+ await waitingFor1688Contact();
+ chrome.tabs.onCreated.list[0]({id:30,url:messenger1688});await message('GET');assert.equal(stored.queue[0].tabId,1);
+ chrome.webNavigation.onCreatedNavigationTarget.list[0]({tabId:30,sourceTabId:1,url:messenger1688});await message('GET');
+ assert.equal(stored.queue[0].tabId,30);assert.equal(stored.running,true);assert.equal(stored.learning,null);
+});
+test('chat discovery respects a user pause, cancelled lesson, explicit editor lesson and required tab rebinding',async()=>{
+ for(const mode of ['pause','cancel','manual-editor','restart']) {
+  await waitingFor1688Contact();
+  if(mode==='pause')await message('PAUSE');
+  if(mode==='cancel')await message('CANCEL_TEACH');
+  if(mode==='manual-editor')await message('TEACH',{field:'editor'});
+  if(mode==='restart')stored.queue[0].needsTabCheck=true;
+  const previous=stored.learning?.token;
+  chrome.tabs.onCreated.list[0]({id:30,openerTabId:1,url:messenger1688});await message('GET');
+  await tick();assert.equal(stored.running,false);assert.equal(stored.queue[0].tabId,1);assert.equal(stored.learning?.token,previous);assert.equal(clicks,0);
+ }
+});
+test('CAPTCHA blocking and uncertain sends cannot be resumed by a new 1688 chat tab',async()=>{
+ for(const status of ['blocked','uncertain','sending']) {
+  reset();frameUrl='https://current.1688.com/';probeKind='waiting';await review(frameUrl);
+  stored.queue[0].status=status;stored.queue[0].reason='Preserve intervention';stored.running=false;
+  chrome.tabs.onCreated.list[0]({id:30,openerTabId:1,url:messenger1688});await message('GET');
+  assert.equal(stored.queue[0].status,status);assert.equal(stored.running,false);assert.equal(stored.queue[0].tabId,1);assert.equal(clicks,0);
+ }
+});
+
+test('an already opened 1688 chat never clicks the learned go-shop action or asks to reopen chat',async()=>{
+ reset();const store='https://current.1688.com/';stored.chatRoutes[store]={url:messenger1688};frameUrl=messenger1688;probeKind='contact';probeKey='div.go-shop';
+ frameProbes.set(0,{diagnostics:{editors:1,sends:0,chatRoots:0,contacts:1,inquiriesIgnored:0}});
+ await review(store);stored.queue[0].stepAt=Date.now()-31000;await tick();
+ assert.equal(contactClicks,0);assert.equal(stored.learning.field,'send');assert.ok(stored.queue[0].chatOpened);
 });
