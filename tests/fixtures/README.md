@@ -8,7 +8,9 @@ Inline scripts in these fixtures are explicit test doubles written for the tests
   storefront header and a separate inquiry form (434096135 / 220146650).
 - `captured-alibaba.html`: `icbu-alitalk` storefront/toolbar actions and the
   `send-box-container` composer with `send-textarea` / `send-tool-button`
-  (390833943 / 407597383). No outgoing-message markup was present in the capture.
+  (390833943 / 407597383 and the later `Алибаба кнопка.txt`). The `gray` class
+  intentionally remains on an enabled button, reproducing the later capture.
+  No outgoing-message markup was present in the captures.
 - `captured-1688-store.html`: `pcV2WangWang` and a visible middleware security
   iframe (457454315). The challenge URL deliberately has no captured parameters.
 - `captured-1688-shell.html`: `layout-iframe` outer shell (407487735). Its inner

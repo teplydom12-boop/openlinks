@@ -8,6 +8,6 @@
 window.headerClicks=0;window.toolbarClicks=0;window.sendClicks=0;
 document.querySelector('.shop-sign-container a').addEventListener('click',event=>{event.preventDefault();headerClicks++;});
 document.querySelector('#J_Toolbar a').addEventListener('click',event=>{event.preventDefault();toolbarClicks++;});
-document.querySelector('textarea').addEventListener('input',event=>document.querySelector('.send-tool-button').classList.toggle('gray',!event.target.value.trim()));
+// A visual gray class is deliberately retained; the native button is enabled.
 document.querySelector('.send-tool-button').addEventListener('click',()=>sendClicks++);
 </script></body></html>

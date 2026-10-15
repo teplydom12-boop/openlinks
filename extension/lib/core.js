@@ -4,10 +4,11 @@ export const PLATFORMS = {
   alibaba: {label: 'Alibaba', domain: 'alibaba.com', limit: 3, interval: 420},
   mic: {label: 'Made-in-China', domain: 'made-in-china.com', limit: null, interval: 60},
 };
-export const FINAL = new Set(['sent', 'skipped', 'failed']);
+export const FINAL = new Set(['sent', 'attempted', 'attempt_unknown', 'skipped', 'failed']);
 export const STATUS = {
   pending: 'В очереди', visiting: 'Открытие магазина', contacting: 'Открытие чата',
-  drafting: 'Подготовка сообщения', review: 'Ждёт подтверждения', sending: 'Проверка отправки',
+  drafting: 'Подготовка сообщения', review: 'Ждёт подтверждения', sending: 'Нажимаю «Отправить»',
+  attempted:'Кнопка отправки нажата', attempt_unknown:'Попытка без ответа вкладки',
   sent: 'Отправлено', uncertain: 'Отправка не подтверждена', blocked: 'Нужно вмешательство',
   failed: 'Ошибка', skipped: 'Пропущено',
 };
@@ -30,7 +31,7 @@ export function classify(raw) {
 }
 export function initialState() {
   return {
-    version: 2, running: false, activeId: null, waiting: null, activity: null, queue: [], events: [], slots: [],
+    version: 3, running: false, activeId: null, waiting: null, activity: null, learning:null, rules:[], chatRoutes:{}, queue: [], events: [], slots: [],
     settings: {message: '', review: true, intervals: { '1688': 180, alibaba: 420, mic: 60 },
       profiles: Object.fromEntries(Object.keys(PLATFORMS).map(key => [key, {
         chat: '', contact: '', editor: '', send: '', success: '',
@@ -39,18 +40,20 @@ export function initialState() {
 }
 export function migrateState(saved) {
   if (!saved) return initialState();
-  if (saved.version === 2) return saved;
+  if (saved.version === 3) return saved;
   const state = structuredClone(saved);
-  state.version = 2; state.running = false; state.waiting = null; state.activity = null;
+  state.version = 3; state.running = false; state.waiting = null; state.activity = null; state.learning=null; state.rules||=[];state.chatRoutes||={};
   state.settings.review = true;
   for (const profile of Object.values(state.settings.profiles)) profile.chat ||= '';
   const active = state.queue.find(job => job.id === state.activeId);
   if (active) {
-    active.status = active.status === 'sending' || active.status === 'uncertain' ? 'uncertain' : 'blocked';
-    active.reason = 'Расширение обновлено: теперь используется только чат. Обновите вкладку и проверьте состояние сообщения.';
+    const started=active.status==='sending' || active.status==='uncertain';
+    active.status = started ? 'attempt_unknown' : 'blocked';
+    if(started){active.finishedAt=Date.now();state.activeId=null;}
+    active.reason = 'Расширение обновлено. Обновите вкладки и продолжите задачу. Проверка успеха/прочтения больше не выполняется.';
     active.approved = false;
   }
-  state.events.push({id:crypto.randomUUID(),at:Date.now(),type:'upgrade',level:'decision',detail:'Переход на строгую очередь и отправку только в чат. Выполнение приостановлено, подтверждение включено.'});
+  state.events.push({id:crypto.randomUUID(),at:Date.now(),type:'upgrade',level:'decision',detail:'Добавлено обучение по клику. Результат отправки не проверяется; история и лимиты сохранены.'});
   return state;
 }
 export function validateSettings(value) {
@@ -152,7 +155,7 @@ export function scheduleText(state, now = Date.now()) {
     plan.map(j => [iso(j.plannedAt), PLATFORMS[j.platform].label, j.status, j.url].join('\t')).join('\n') + '\n';
 }
 export function reportText(state) {
-  return '# OpenLinks — report.txt\n# Время UTC (ISO 8601). sent означает подтверждение интерфейсом, не доставку или прочтение.\n' +
+  return '# OpenLinks — report.txt\n# Время UTC. attempted = нажатие отправки, attempt_unknown = нет ответа вкладки. Успех, доставка и прочтение не проверяются. sent = старая или ручная отметка.\n' +
     '# время\tсобытие\tURL\tподробности\n' + state.events.map(e =>
       [iso(e.at), e.type, clean(e.url), clean(e.detail)].join('\t')).join('\n') + '\n';
 }
@@ -163,6 +166,8 @@ export const EVENT_LABELS = {
   delivery_check:'Проверка результата', send_disconnect:'Ответ вкладки потерян', settings:'Настройки сохранены',
   start:'Запуск',pause:'Пауза',import:'Импорт',complete:'Очередь завершена',recheck:'Проверяю снова',
   chat_tab:'Новая вкладка чата',remove_pending:'Удаление ожидающих задач',upgrade:'Обновление расширения',...STATUS,
+  learning:'Жду обучающего клика',learned:'Правило сохранено',learning_cancel:'Обучение отменено',rule_removed:'Правило удалено',
+  challenge_close:'Закрываю окно проверки',direct_chat:'Прямой переход в чат',chat_route:'Адрес чата сохранён',
 };
 export function activityText(state) {
   return '# OpenLinks — activity.log\n# Наблюдаемые действия, результаты проверок и причины решений. Время UTC.\n' +

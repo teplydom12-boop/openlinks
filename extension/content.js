@@ -3,11 +3,9 @@
   globalThis.__openlinksInstalled = true;
   const CONTACT = /^(chat now|chat with supplier|start chat|live chat|online chat|chat online|chat|talk to supplier|联系卖家|联系供应商|立即咨询|在线咨询|在线洽谈|在线交谈|立即沟通|联系商家|Написать в чат|Чат с продавцом|Пообщаться сейчас|Начать чат)$/iu;
   const SEND = /^(send|send message|发送|发送消息|立即发送|Отправить|Отправить сообщение)$/iu;
-  const SUCCESS = /^(message sent[.!]?|your message has been sent[.!]?|发送成功[！!。]?|消息发送成功[！!。]?|Сообщение отправлено[.!]?)$/iu;
   const INQUIRY = /inquir|inquer|enquir|quotation|request[\s_-]*(?:a[\s_-]*)?quote|\brfq\b|msgsend|询盘|询价|запрос|заявк/iu;
   const EDITORS = 'textarea,[contenteditable="true"],[role="textbox"][contenteditable]';
   const ACTIONS = 'a,button,[role="button"],input[type="submit"],input[type="button"]';
-  const OUTGOING = '[data-direction="outgoing"],[data-is-self="true"],.message-outgoing,.message-self,.msg-self,.msg-sent,.message-right,.im-message-right';
   const CHAT_ROOT = '[data-chat-root],[data-chat],[class~="chat"],[id*="chat" i],[class*="chat-panel" i],[class*="chat-window" i],[class*="chat-container" i],[class*="conversation" i],[class*="messenger" i],[role="dialog"][aria-label*="chat" i]';
   const host=location.hostname;
   const site=host==='alibaba.com' || host.endsWith('.alibaba.com') ? 'alibaba' : host==='1688.com' || host.endsWith('.1688.com') ? '1688' : host==='made-in-china.com' || host.endsWith('.made-in-china.com') ? 'mic' : 'generic';
@@ -19,6 +17,7 @@
     '1688':['#pcV2WangWang'],
   };
   const sentOps = new Set();
+  let picker=null;
   const norm = value => String(value || '').replace(/\r\n/g,'\n').trim();
   function visible(node) {
     if (!(node instanceof Element)) return false;
@@ -46,11 +45,13 @@
       if(found.length) return found;
     }
     // Made-in-China's tm-placeholder is an unbound visual stub, not a chat action.
-    return candidates('',ACTIONS,CONTACT).filter(node=>!(site==='mic' && node.classList.contains('tm-placeholder')));
+    const basic=candidates('',ACTIONS,CONTACT).filter(node=>!(site==='mic' && node.classList.contains('tm-placeholder')));
+    if(basic.length || site!=='1688') return basic;
+    const service=all('a,button,[role="button"],div,span').filter(node=>norm(node.innerText)==='客服' && ![...node.children].some(child=>visible(child)&&norm(child.innerText)==='客服'));
+    return [...new Set(service.map(node=>node.closest('a,button,[role="button"],#pcV2WangWang') || node))];
   }
   function unavailable(node) {
-    return node.disabled || node.getAttribute('aria-disabled')==='true' ||
-      (site==='alibaba' && node.matches('button.send-tool-button.gray'));
+    return !node.isConnected || !visible(node) || node.matches(':disabled') || node.getAttribute('aria-disabled')==='true' || getComputedStyle(node).pointerEvents==='none';
   }
   function isInquiry(node) {
     const names=node.matches(EDITORS) ? [node.getAttribute('aria-label'),node.getAttribute('title')] : labels(node);
@@ -63,6 +64,13 @@
   function commonChat(editor,send,roots) {
     return roots.find(root=>root.contains(editor) && root.contains(send));
   }
+  function closeControl() {
+    if(site!=='1688') return null;
+    const panels=all('.J_MIDDLEWARE_FRAME_WIDGET').filter(panel=>[...panel.querySelectorAll('iframe')].some(frame=>visible(frame)&&frame.getAttribute('src')?.includes('_____tmd_____/punish')));
+    if(panels.length!==1) return null;
+    const close=[...panels[0].children].filter(node=>visible(node) && (node.matches('button[aria-label="Close"],button[aria-label="关闭"],[role="button"][aria-label="Close"]') || (node.tagName==='IMG' && getComputedStyle(node).cursor==='pointer' && node.getBoundingClientRect().width<=40 && node.getBoundingClientRect().height<=40)));
+    return close.length===1?close[0]:null;
+  }
   function obstacle() {
     const challenges = all('#nc_1_wrapper,.nc-container,.geetest_panel,[id*="captcha" i],[class*="captcha" i],iframe[src*="captcha" i],iframe[src*="recaptcha" i],iframe[src*="hcaptcha" i],iframe[src*="_____tmd_____/punish"],#baxia-dialog-content');
     if(challenges.length) return 'Обнаружена проверка CAPTCHA. Пройдите её вручную и нажмите «Проверить снова».';
@@ -72,6 +80,7 @@
     return '';
   }
   function inspect(profile) {
+    profile=effectiveProfile(profile);
     const blocked=obstacle();
     if(blocked) return {kind:'obstacle',obstacle:blocked};
     const chatFrames=all('iframe.webtm-lite-iframe,iframe.weblite-iframe,iframe.layout-iframe[src*="def_cbu_web_im_core"]').length;
@@ -105,7 +114,7 @@
     if(unique.length===1) {
       const {node,href}=unique[0];
       // javascript:, aliim: and wangwang: are not navigated by the extension.
-      return {kind:'contact',contact:node,href:/^https:\/\//i.test(href) && href!==location.href ? href : null,diagnostics};
+      return {kind:'contact',contact:node,href:/^https:\/\//i.test(href) && href!==location.href ? href : null,key:selectorFor(node),diagnostics};
     }
     const inquiryButtons=all(ACTIONS).filter(isInquiry);
     diagnostics.inquiriesIgnored=Math.max(diagnostics.inquiriesIgnored,inquiryButtons.length);
@@ -116,13 +125,6 @@
     return {kind:'waiting',diagnostics};
   }
   function textOf(node) { return norm('value' in node ? node.value : node.innerText); }
-  function evidence(profile,message) {
-    const success=profile.success ? all(profile.success) : all('[role="alert"],[role="status"],.success,.success-tip,.success-message,h1,h2,h3,p,span').filter(node=>SUCCESS.test(norm(node.innerText)));
-    return {
-      successes:success.map(node=>norm(node.innerText)).filter(Boolean).sort(),
-      outgoing:all(OUTGOING).filter(node=>norm(node.innerText)===norm(message)).length,
-    };
-  }
   function fill(editor,message) {
     editor.focus();
     if(editor instanceof HTMLTextAreaElement || editor instanceof HTMLInputElement) {
@@ -152,14 +154,95 @@
     const reason=validation(found.send);
     if(reason) return {ok:false,reason};
     if(unavailable(found.send)) return {ok:false,reason:'Кнопка отправки недоступна. Проверьте обязательные поля или ограничения сайта.'};
-    return {ok:true,pageUrl:location.href,evidence:evidence(request.profile,request.message)};
+    return {ok:true,pageUrl:location.href};
+  }
+  function effectiveProfile(raw={}) {
+    const profile={...raw},seen=new Set();
+    for(const rule of [...(raw.rules || [])].reverse()) {
+      if(seen.has(rule.field) || !globalThis.OpenLinksRules?.matches(rule,location.href)) continue;
+      try {
+        const nodes=all(rule.selector);
+        if(nodes.length===1 && (!rule.tag || nodes[0].localName===rule.tag) && (!rule.label || norm(nodes[0].getAttribute('aria-label') || nodes[0].innerText).toLowerCase()===rule.label.toLowerCase())) {
+          profile[rule.field]=rule.selector;seen.add(rule.field);
+        }
+      } catch { /* Stale selectors do not become executable code. */ }
+    }
+    return profile;
+  }
+  function selectorFor(node) {
+    const unique=selector=>{try{return all(selector).length===1 && all(selector)[0]===node;}catch{return false;}};
+    const tag=node.localName;
+    if(node.id && /^[a-z_][\w:-]{0,70}$/i.test(node.id) && !/\d{4}|[a-f0-9]{10}|:r\d/i.test(node.id)) {
+      const selector='#'+CSS.escape(node.id);if(unique(selector))return selector;
+    }
+    for(const attr of ['data-testid','data-action','name','aria-label','placeholder']) {
+      const value=node.getAttribute(attr);
+      if(value && value.length<=80) {const selector=`${tag}[${attr}="${CSS.escape(value)}"]`;if(unique(selector))return selector;}
+    }
+    const classes=[...node.classList].filter(c=>!/^(gray|active|disabled|selected|focus|hover|hide|show|undefined)$|^(css|sc|jsx)[-_]|\d{4}|[a-f0-9]{10}/i.test(c)).slice(0,4);
+    for(let count=1;count<=classes.length;count++) {const selector=tag+classes.slice(0,count).map(c=>'.'+CSS.escape(c)).join('');if(unique(selector))return selector;}
+    let path='',current=node;
+    for(let depth=0;current?.localName && depth<5;depth++,current=current.parentElement) {
+      const siblings=current.parentElement?[...current.parentElement.children].filter(n=>n.localName===current.localName):[current];
+      path=current.localName+`:nth-of-type(${siblings.indexOf(current)+1})`+(path?' > '+path:'');
+      if(unique(path))return path;
+    }
+    throw new Error('Не удалось составить однозначное правило. Выберите саму кнопку или поле.');
+  }
+  function stopPicker() {
+    if(!picker)return;
+    document.removeEventListener('click',picker.listener,true);document.removeEventListener('pointerdown',picker.guard,true);picker.host.remove();picker=null;
+  }
+  function startPicker(request) {
+    stopPicker();
+    const host=document.createElement('div');host.dataset.openlinksPicker='true';host.style.pointerEvents='none';
+    const shadow=host.attachShadow({mode:'open'}),box=document.createElement('div');
+    box.style.cssText='position:fixed;top:10px;right:10px;max-width:420px;pointer-events:none;z-index:2147483647;background:#102b33;color:white;padding:14px 18px;border-radius:9px;font:14px/1.5 Arial;box-shadow:0 3px 20px #0005';
+    const message=document.createElement('span'),cancel=document.createElement('button');
+    const names={contact:'кнопку открытия чата (например 客服)',editor:'поле сообщения',send:'кнопку отправки в чат',chat:'общую область с полем сообщения и кнопкой отправки'};
+    message.textContent=`OpenLinks: нажмите ${names[request.field]}. Правило будет сохранено.${request.field==='contact'?' Затем откроется чат.':request.field==='send'?' Затем будет выполнена одна отправка с учётом лимита.':''}`;
+    cancel.textContent='Отмена';cancel.style.cssText='margin-left:15px;padding:5px 12px;cursor:pointer;pointer-events:auto';
+    box.append(message,cancel);shadow.append(box);document.documentElement.append(host);
+    const listener=async event=>{
+      if(event.composedPath().includes(host) || !event.isTrusted)return;
+      event.preventDefault();event.stopImmediatePropagation();if(picker?.busy)return;picker.busy=true;
+      try {
+        let node=event.composedPath().find(item=>item instanceof Element);
+        if(['send','contact'].includes(request.field))node=node.closest('a,button,[role="button"],#pcV2WangWang') || node;
+        if(!node || isInquiry(node))throw new Error('Это элемент формы запроса. Укажите элемент именно чата.');
+        if(request.field==='chat' && node.matches('body,html'))throw new Error('Укажите контейнер диалога, а не всю страницу.');
+        if(request.field==='editor' && !node.matches(EDITORS))throw new Error('Укажите само поле сообщения.');
+        const selector=selectorFor(node),profile=effectiveProfile(request.profile),data={type:'LEARN_PICK',token:request.token,field:request.field,selector,tag:node.localName,label:''};
+        if(['contact','send'].includes(request.field))data.label=norm(node.getAttribute('aria-label') || node.innerText).slice(0,80);
+        if(['editor','send'].includes(request.field)) {
+          const editor=request.field==='editor'?node:all(profile.editor || EDITORS).filter(n=>!isInquiry(n));
+          const send=request.field==='send'?node:candidates(profile.send,ACTIONS,SEND).filter(n=>!isInquiry(n));
+          const e=Array.isArray(editor)?(editor.length===1?editor[0]:null):editor;
+          const s=Array.isArray(send)?(send.length===1?send[0]:null):send;
+          if(e&&s) {
+            let root=e.parentElement;while(root && !root.contains(s))root=root.parentElement;
+            if(root && !root.matches('body,html') && !isInquiry(e) && !isInquiry(s))data.chatSelector=selectorFor(root);
+          }
+        }
+        const reply=await chrome.runtime.sendMessage(data);
+        if(!reply?.ok)throw new Error(reply?.error || 'Не удалось сохранить правило');
+        if(picker?.token===request.token)stopPicker();
+      } catch(error) {message.textContent='OpenLinks: '+error.message;if(picker?.token===request.token)picker.busy=false;}
+    };
+    const guard=event=>{if(event.isTrusted && !event.composedPath().includes(host)){event.preventDefault();event.stopImmediatePropagation();}};
+    picker={host,listener,guard,busy:false,token:request.token};document.addEventListener('pointerdown',guard,true);document.addEventListener('click',listener,true);
+    cancel.addEventListener('click',()=>{chrome.runtime.sendMessage({type:'LEARN_CANCEL',token:request.token}).catch(()=>{});stopPicker();});
+    return {ok:true};
   }
   function handle(request) {
     const profile=request.profile || {};
     if(request.type==='PROBE') {
       const found=inspect(profile);
-      return {kind:found.kind,obstacle:found.obstacle,reason:found.reason,href:found.href,diagnostics:found.diagnostics};
+      return {kind:found.kind,obstacle:found.obstacle,canDismiss:!!closeControl(),reason:found.reason,href:found.href,key:found.key,diagnostics:found.diagnostics};
     }
+    if(request.type==='PICK_START')return startPicker(request);
+    if(request.type==='PICK_STOP'){stopPicker();return {ok:true};}
+    if(request.type==='DISMISS_CHALLENGE'){const close=closeControl();if(!close)return {clicked:false};close.click();return {clicked:true};}
     if(request.type==='CONTACT') {
       const found=inspect(profile);
       if(found.kind!=='contact') return {ok:false,reason:found.reason || found.obstacle || 'Контакт изменился'};
@@ -180,23 +263,10 @@
       sentOps.add(request.jobId);
       found.send.click(); return {clicked:true};
     }
-    if(request.type==='CHECK_SENT') {
-      const blocked=obstacle();
-      if(blocked) return {confirmed:false};
-      const after=evidence(profile,request.message), before=request.evidence || {successes:[],outgoing:0};
-      // Multiset difference: a pre-existing success banner cannot confirm a new send.
-      const remaining=[...before.successes];
-      let newSuccess=false;
-      for(const text of after.successes) {
-        const index=remaining.indexOf(text);
-        if(index<0) newSuccess=true; else remaining.splice(index,1);
-      }
-      return {confirmed:newSuccess || after.outgoing>before.outgoing};
-    }
     return {ok:false,reason:'Неизвестная команда'};
   }
   chrome.runtime.onMessage.addListener((request,sender,respond)=>{
-    if(sender.id!==chrome.runtime.id || !['PROBE','CONTACT','PREPARE','SEND','CHECK_SENT'].includes(request.type)) return;
+    if(sender.id!==chrome.runtime.id || !['PROBE','CONTACT','PREPARE','SEND','PICK_START','PICK_STOP','DISMISS_CHALLENGE'].includes(request.type)) return;
     Promise.resolve().then(()=>handle(request)).then(respond,error=>respond({ok:false,kind:'ambiguous',reason:'Ошибка селектора или формы: '+error.message}));
     return true;
   });

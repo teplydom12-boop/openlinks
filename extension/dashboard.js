@@ -32,7 +32,7 @@ function initSettings() {
     block.append(label,input); $('#interval-fields').append(block);
     const profile=element('div',undefined,'profile'); profile.append(element('h3',platform.label));
     const grid=element('div',undefined,'profile-grid');
-    for(const [field,title] of Object.entries({chat:'Область чата (контейнер редактора и отправки)',contact:'Кнопка открытия чата',editor:'Поле сообщения в чате',send:'Кнопка отправки в чат',success:'Новое подтверждение успеха'})) {
+    for(const [field,title] of Object.entries({chat:'Область чата (контейнер редактора и отправки)',contact:'Кнопка открытия чата',editor:'Поле сообщения в чате',send:'Кнопка отправки в чат'})) {
       const item=element('div'); const label=element('label',title); label.htmlFor=`profile-${key}-${field}`;
       const input=element('input'); Object.assign(input,{type:'text',id:`profile-${key}-${field}`,maxLength:500,placeholder:'Автопоиск по смыслу',spellcheck:false});
       item.append(label,input); grid.append(item);
@@ -46,13 +46,13 @@ function fillSettings() {
   $('#message').value=state.settings.message; $('#review').checked=state.settings.review;
   for(const key of Object.keys(PLATFORMS)) {
     $('#interval-'+key).value=state.settings.intervals[key];
-    for(const field of ['chat','contact','editor','send','success']) $(`#profile-${key}-${field}`).value=state.settings.profiles[key][field] || '';
+    for(const field of ['chat','contact','editor','send']) $(`#profile-${key}-${field}`).value=state.settings.profiles[key][field] || '';
   }
 }
 function render() {
   if(!state) return;
   const now=Date.now(), active=state.queue.find(j=>j.id===state.activeId);
-  $('#run-state').textContent=state.running ? (state.waiting ? 'Ожидание интервала / лимита' : active?.status==='review'&&!active.approved?'Ждёт подтверждения':'Очередь работает') : 'На паузе';
+  $('#run-state').textContent=state.learning?'Ждёт обучающего клика':state.running ? (state.waiting ? 'Ожидание интервала / лимита' : active?.status==='review'&&!active.approved?'Ждёт подтверждения':'Очередь работает') : 'На паузе';
   $('#run-state').classList.toggle('running',state.running);
   $('#start').disabled=state.running; $('#pause').disabled=!state.running;
   $('#nav-count').textContent=state.queue.filter(j=>!FINAL.has(j.status)).length;
@@ -81,9 +81,18 @@ function render() {
     $('#active-reason').textContent=`${STATUS[active.status]}${active.reason?' · '+active.reason:''}`;
     $('#active-message').textContent=active.message || '';
     $('#approve').hidden=active.status!=='review' || active.approved===true;
-    $('#recheck').hidden=active.status!=='blocked'; $('#mark-sent').hidden=active.status!=='uncertain';
+    $('#recheck').hidden=active.status!=='blocked';
     $('#skip-active').disabled=active.status==='sending';
+    $('#cancel-teach').hidden=!state.learning;
   }
+  const learned=$('#learned-rules');learned.replaceChildren();
+  const fieldNames={contact:'Открыть чат',editor:'Поле сообщения',send:'Отправить',chat:'Область диалога'};
+  for(const rule of state.rules || []) {
+    const item=element('p'),remove=element('button','Забыть','link-button');
+    item.append(element('span',`${PLATFORMS[rule.platform].label} · ${fieldNames[rule.field]} · ${rule.scope.host}${rule.scope.path} · ${rule.selector} `),remove);
+    remove.addEventListener('click',()=>command('FORGET_RULE',{id:rule.id}).catch(e=>toast(e.message,true)));learned.append(item);
+  }
+  if(!(state.rules || []).length)learned.append(element('p','Правил пока нет. При остановке задачи покажите нужный элемент на странице.','hint'));
   const body=$('#queue-body'); body.replaceChildren();
   for(const [index,job] of makePlan(state,now).entries()) {
     const row=element('tr'), urlCell=element('td'),link=element('a',new URL(job.url).hostname);
@@ -127,8 +136,8 @@ $('#settings-form').addEventListener('submit',async event=>{
   try {
     const settings={message:$('#message').value,review:$('#review').checked,intervals:{},profiles:{}};
     for(const key of Object.keys(PLATFORMS)) {
-      settings.intervals[key]=Number($('#interval-'+key).value); settings.profiles[key]={};
-      for(const field of ['chat','contact','editor','send','success']) {
+      settings.intervals[key]=Number($('#interval-'+key).value); settings.profiles[key]={success:''};
+      for(const field of ['chat','contact','editor','send']) {
         const selector=$(`#profile-${key}-${field}`).value.trim();
         if(selector) document.createDocumentFragment().querySelector(selector); // Validate syntax only.
         settings.profiles[key][field]=selector;
@@ -160,9 +169,18 @@ $('#import-file').addEventListener('change',async event=>{
 button('#examples',async()=>{ $('#supplier-input').value=await (await fetch('examples.txt')).text(); });
 button('#approve',()=>command('APPROVE'));
 button('#recheck',()=>command('RECHECK'));
-button('#mark-sent',async()=>{
-  if(confirm('Вы проверили чат и видите отправленное сообщение этому поставщику?')) await command('MARK_SENT');
+for(const field of ['contact','editor','send','chat'])button('#teach-'+field,async()=>{
+  await command('TEACH',{field});
+  const active=state.queue.find(job=>job.id===state.activeId);
+  if(active?.tabId){const tab=await chrome.tabs.update(active.tabId,{active:true});await chrome.windows.update(tab.windowId,{focused:true});}
 });
+button('#cancel-teach',()=>command('CANCEL_TEACH'));
+button('#refresh-tabs',async()=>{
+  const reply=await command('LIST_TABS');const select=$('#chat-tabs');select.replaceChildren();
+  for(const tab of reply.tabs){const option=element('option',tab.title);option.value=tab.id;select.append(option);}
+  if(!reply.tabs.length)toast('Вкладки этой площадки не найдены',true);
+});
+button('#bind-tab',()=>command('BIND_TAB',{tabId:$('#chat-tabs').value}));
 button('#skip-active',()=>command('SKIP',{id:state.activeId}));
 button('#open-tab',async()=>{
   const active=state.queue.find(j=>j.id===state.activeId);

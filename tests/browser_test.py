@@ -112,29 +112,28 @@ try:
         supplier = context.new_page()
         supplier.add_init_script("""
           let listener;
-          window.chrome={runtime:{id:'adapter-test',onMessage:{addListener(fn){listener=fn}},sendMessage:async()=>({ok:true})}};
+          window.lessonMessages=[];
+          window.chrome={runtime:{id:'adapter-test',onMessage:{addListener(fn){listener=fn}},sendMessage:async message=>{if(message.type==='LEARN_PICK')lessonMessages.push(message);return {ok:true};}}};
           window.adapter=(type,extra={})=>new Promise(resolve=>listener({type,jobId:'test-job',profile:{},message:'Hello, WeChat: demo',...extra},{id:'adapter-test'},resolve));
         """)
         supplier.goto('https://test.en.alibaba.com/')
+        supplier.add_script_tag(path=str(ROOT/'extension/rules-shared.js'))
         supplier.add_script_tag(path=str(ROOT/'extension/content.js'))
         result = supplier.evaluate("adapter('PROBE')")
         assert result['kind']=='contact' and result['href']=='https://test.en.alibaba.com/chat'
         passed('semantic contact discovery')
         supplier.goto('https://test.en.alibaba.com/chat')
+        supplier.add_script_tag(path=str(ROOT/'extension/rules-shared.js'))
         supplier.add_script_tag(path=str(ROOT/'extension/content.js'))
         assert supplier.evaluate("adapter('PROBE')")['kind']=='chat'
         result = supplier.evaluate("adapter('PREPARE')")
         assert result['ok']
         expect(supplier.locator('#message')).to_have_value('Hello, WeChat: demo')
         passed('preparation fills React-style native input and enables initially disabled Send')
-        assert not supplier.evaluate("adapter('CHECK_SENT', {evidence:{successes:[],outgoing:0}})")['confirmed']
         assert supplier.evaluate("adapter('SEND', {expectedUrl:location.href})")['clicked']
-        assert supplier.evaluate("adapter('CHECK_SENT', {evidence:{successes:[],outgoing:0}})")['confirmed']
         assert supplier.evaluate('clicks')==1
         assert not supplier.evaluate("adapter('SEND', {expectedUrl:location.href})")['clicked']
-        passed('single send, new success evidence, and duplicate-click prevention')
-        assert not supplier.evaluate("adapter('CHECK_SENT', {evidence:{successes:['Message sent'],outgoing:1}})")['confirmed']
-        passed('old success banner cannot confirm a new attempt')
+        passed('single send without result checks and duplicate-click prevention')
         supplier.evaluate("document.querySelector('#message').value='My existing draft'")
         assert not supplier.evaluate("adapter('PREPARE')")['ok']
         expect(supplier.locator('#message')).to_have_value('My existing draft')
@@ -181,6 +180,7 @@ try:
                 route.fulfill(body='<!doctype html><title>Empty frame fixture</title>',content_type='text/html')
         context.route('**/*',capture_route)
         supplier.goto('https://test.en.made-in-china.com/captured')
+        supplier.add_script_tag(path=str(ROOT/'extension/rules-shared.js'))
         supplier.add_script_tag(path=str(ROOT/'extension/content.js'))
         result=supplier.evaluate("adapter('PROBE')")
         assert result['kind']=='contact' and result['diagnostics']['adapter']=='mic'
@@ -198,14 +198,20 @@ try:
         passed('competing header chat targets are still rejected rather than arbitrarily deduplicated')
 
         supplier.goto('https://test.en.alibaba.com/captured')
+        supplier.add_script_tag(path=str(ROOT/'extension/rules-shared.js'))
         supplier.add_script_tag(path=str(ROOT/'extension/content.js'))
         assert supplier.evaluate("adapter('PROBE')")['kind']=='chat'
         assert supplier.evaluate("adapter('PREPARE')")['ok']
         expect(supplier.locator('textarea.send-textarea')).to_have_value('Hello, WeChat: demo')
         assert supplier.evaluate("adapter('SEND',{expectedUrl:location.href})")['clicked']
         assert supplier.evaluate('sendClicks')==1
-        assert not supplier.evaluate("adapter('CHECK_SENT',{evidence:{successes:[],outgoing:0}})")['confirmed']
-        passed('captured Alibaba composer: fills and clicks once, but does not invent send confirmation')
+        assert supplier.locator('.send-tool-button').evaluate("node=>node.classList.contains('gray')")
+        passed('Alibaba gray button without disabled remains clickable')
+        supplier.evaluate("document.querySelector('textarea.send-textarea').value='';document.querySelector('.send-tool-button').disabled=true")
+        assert not supplier.evaluate("adapter('PREPARE')")['ok']
+        supplier.evaluate("document.querySelector('.send-tool-button').disabled=false;document.querySelector('.send-tool-button').setAttribute('aria-disabled','true')")
+        assert not supplier.evaluate("adapter('PREPARE')")['ok']
+        passed('native disabled and aria-disabled still prevent Alibaba sending')
         supplier.evaluate("document.querySelector('.send-box-container').remove()")
         assert supplier.evaluate("adapter('PROBE')")['kind']=='contact'
         assert supplier.evaluate("adapter('CONTACT')")['ok']
@@ -216,21 +222,57 @@ try:
         passed('captured Alibaba contacts: Russian storefront action first, Chat Now! toolbar fallback')
 
         supplier.goto('https://test.1688.com/captured')
+        supplier.add_script_tag(path=str(ROOT/'extension/rules-shared.js'))
         supplier.add_script_tag(path=str(ROOT/'extension/content.js'))
         assert 'CAPTCHA' in supplier.evaluate("adapter('PROBE')")['obstacle']
         assert not supplier.evaluate("adapter('CONTACT')")['ok']
         assert supplier.evaluate('contactClicks')==0
-        supplier.evaluate("document.querySelector('.J_MIDDLEWARE_FRAME_WIDGET').remove()")
+        assert supplier.evaluate("adapter('PROBE')")['canDismiss']
+        assert supplier.evaluate("adapter('DISMISS_CHALLENGE')")['clicked']
         assert supplier.evaluate("adapter('CONTACT')")['ok']
         assert supplier.evaluate('contactClicks')==1
-        passed('captured 1688 storefront: visible middleware challenge blocks customer-service action')
+        passed('1688 native close control dismisses the known overlay before customer-service click')
+        supplier.evaluate("document.body.innerHTML='<div id=application><div class=service-entry><span>客服</span></div></div>';window.serviceClicks=0;document.querySelector('.service-entry').addEventListener('click',()=>serviceClicks++)")
+        assert supplier.evaluate("adapter('CONTACT')")['ok']
+        assert supplier.evaluate('serviceClicks')==1
+        passed('1688 customer-service text works without a specific id and preserves event bubbling')
 
         supplier.goto('https://air.1688.com/captured-shell')
+        supplier.add_script_tag(path=str(ROOT/'extension/rules-shared.js'))
         supplier.add_script_tag(path=str(ROOT/'extension/content.js'))
         result=supplier.evaluate("adapter('PROBE')")
         assert result['kind']=='waiting' and result['diagnostics']['chatFrames']==1
         assert not supplier.evaluate("adapter('PREPARE')")['ok']
         passed('captured 1688 shell: waits for real iframe editor and ignores feedback textarea')
+
+        supplier.goto('https://test.en.alibaba.com/captured')
+        supplier.add_script_tag(path=str(ROOT/'extension/rules-shared.js'))
+        supplier.add_script_tag(path=str(ROOT/'extension/content.js'))
+        supplier.evaluate("""document.body.innerHTML='<div class=dm-compose><textarea class=dm-draft></textarea><button class=dm-submit><span>Deliver</span></button></div><button class=vendor-contact>Talk to our team</button>';window.unknownClicks=0;window.earlyPointerDown=0;document.querySelector('.dm-submit').addEventListener('pointerdown',()=>earlyPointerDown++);document.querySelector('.dm-submit').addEventListener('click',()=>unknownClicks++);document.querySelector('.dm-draft').value='Private draft must not be recorded';""")
+        assert supplier.evaluate("adapter('PICK_START',{field:'editor',token:'editor-lesson'})")['ok']
+        supplier.locator('textarea.dm-draft').click()
+        supplier.wait_for_function('lessonMessages.length===1')
+        editor_pick=supplier.evaluate('lessonMessages[0]')
+        assert editor_pick['field']=='editor' and 'Private draft' not in str(editor_pick)
+        supplier.evaluate("window.lessonRules=[OpenLinksRules.makeRule(lessonMessages[0],location.href,'alibaba')]")
+        assert supplier.evaluate("adapter('PICK_START',{field:'send',token:'send-lesson',profile:{rules:lessonRules}})")['ok']
+        supplier.locator('button.dm-submit span').click()
+        supplier.wait_for_function('lessonMessages.length===2')
+        send_pick=supplier.evaluate('lessonMessages[1]')
+        assert send_pick['field']=='send' and send_pick['chatSelector']
+        assert supplier.evaluate('unknownClicks')==0
+        assert supplier.evaluate('earlyPointerDown')==0
+        passed('trusted teaching click records editor/send and inferred chat root before any native send')
+        supplier.evaluate("""const p=lessonMessages[1];lessonRules.push(OpenLinksRules.makeRule(p,location.href,'alibaba'),OpenLinksRules.makeRule({field:'chat',selector:p.chatSelector},location.href,'alibaba'));document.querySelector('.dm-draft').value='';""")
+        assert supplier.evaluate("adapter('PREPARE',{profile:{rules:lessonRules}})")['ok']
+        assert supplier.evaluate("adapter('SEND',{jobId:'learned-send',expectedUrl:location.href,profile:{rules:lessonRules}})")['clicked']
+        assert supplier.evaluate('unknownClicks')==1
+        passed('learned nonstandard composer is filled and clicked exactly once on replay')
+        assert supplier.evaluate("adapter('PICK_START',{field:'contact',token:'cancel-lesson'})")['ok']
+        supplier.locator('[data-openlinks-picker] button').click()
+        assert supplier.evaluate("document.querySelector('[data-openlinks-picker]')===null")
+        assert supplier.evaluate('lessonMessages.length')==2
+        passed('cancel teaching removes the overlay and records no unrelated click')
         assert not errors, errors
         passed('no browser JavaScript errors')
         browser.close()
