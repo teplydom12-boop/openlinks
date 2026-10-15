@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import '../extension/rules-shared.js';
-const {makeRule,matches,direct1688,upgradeRule,mergeRule,known1688Chat}=globalThis.OpenLinksRules;
+const {makeRule,matches,direct1688,upgradeRule,mergeRule}=globalThis.OpenLinksRules;
 test('learned storefront rule transfers across suppliers only within its platform',()=>{
  const rule=makeRule({field:'send',selector:'button.dm-submit',tag:'button',label:'Deliver'},'https://first.en.alibaba.com/','alibaba');
  assert.ok(matches(rule,'https://second.en.alibaba.com/'));
@@ -45,11 +45,4 @@ test('direct chat retains recipient but never a buyer/session/challenge token',(
  assert.equal(direct1688(base+'?touid=supplier&siteid=cnalichn&spm=tracking'),base+'?touid=supplier&siteid=cnalichn');
  for(const query of ['?touid=supplier&chatToken=secret','?touid=supplier&uid=buyer','?touid=supplier&x5secdata=secret',''])assert.equal(direct1688(base+query),null);
  assert.equal(direct1688('https://evil.test/?touid=supplier'),null);
-});
-test('user supplied direct route preserves the recipient and hash entry only for that store',()=>{
- const chat=new URL(known1688Chat('https://keyangjixie.1688.com/'));
- assert.equal(chat.searchParams.get('touid'),'cnalichn山东科阳重工机械');
- assert.equal(chat.searchParams.get('siteid'),'cnalichn');assert.equal(chat.searchParams.get('status'),'1');assert.equal(chat.hash,'#/');
- assert.equal(known1688Chat('https://other.1688.com/'),null);
- assert.equal(known1688Chat('https://keyangjixie.1688.com.evil.test/'),null);
 });

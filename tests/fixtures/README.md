@@ -17,3 +17,7 @@ Inline scripts in these fixtures are explicit test doubles written for the tests
   document/editor was not present in the supplied source. It is not fabricated here.
 
 Existing `chat.html` and `store.html` are synthetic generic workflow fixtures.
+
+- `1688-metadata.html`: public `pageData.globalData.domain`, `sellerLoginId`
+  and `moduleData.commonUrl.wangWangUrl` structure from 457454315.
+  All domain and recipient values are synthetic. No buyer or session data.

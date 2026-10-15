@@ -1,16 +1,19 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import {readFileSync} from 'node:fs';
 import {initialState} from '../extension/lib/core.js';
 const listener=()=>{const list=[];return {list,addListener(fn){list.push(fn);}};};
-let stored,clicks,contactClicks,commands,requests,beforeClick,probeKind,sendResult,frameUrl,tabCount,opened,missing,obstacle,prepareOk;
+let stored,clicks,contactClicks,commands,requests,beforeClick,probeKind,sendResult,frameUrl,tabCount,opened,missing,obstacle,prepareOk,lookupPages,fetches,probeRoute,updated;
+const metadataFixture=readFileSync(new URL('./fixtures/1688-metadata.html',import.meta.url),'utf8');
+globalThis.fetch=async(url,options)=>{fetches.push({url,credentials:options.credentials});const html=lookupPages.get(url);if(html===undefined)throw new Error('No local metadata fixture');return new Response(html,{headers:{'content-type':'text/html'}});};
 const runtime={onMessage:listener(),onStartup:listener(),onInstalled:listener(),getURL:path=>'chrome-extension://test/'+path};
 const alarms={onAlarm:listener(),create:async()=>{}};
 globalThis.chrome={runtime,alarms,storage:{local:{get:async()=>({openlinksState:structuredClone(stored)}),set:async data=>{stored=structuredClone(data.openlinksState);}}},
- tabs:{onUpdated:listener(),onCreated:listener(),create:async data=>{opened.push(data.url);return {id:++tabCount};},update:async()=>{},query:async()=>[],get:async id=>({id,url:frameUrl}),
+ tabs:{onUpdated:listener(),onCreated:listener(),create:async data=>{opened.push(data.url);return {id:++tabCount};},update:async(id,data)=>{updated.push({id,...data});},query:async()=>[],get:async id=>({id,url:frameUrl}),
  sendMessage:async(tab,data)=>{
   commands.push(data.type);
   requests.push(structuredClone(data));
-  if(data.type==='PROBE')return {kind:probeKind,obstacle:obstacle?.text,canDismiss:obstacle?.dismiss,dismissKey:obstacle?.key,reason:probeKind==='inquiry'?'Форма запроса, нужен чат':undefined};
+  if(data.type==='PROBE')return {kind:probeKind,chatRoute:probeRoute,obstacle:obstacle?.text,canDismiss:obstacle?.dismiss,dismissKey:obstacle?.key,reason:probeKind==='inquiry'?'Форма запроса, нужен чат':undefined};
   if(data.type==='PREPARE')return {ok:prepareOk,pageUrl:frameUrl,reason:prepareOk?undefined:'Редактор изменился'};
   if(data.type==='SEND'){clicks++;beforeClick=structuredClone(stored);if(sendResult==='disconnect')throw new Error('Disconnected');return {clicked:sendResult!==false,reason:'Кнопка изменилась'};}
   if(data.type==='CONTACT'){contactClicks++;return {ok:true};}
@@ -21,7 +24,7 @@ await import('../extension/background.js');
 const ui={id:'test',url:'chrome-extension://test/dashboard.html'};
 const message=(type,extra={},sender=ui)=>new Promise(resolve=>runtime.onMessage.list[0]({type,...extra},sender,resolve));
 async function tick(){alarms.onAlarm.list[0]({name:'openlinks-tick'});await message('GET');}
-function reset(){stored=initialState();stored.settings.message='Hello';clicks=0;contactClicks=0;commands=[];requests=[];beforeClick=null;probeKind='chat';sendResult=true;frameUrl='https://a.en.alibaba.com/chat';tabCount=0;opened=[];missing=false;obstacle=null;prepareOk=true;}
+function reset(){stored=initialState();stored.settings.message='Hello';clicks=0;contactClicks=0;commands=[];requests=[];beforeClick=null;probeKind='chat';sendResult=true;frameUrl='https://a.en.alibaba.com/chat';tabCount=0;opened=[];missing=false;obstacle=null;prepareOk=true;lookupPages=new Map();fetches=[];probeRoute=null;updated=[];}
 async function review(url='https://a.en.alibaba.com/'){await message('IMPORT',{text:url});await message('START');await tick();await tick();}
 
 test('click is persisted before side effect; completion does not wait for success or read receipt',async()=>{
@@ -151,15 +154,56 @@ test('about:blank popup is adopted after navigation; unrelated tabs are not adop
  chrome.tabs.onUpdated.list[0](20,{url:frameUrl},{id:20,url:frameUrl});await message('GET');assert.equal(stored.queue[0].tabId,20);assert.ok(stored.chatRoutes[stored.queue[0].url]);
  chrome.tabs.onUpdated.list[0](21,{url:frameUrl},{id:21,url:frameUrl});await message('GET');assert.equal(stored.queue[0].tabId,20);
 });
-test('direct chat cache is keyed to the exact storefront, never a supplier template',async()=>{
+test('a recommendation storefront popup cannot teach a chat for the active 1688 supplier',async()=>{
+ reset();frameUrl='https://first-shop.1688.com/';probeKind='contact';await review(frameUrl);
+ chrome.tabs.onCreated.list[0]({id:20,openerTabId:1,url:'https://different-shop.1688.com/'});await message('GET');
+ assert.equal(stored.queue[0].tabId,1);assert.equal(Object.keys(stored.chatRoutes).length,0);
+ const chat='https://air.1688.com/app/ocms-fusion-components-1688/def_cbu_web_im/index.html?touid=cnalichnfirst';
+ chrome.tabs.onUpdated.list[0](20,{url:chat},{id:20,openerTabId:1,url:chat});await message('GET');assert.equal(stored.queue[0].tabId,1);assert.equal(Object.keys(stored.chatRoutes).length,0);
+ chrome.tabs.onCreated.list[0]({id:21,openerTabId:1,url:chat});await message('GET');assert.equal(stored.queue[0].tabId,21);assert.ok(stored.chatRoutes[frameUrl]);
+});
+test('direct chat cache is keyed to the supplier origin and never another supplier',async()=>{
  reset();const store='https://13153773601.1688.com/';const chat='https://air.1688.com/app/ocms-fusion-components-1688/def_cbu_web_im/index.html?touid=supplier-a';
- stored.chatRoutes[store]={url:chat};await message('IMPORT',{text:store});await message('START');await tick();assert.equal(opened[0],chat);
+ stored.chatRoutes[store]={url:chat};await message('IMPORT',{text:store+'page/offer.htm?view=1'});await message('START');await tick();assert.equal(new URL(opened[0]).searchParams.get('touid'),'supplier-a');assert.equal(fetches.length,0);
  reset();stored.chatRoutes[store]={url:chat};await message('IMPORT',{text:'https://999999.1688.com/'});await message('START');await tick();assert.equal(opened[0],'https://999999.1688.com/');
 });
-test('the user provided keyangjixie mapping opens directly without a previous cache entry',async()=>{
- reset();await message('IMPORT',{text:'https://keyangjixie.1688.com/'});await message('START');await tick();
- const chat=new URL(opened[0]);assert.equal(chat.hostname,'air.1688.com');assert.equal(chat.searchParams.get('touid'),'cnalichn山东科阳重工机械');assert.equal(chat.hash,'#/');
+test('any unknown store is resolved from metadata and later opens directly without a storefront request',async()=>{
+ reset();const store='https://brand-new.1688.com/';lookupPages.set(store,metadataFixture.replaceAll('example-shop.1688.com','brand-new.1688.com'));
+ await message('IMPORT',{text:store});await message('START');await tick();
+ const chat=new URL(opened[0]);assert.equal(chat.hostname,'air.1688.com');assert.equal(chat.searchParams.get('touid'),'cnalichn示例供应商甲');assert.equal(chat.hash,'#/');
  assert.equal(stored.queue[0].status,'contacting');assert.equal(contactClicks,0);
+ assert.equal(fetches.length,1);assert.equal(stored.slots.filter(slot=>slot.kind==='visit').length,1);
+ assert.ok(stored.chatRoutes[store]);await message('SKIP',{id:stored.activeId});
+ stored=JSON.parse(JSON.stringify(stored));stored.slots[0].at-=181000;
+ await message('IMPORT',{text:store+'page/contact.htm?ref=other'});await message('START');await tick();
+ assert.equal(opened[1],opened[0]);assert.equal(fetches.length,1);assert.equal(contactClicks,0);
+});
+test('example store has no special mapping when no observed identity is available',async()=>{
+ reset();await message('IMPORT',{text:'https://keyangjixie.1688.com/'});await message('START');await tick();
+ assert.equal(opened[0],'https://keyangjixie.1688.com/');assert.ok(stored.events.some(e=>e.type==='chat_lookup_fallback'));
+});
+test('metadata appearing after storefront load opens and remembers chat without a contact click',async()=>{
+ reset();frameUrl='https://example-shop.1688.com/';probeKind='waiting';await message('IMPORT',{text:frameUrl});await message('START');await tick();
+ probeRoute=globalThis.OpenLinks1688.fromPage(metadataFixture,frameUrl).url;await tick();
+ assert.equal(updated.length,1);assert.equal(updated[0].url,probeRoute);assert.equal(contactClicks,0);assert.ok(stored.chatRoutes[frameUrl]);
+});
+test('same-tab chat navigation and inner iframe URL both teach general store associations',async()=>{
+ reset();const store='https://first.1688.com/';frameUrl=store;probeKind='contact';await review(store);
+ const chat='https://air.1688.com/app/ocms-fusion-components-1688/def_cbu_web_im/index.html?touid=cnalichnfirst';
+ chrome.tabs.onUpdated.list[0](1,{url:chat},{id:1,url:chat});await message('GET');assert.equal(new URL(stored.chatRoutes[store].url).searchParams.get('touid'),'cnalichnfirst');
+ reset();const second='https://second.1688.com/';frameUrl=second;await review(second);
+ frameUrl=chat.replace('def_cbu_web_im/','def_cbu_web_im_core/').replace('cnalichnfirst','cnalichnsecond');await tick();
+ assert.equal(new URL(stored.chatRoutes[second].url).searchParams.get('touid'),'cnalichnsecond');assert.ok(stored.chatRoutes[second].url.includes('/def_cbu_web_im/'));
+});
+test('public metadata observed on a manually opened storefront is available to future queue work',async()=>{
+ reset();const store='https://example-shop.1688.com/',chat=globalThis.OpenLinks1688.fromPage(metadataFixture,store).url;
+ await message('PAGE_READY',{chatRoute:chat},{id:'test',url:store+'page/offer.htm',tab:{id:40},frameId:0});assert.ok(stored.chatRoutes[store]);
+ await message('IMPORT',{text:store});await message('START');await tick();assert.equal(opened[0],chat);assert.equal(fetches.length,0);
+ await message('FORGET_CHAT_ROUTE',{store});assert.equal(stored.chatRoutes[store],undefined);
+});
+test('quota wait performs no background supplier lookup or tab opening',async()=>{
+ reset();const now=Date.now();stored.slots=Array.from({length:7},(_,i)=>({platform:'1688',kind:'visit',at:now-1000+i}));
+ await message('IMPORT',{text:'https://example-shop.1688.com/'});await message('START');await tick();assert.equal(fetches.length,0);assert.equal(opened.length,0);assert.ok(stored.waiting);
 });
 test('update during sending finalizes an unknown attempt and preserves quota',async()=>{
  reset();stored.running=true;stored.activeId='x';stored.queue=[{id:'x',platform:'alibaba',url:frameUrl,status:'sending'}];stored.slots=[{platform:'alibaba',kind:'send',at:Date.now()}];

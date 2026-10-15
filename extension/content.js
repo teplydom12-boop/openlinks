@@ -78,6 +78,13 @@
     if(challenge?.control!==control)challenge={control,key:crypto.randomUUID()};
     return challenge;
   }
+  function storeChatRoute() {
+    if(site!=='1688' || !globalThis.OpenLinks1688?.storeKey(location.href))return null;
+    // Isolated scripts cannot access window.pageData. Parse the inline JSON as
+    // data instead; never execute the supplier's saved JavaScript in the worker.
+    const scripts=[...document.scripts].filter(script=>/\bwindow\.pageData\s*=/.test(script.textContent));
+    return globalThis.OpenLinks1688.fromPage(scripts.map(script=>script.textContent).join('\n'),location.href).url;
+  }
   function obstacle() {
     const challenges = all('#nc_1_wrapper,.nc-container,.geetest_panel,[id*="captcha" i],[class*="captcha" i],iframe[src*="captcha" i],iframe[src*="recaptcha" i],iframe[src*="hcaptcha" i],iframe[src*="_____tmd_____/punish"],#baxia-dialog-content');
     if(challenges.length) return 'Обнаружена проверка CAPTCHA. Пройдите её вручную и нажмите «Проверить снова».';
@@ -257,7 +264,7 @@
     if(request.type==='PROBE') {
       const found=inspect(profile);
       const close=dismissal();
-      return {kind:found.kind,obstacle:found.obstacle,canDismiss:!!close,dismissKey:close?.key,reason:found.reason,href:found.href,key:found.key,diagnostics:found.diagnostics};
+      return {kind:found.kind,obstacle:found.obstacle,canDismiss:!!close,dismissKey:close?.key,reason:found.reason,href:found.href,key:found.key,diagnostics:found.diagnostics,chatRoute:found.obstacle?null:storeChatRoute()};
     }
     if(request.type==='PICK_START')return startPicker(request);
     if(request.type==='PICK_STOP'){stopPicker();return {ok:true};}
@@ -298,5 +305,5 @@
     Promise.resolve().then(()=>handle(request)).then(respond,error=>respond({ok:false,kind:'ambiguous',reason:'Ошибка селектора или формы: '+error.message}));
     return true;
   });
-  chrome.runtime.sendMessage({type:'PAGE_READY'}).catch(()=>{});
+  chrome.runtime.sendMessage({type:'PAGE_READY',chatRoute:obstacle()?null:storeChatRoute()}).catch(()=>{});
 })();

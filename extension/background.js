@@ -1,6 +1,8 @@
 import {migrateState, validateSettings, classify, parseList, dueJob, eligibility, PLATFORMS, FINAL} from './lib/core.js';
 import './rules-shared.js';
-const {makeRule,mergeRule,direct1688,known1688Chat}=globalThis.OpenLinksRules;
+import './routes-1688-shared.js';
+const {makeRule,mergeRule}=globalThis.OpenLinksRules;
+const routes1688=globalThis.OpenLinks1688;
 
 const KEY = 'openlinksState';
 let serial = Promise.resolve();
@@ -51,7 +53,7 @@ async function call(job, frameId, type, extra = {}) {
 }
 async function probe(job) {
   const results = await Promise.all((await frames(job)).map(async frame => {
-    try { return {...await call(job, frame.frameId, 'PROBE'), frameId:frame.frameId}; }
+    try { return {...await call(job, frame.frameId, 'PROBE'), frameId:frame.frameId,pageUrl:frame.url}; }
     catch { return null; }
   }));
   return results.filter(Boolean);
@@ -160,8 +162,15 @@ async function tick() {
     event(state, 'visit', job, 'Открытие страницы; зарезервирован лимит посещения');
     await save(state);
     try {
-      const cached=job.platform==='1688'?(direct1688(state.chatRoutes[job.url]?.url) || known1688Chat(job.url)):null;
-      if(cached)event(state,'direct_chat',job,'Открываю сохранённый или предоставленный пользователем адрес чата именно этого магазина.');
+      let cached=job.platform==='1688'?routes1688.cached(state.chatRoutes,job.url):null;
+      if(!cached && routes1688.storeKey(job.url)) {
+        event(state,'chat_lookup',job,'Связь с получателем ещё не известна. Однократно читаю публичные данные витрины фоновым запросом в рамках зарезервированного обращения.');
+        await save(state);
+        const result=await routes1688.lookup(job.url);
+        if(result.url){cached=result.url;rememberChat(state,job,cached,result.source);await save(state);}
+        else event(state,'chat_lookup_fallback',job,result.reason+'. Открываю витрину и использую 客服; адрес открывшегося чата будет сохранён.','observation');
+      }
+      if(cached)event(state,'direct_chat',job,'Открываю чат по сохранённому идентификатору этого магазина. Витрину во вкладке не открываю.');
       const tab = await chrome.tabs.create({url:cached || job.url, active:true});
       job.tabId = tab.id;job.supplierTabId=tab.id;if(cached)job.status='contacting';
       event(state,'page_opened',job,`Вкладка ${tab.id} создана. Жду загрузки и ищу веб-чат продавца.`);
@@ -198,6 +207,21 @@ async function tick() {
     await save(state); return;
   }
   delete job.challengeAttempt;
+  if(job.platform==='1688') {
+    let learned=false;
+    const store=routes1688.storeKey(job.url);
+    const storefront=results.find(result=>routes1688.storeKey(result.pageUrl)===store && result.chatRoute && routes1688.route(result.chatRoute));
+    if(storefront && store) {
+      const target=routes1688.route(storefront.chatRoute);learned=rememberChat(state,job,target,'pageData текущей витрины');
+      if(job.status==='visiting') {
+        job.status='contacting';job.stepAt=Date.now();event(state,'direct_chat',job,'В данных текущей витрины найден адрес получателя. Открываю веб-чат напрямую без поиска кнопки 客服.');
+        await save(state);await chrome.tabs.update(job.tabId,{url:target});return;
+      }
+    }
+    const observed=[...new Set(results.map(result=>routes1688.route(result.pageUrl)).filter(Boolean))];
+    if(store && observed.length===1)learned=rememberChat(state,job,observed[0],'адрес фрейма открытого чата') || learned;
+    if(learned)await save(state);
+  }
   if (job.status === 'review') {
     if (job.approved) await performSend(state, job);
     return;
@@ -229,6 +253,7 @@ async function tick() {
       if (contact.href) {
         try {
           if (classify(contact.href).platform !== job.platform) throw new Error('Другая площадка');
+          rememberChat(state,job,contact.href,'ссылка штатной кнопки чата');await save(state);
           await chrome.tabs.update(job.tabId, {url:contact.href});
         } catch { halt(state, job, 'Ссылка ведёт вне поддерживаемой площадки. Откройте чат вручную.'); await save(state); }
       } else {
@@ -281,6 +306,9 @@ async function dispatch(message, sender) {
   if (message.type === 'PAGE_READY') {
     const state = await load();
     const job = state.queue.find(j => j.id === state.activeId);
+    if(sender.tab?.id && sender.frameId===0 && routes1688.storeKey(sender.url) && routes1688.route(message.chatRoute)) {
+      rememberChat(state,{url:sender.url,platform:'1688'},message.chatRoute,'данные открытой витрины');await save(state);
+    }
     if (sender.tab?.id === job?.tabId) {
       if(state.learning && !state.learning.frameIds.includes(sender.frameId)) {
         try {
@@ -337,6 +365,11 @@ async function dispatch(message, sender) {
       state.rules=state.rules.filter(rule=>rule.id!==message.id);
       if(job)job.profile.rules=state.rules.filter(rule=>rule.platform===job.platform);
       event(state,'rule_removed',job,'Выбранное правило удалено.');await save(state);return {ok:true};
+    case 'FORGET_CHAT_ROUTE': {
+      const key=routes1688.storeKey(message.store);if(!key)throw new Error('Некорректный адрес магазина');
+      for(const saved of Object.keys(state.chatRoutes))if(routes1688.storeKey(saved)===key)delete state.chatRoutes[saved];
+      event(state,'chat_route_removed',{url:key},'Адрес чата забыт. При следующем обращении получатель будет определён заново.');await save(state);return {ok:true};
+    }
     case 'LIST_TABS': {
       if(!job)return {ok:true,tabs:[]};
       const tabs=(await chrome.tabs.query({})).filter(tab=>{try{return classify(tab.url).platform===job.platform;}catch{return false;}});
@@ -373,20 +406,34 @@ chrome.runtime.onMessage.addListener((message,sender,respond) => {
   return true;
 });
 chrome.alarms.onAlarm.addListener(item=>{ if(item.name==='openlinks-tick') exclusive(safeTick); });
-function rememberChat(state,job,url) {
-  if(job.platform!=='1688')return;
-  const safe=direct1688(url);if(!safe)return;
-  state.chatRoutes[job.url]={url:safe,at:Date.now()};event(state,'chat_route',job,'Сохранён наблюдавшийся адрес получателя для этого магазина, без данных сессии.');
+function rememberChat(state,job,url,source='вкладка открытого чата') {
+  if(job.platform!=='1688')return false;
+  const key=routes1688.storeKey(job.url),safe=routes1688.route(url);if(!key || !safe)return false;
+  if(state.chatRoutes[key]?.url===safe)return false;
+  state.chatRoutes[key]={url:safe,at:Date.now(),source};
+  event(state,'chat_route',job,`Сохранена связь ${new URL(key).hostname} → получатель чата; источник: ${source}. Применяется ко всем страницам этого магазина, без данных сессии.`);
+  return true;
 }
 async function adoptChatTab(state,tab) {
   const job=state.queue.find(j=>j.id===state.activeId);
-  if(!job || !['contacting','visiting','blocked'].includes(job.status))return;
-  if(tab.id===job.tabId)return;
+  if(!job || !['contacting','visiting','blocked','review'].includes(job.status))return;
+  if(tab.id===job.tabId) {
+    const before=state.chatRoutes[routes1688.storeKey(job.url)]?.url;
+    rememberChat(state,job,tab.pendingUrl || tab.url,'переход текущей вкладки в чат');
+    if(before!==state.chatRoutes[routes1688.storeKey(job.url)]?.url)await save(state);
+    return;
+  }
+  if(job.status==='review')return;
+  if(job.ignoredPopupIds?.includes(tab.id))return;
   const related=(tab.openerTabId!==undefined && [job.tabId,job.supplierTabId].includes(tab.openerTabId)) || job.popupCandidates?.includes(tab.id);
   if(!related)return;
   job.popupCandidates=[...new Set([...(job.popupCandidates || []),tab.id])];
   try {
     if(classify(tab.pendingUrl || tab.url).platform!==job.platform) {await save(state);return;}
+    if(job.platform==='1688' && !routes1688.isMessenger(tab.pendingUrl || tab.url)) {
+      job.popupCandidates=job.popupCandidates.filter(id=>id!==tab.id);
+      job.ignoredPopupIds=[...(job.ignoredPopupIds || []),tab.id];await save(state);return;
+    }
     await stopLearning(state,job);
     job.tabId=tab.id; job.stepAt=Date.now(); event(state,'chat_tab',job,'Открыта вкладка чата площадки');
     if(job.status==='blocked')job.resumeStatus='contacting';

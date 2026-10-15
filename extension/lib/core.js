@@ -187,6 +187,7 @@ export const EVENT_LABELS = {
   chat_tab:'Новая вкладка чата',remove_pending:'Удаление ожидающих задач',upgrade:'Обновление расширения',...STATUS,
   learning:'Жду обучающего клика',learned:'Правило сохранено',learning_cancel:'Обучение отменено',rule_removed:'Правило удалено',
   challenge_close:'Закрываю окно проверки',direct_chat:'Прямой переход в чат',chat_route:'Адрес чата сохранён',
+  chat_lookup:'Определяю получателя 1688',chat_lookup_fallback:'Перехожу к обычному открытию чата',chat_route_removed:'Адрес чата забыт',
   quota_deferred:'Площадка отложена из-за лимита',quota_resume:'Возврат к отложенной задаче',
 };
 export function activityText(state) {

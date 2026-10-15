@@ -7,6 +7,7 @@ The actual core, content script, dashboard and file writer run unmodified.
 import functools
 import http.server
 import os
+import re
 from pathlib import Path
 import threading
 from playwright.sync_api import sync_playwright, expect
@@ -106,6 +107,15 @@ try:
         assert ui.evaluate('document.documentElement.scrollWidth <= window.innerWidth')
         passed('responsive layout at 600px')
         ui.set_viewport_size({'width':1440,'height':1050})
+        ui.get_by_role('button',name='Сообщение и настройки').click()
+        ui.evaluate("seedChatRoute('https://example-shop.1688.com/','https://air.1688.com/app/ocms-fusion-components-1688/def_cbu_web_im/index.html?touid=cnalichnexample&siteid=cnalichn&status=1#/')")
+        expect(ui.locator('#known-chats')).to_contain_text('example-shop.1688.com')
+        expect(ui.locator('#known-chats a')).to_have_attribute('href',re.compile('touid=cnalichnexample'))
+        assert ui.locator('#known-chats button').get_attribute('type')=='button'
+        ui.locator('#known-chats button').click()
+        expect(ui.locator('#known-chats a')).to_have_count(0)
+        ui.get_by_role('button',name='Очередь поставщиков').click()
+        passed('dashboard lists saved 1688 chat associations and forgets them without submitting settings')
 
         context.route('https://test.en.alibaba.com/**', lambda route: route.fulfill(
             body=(ROOT/'tests/fixtures'/('chat.html' if '/chat' in route.request.url else 'store.html')).read_text(), content_type='text/html'))
@@ -113,18 +123,21 @@ try:
         adapter_transport="""
           let listener;
           window.lessonMessages=[];
-          window.chrome={runtime:{id:'adapter-test',onMessage:{addListener(fn){listener=fn}},sendMessage:async message=>{if(message.type==='LEARN_PICK')lessonMessages.push(message);return {ok:true};}}};
+          window.adapterMessages=[];
+          window.chrome={runtime:{id:'adapter-test',onMessage:{addListener(fn){listener=fn}},sendMessage:async message=>{adapterMessages.push(message);if(message.type==='LEARN_PICK')lessonMessages.push(message);return {ok:true};}}};
           window.adapter=(type,extra={})=>new Promise(resolve=>listener({type,jobId:'test-job',profile:{},message:'Hello, WeChat: demo',...extra},{id:'adapter-test'},resolve));
         """
         supplier.add_init_script(adapter_transport)
         supplier.goto('https://test.en.alibaba.com/')
         supplier.add_script_tag(path=str(ROOT/'extension/rules-shared.js'))
+        supplier.add_script_tag(path=str(ROOT/'extension/routes-1688-shared.js'))
         supplier.add_script_tag(path=str(ROOT/'extension/content.js'))
         result = supplier.evaluate("adapter('PROBE')")
         assert result['kind']=='contact' and result['href']=='https://test.en.alibaba.com/chat'
         passed('semantic contact discovery')
         supplier.goto('https://test.en.alibaba.com/chat')
         supplier.add_script_tag(path=str(ROOT/'extension/rules-shared.js'))
+        supplier.add_script_tag(path=str(ROOT/'extension/routes-1688-shared.js'))
         supplier.add_script_tag(path=str(ROOT/'extension/content.js'))
         assert supplier.evaluate("adapter('PROBE')")['kind']=='chat'
         result = supplier.evaluate("adapter('PREPARE')")
@@ -170,6 +183,7 @@ try:
             'https://test.en.alibaba.com/captured': 'captured-alibaba.html',
             'https://test.1688.com/captured': 'captured-1688-store.html',
             'https://air.1688.com/captured-shell': 'captured-1688-shell.html',
+            'https://example-shop.1688.com/': '1688-metadata.html',
         }
         # Every iframe/resource request is intercepted locally. No vendor request
         # or challenge is fetched, even though the fixtures preserve frame URLs.
@@ -182,6 +196,7 @@ try:
         context.route('**/*',capture_route)
         supplier.goto('https://test.en.made-in-china.com/captured')
         supplier.add_script_tag(path=str(ROOT/'extension/rules-shared.js'))
+        supplier.add_script_tag(path=str(ROOT/'extension/routes-1688-shared.js'))
         supplier.add_script_tag(path=str(ROOT/'extension/content.js'))
         result=supplier.evaluate("adapter('PROBE')")
         assert result['kind']=='contact' and result['diagnostics']['adapter']=='mic'
@@ -200,6 +215,7 @@ try:
 
         supplier.goto('https://test.en.alibaba.com/captured')
         supplier.add_script_tag(path=str(ROOT/'extension/rules-shared.js'))
+        supplier.add_script_tag(path=str(ROOT/'extension/routes-1688-shared.js'))
         supplier.add_script_tag(path=str(ROOT/'extension/content.js'))
         assert supplier.evaluate("adapter('PROBE')")['kind']=='chat'
         assert supplier.evaluate("adapter('PREPARE')")['ok']
@@ -224,6 +240,7 @@ try:
 
         supplier.goto('https://test.1688.com/captured')
         supplier.add_script_tag(path=str(ROOT/'extension/rules-shared.js'))
+        supplier.add_script_tag(path=str(ROOT/'extension/routes-1688-shared.js'))
         supplier.add_script_tag(path=str(ROOT/'extension/content.js'))
         assert 'CAPTCHA' in supplier.evaluate("adapter('PROBE')")['obstacle']
         assert not supplier.evaluate("adapter('CONTACT')")['ok']
@@ -250,14 +267,31 @@ try:
 
         supplier.goto('https://air.1688.com/captured-shell')
         supplier.add_script_tag(path=str(ROOT/'extension/rules-shared.js'))
+        supplier.add_script_tag(path=str(ROOT/'extension/routes-1688-shared.js'))
         supplier.add_script_tag(path=str(ROOT/'extension/content.js'))
         result=supplier.evaluate("adapter('PROBE')")
         assert result['kind']=='waiting' and result['diagnostics']['chatFrames']==1
         assert not supplier.evaluate("adapter('PREPARE')")['ok']
         passed('captured 1688 shell: waits for real iframe editor and ignores feedback textarea')
 
+        supplier.goto('https://example-shop.1688.com/')
+        supplier.add_script_tag(path=str(ROOT/'extension/rules-shared.js'))
+        supplier.add_script_tag(path=str(ROOT/'extension/routes-1688-shared.js'))
+        supplier.add_script_tag(path=str(ROOT/'extension/content.js'))
+        metadata=supplier.evaluate("adapter('PROBE')")
+        assert metadata['kind']=='contact' and 'touid=cnalichn' in metadata['chatRoute']
+        ready=supplier.evaluate("adapterMessages.find(message=>message.type==='PAGE_READY')")
+        assert ready['chatRoute']==metadata['chatRoute']
+        assert '示例供应商甲' in supplier.evaluate("decodeURIComponent(adapterMessages.find(message=>message.type==='PAGE_READY').chatRoute)")
+        passed('1688 inline seller metadata is exposed to the worker before any contact-button click')
+        lookup=supplier.evaluate('OpenLinks1688.lookup(location.href)')
+        assert lookup['url']==metadata['chatRoute']
+        assert not supplier.evaluate("adapterMessages.some(message=>message.type==='CONTACT')")
+        passed('background-style HTML lookup resolves a previously unknown 1688 seller without opening its chat button')
+
         supplier.goto('https://test.en.alibaba.com/captured')
         supplier.add_script_tag(path=str(ROOT/'extension/rules-shared.js'))
+        supplier.add_script_tag(path=str(ROOT/'extension/routes-1688-shared.js'))
         supplier.add_script_tag(path=str(ROOT/'extension/content.js'))
         supplier.evaluate("""document.body.innerHTML='<div class=dm-compose><textarea class=dm-draft></textarea><button class=dm-submit><span>Deliver</span></button></div><button class=vendor-contact>Talk to our team</button>';window.unknownClicks=0;window.earlyPointerDown=0;document.querySelector('.dm-submit').addEventListener('pointerdown',()=>earlyPointerDown++);document.querySelector('.dm-submit').addEventListener('click',()=>unknownClicks++);document.querySelector('.dm-draft').value='Private draft must not be recorded';""")
         assert supplier.evaluate("adapter('PICK_START',{field:'editor',token:'editor-lesson'})")['ok']
@@ -294,6 +328,7 @@ try:
         restored.add_init_script(adapter_transport)
         restored.goto('https://second.en.alibaba.com/')
         restored.add_script_tag(path=str(ROOT/'extension/rules-shared.js'))
+        restored.add_script_tag(path=str(ROOT/'extension/routes-1688-shared.js'))
         restored.add_script_tag(path=str(ROOT/'extension/content.js'))
         restored.evaluate("rules=>{window.restoredRules=JSON.parse(rules);restoredRules.push(OpenLinksRules.makeRule({field:'send',selector:'.missing-template'},location.href,'alibaba'));}",persisted_rules)
         replay=restored.evaluate("adapter('PROBE',{profile:{rules:restoredRules}})")
@@ -306,6 +341,7 @@ try:
         fresh.close()
         supplier.goto('https://first-named.1688.com/')
         supplier.add_script_tag(path=str(ROOT/'extension/rules-shared.js'))
+        supplier.add_script_tag(path=str(ROOT/'extension/routes-1688-shared.js'))
         supplier.add_script_tag(path=str(ROOT/'extension/content.js'))
         supplier.evaluate("document.body.innerHTML='<button class=vendor-contact>Talk to our team</button>'")
         assert supplier.evaluate("adapter('PICK_START',{field:'contact',token:'named-shop'})")['ok']
@@ -314,6 +350,7 @@ try:
         named_rule=supplier.evaluate("JSON.stringify(OpenLinksRules.makeRule(lessonMessages[0],location.href,'1688'))")
         supplier.goto('https://second-named.1688.com/')
         supplier.add_script_tag(path=str(ROOT/'extension/rules-shared.js'))
+        supplier.add_script_tag(path=str(ROOT/'extension/routes-1688-shared.js'))
         supplier.add_script_tag(path=str(ROOT/'extension/content.js'))
         supplier.evaluate("rule=>{window.namedRule=JSON.parse(rule);document.body.innerHTML='<button class=vendor-contact>Talk to our team</button>';window.namedClicks=0;document.querySelector('button').onclick=()=>namedClicks++;}",named_rule)
         result=supplier.evaluate("adapter('PROBE',{profile:{rules:[namedRule]}})")

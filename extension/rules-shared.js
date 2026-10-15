@@ -61,11 +61,5 @@
       u.hash=u.hash.startsWith('#/')?'/':'';return u.href;
     } catch {return null;}
   }
-  const known1688Chats={
-    'keyangjixie.1688.com':direct1688('https://air.1688.com/app/ocms-fusion-components-1688/def_cbu_web_im/index.html?touid=cnalichn%E5%B1%B1%E4%B8%9C%E7%A7%91%E9%98%B3%E9%87%8D%E5%B7%A5%E6%9C%BA%E6%A2%B0&siteid=cnalichn&status=1#/'),
-  };
-  function known1688Chat(store) {
-    try {const u=new URL(store);return platform(store)==='1688'?known1688Chats[u.hostname] || null:null;}catch{return null;}
-  }
-  globalThis.OpenLinksRules={platform,scopeFor,matches,makeRule,upgradeRule,mergeRule,direct1688,known1688Chat};
+  globalThis.OpenLinksRules={platform,scopeFor,matches,makeRule,upgradeRule,mergeRule,direct1688,is1688Storefront};
 })();

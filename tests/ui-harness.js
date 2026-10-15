@@ -17,9 +17,15 @@ window.chrome={
     if(message.type==='START') state.running=true;
     if(message.type==='PAUSE') state.running=false;
     if(message.type==='REMOVE_PENDING') state.queue=state.queue.filter(j=>j.status!=='pending');
+    if(message.type==='FORGET_CHAT_ROUTE')delete state.chatRoutes[message.store];
     const snapshot=structuredClone(state);
     queueMicrotask(()=>storageListeners.forEach(listener=>listener({openlinksState:{newValue:snapshot}},'local')));
     return result;
   }},storage:{onChanged:{addListener:fn=>storageListeners.push(fn)}},
+};
+window.seedChatRoute=(store,url)=>{
+  state.chatRoutes[store]={url,at:Date.now()};
+  const snapshot=structuredClone(state);
+  storageListeners.forEach(listener=>listener({openlinksState:{newValue:snapshot}},'local'));
 };
 window.showDirectoryPicker=()=>navigator.storage.getDirectory();

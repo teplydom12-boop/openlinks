@@ -1,5 +1,6 @@
 import {PLATFORMS, STATUS, EVENT_LABELS, FINAL, makePlan, WINDOW_MS, scheduleText, reportText, activityText, nextAllowed} from './lib/core.js';
 import {getFolder,rememberFolder,writeFile,writeLog,download} from './lib/files.js';
+import './routes-1688-shared.js';
 const $=selector=>document.querySelector(selector);
 let state, folder, settingsDirty=false, fileWrites=Promise.resolve(), toastTimer;
 const approvedFolders=new WeakSet();
@@ -90,10 +91,22 @@ function render() {
   const fieldNames={contact:'Открыть чат',editor:'Поле сообщения',send:'Отправить',chat:'Область диалога'};
   for(const rule of state.rules || []) {
     const item=element('p'),remove=element('button','Забыть','link-button');
+    remove.type='button';
     item.append(element('span',`${PLATFORMS[rule.platform].label} · ${fieldNames[rule.field]} · ${rule.scope.host}${rule.scope.path} · ${rule.selector} `),remove);
     remove.addEventListener('click',()=>command('FORGET_RULE',{id:rule.id}).catch(e=>toast(e.message,true)));learned.append(item);
   }
   if(!(state.rules || []).length)learned.append(element('p','Правил пока нет. При остановке задачи покажите нужный элемент на странице.','hint'));
+  const knownChats=$('#known-chats');knownChats.replaceChildren();
+  const keys=[...new Set(Object.keys(state.chatRoutes || {}).map(globalThis.OpenLinks1688.storeKey).filter(Boolean))];
+  for(const key of keys) {
+    const target=globalThis.OpenLinks1688.cached(state.chatRoutes,key);if(!target)continue;
+    const item=element('p'),link=element('a','Открыть чат'),remove=element('button','Забыть адрес','link-button');
+    remove.type='button';
+    link.href=target;link.target='_blank';link.rel='noreferrer';
+    item.append(element('span',new URL(key).hostname+' · '),link,document.createTextNode(' · '),remove);knownChats.append(item);
+    remove.addEventListener('click',()=>command('FORGET_CHAT_ROUTE',{store:key}).catch(e=>toast(e.message,true)));
+  }
+  if(!knownChats.children.length)knownChats.append(element('p','Адреса появятся после определения получателей или открытия чатов 1688.','hint'));
   const body=$('#queue-body'); body.replaceChildren();
   for(const [index,job] of makePlan(state,now).entries()) {
     const row=element('tr'), urlCell=element('td'),link=element('a',new URL(job.url).hostname);
