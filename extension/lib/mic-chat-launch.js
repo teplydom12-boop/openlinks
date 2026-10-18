@@ -5,7 +5,10 @@ export function captureMICChat() {
   const blocked=reason=>({ok:false,status:'blocked',reason,detail:'Не удалось безопасно открыть центр сообщений Made-in-China. Проверьте вкладку площадки.'});
   const waiting=reason=>({ok:false,status:'loading',reason,detail:'Ожидаю готовности центра сообщений Made-in-China.'});
   try {
-    if(window.top!==window||location.href!=='https://membercenter.made-in-china.com/message/index.html')return blocked('wrong_page');
+    const page=new URL(location.href);
+    // MIC may add tracking or UI state to the member-center URL. Keep the
+    // origin/path fixed without mistaking those suffixes for a different page.
+    if(window.top!==window||page.origin!=='https://membercenter.made-in-china.com'||page.pathname!=='/message/index.html'||page.username||page.password||page.port)return blocked('wrong_page');
     if(document.readyState!=='complete')return waiting('page_loading');
     const visible=element=>{
       if(!element?.isConnected)return false;
@@ -31,7 +34,8 @@ export function captureMICChat() {
     let attempt=document[key];
     if(!attempt){attempt=Object.seal({bubble:false,expand:false});Object.defineProperty(document,key,{value:attempt});}
     if(attempt.expand)return blocked('attempt_consumed');
-    const expanded=visibleMatches('#webtm-wrapper .webtm-min-task-expanded .webtm-lite-content-visible button.webtm-full-btn');
+    const fullButton='#webtm-wrapper .webtm-min-task-expanded .webtm-lite-content-visible button.webtm-full-btn';
+    let expanded=visibleMatches(fullButton);
     if(expanded.length>1)return blocked('ambiguous_expand');
     const safeControl=element=>{
       if(element.closest('form')||element.form)return 'form_control';
@@ -45,7 +49,11 @@ export function captureMICChat() {
       const unsafe=safeControl(bubbles[0]);if(unsafe)return blocked(unsafe);
       attempt.bubble=true;
       try{HTMLElement.prototype.click.call(bubbles[0]);}catch{return blocked('bubble_failed');}
-      return waiting('widget_expanding');
+      // Let the caller immediately rescan newly visible child frames before
+      // the next action. A fresh editor guard is still required before opening.
+      expanded=visibleMatches(fullButton);
+      if(expanded.length>1)return blocked('ambiguous_expand');
+      return waiting(expanded.length?'widget_ready':'widget_expanding');
     }
     const control=expanded[0],unsafe=safeControl(control);if(unsafe)return blocked(unsafe);
     const original=Object.getOwnPropertyDescriptor(window,'open');

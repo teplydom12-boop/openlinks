@@ -62,11 +62,13 @@
           <p id="dialogs-test-detail" class="hint"></p>
           <div id="dialogs-test-result" class="dialogs-test-result" hidden><p id="dialogs-test-recipient"></p><p id="dialogs-test-time" class="hint"></p><pre id="dialogs-test-text"></pre><p id="dialogs-test-result-note" class="hint">Текст введён в чат для проверки. Записи об отправке в истории переписки нет.</p></div>
           <div class="actions"><button id="dialogs-test-next" class="button primary" type="button" disabled>Проверить первый цикл</button><span id="dialogs-test-count" class="hint"></span></div>
-          <p class="hint">После одного ответа проверка останавливается на всех площадках. «Следующий цикл» учитывает предыдущий ответ только в тестовом режиме и переходит к следующему входящему сообщению.</p>
+          <p class="hint">После одного ответа проверка останавливается на всех площадках. «Следующий цикл» учитывает предыдущий ответ только в тестовом режиме и переходит к следующему подходящему чату, в том числе уже прочитанному, если включена проверка WeChat.</p>
         </div>
       </div>
       <div class="actions"><button id="dialogs-start" class="button primary" type="button" disabled>Начать мониторинг</button><button id="dialogs-stop" class="button secondary" type="button" disabled>Остановить мониторинг</button><button id="dialogs-scan" class="button secondary" type="button" disabled>Проверить сейчас</button></div>
-      <details class="dialogs-inline-details"><summary>Как читаются сообщения</summary><label class="check"><input id="dialogs-read-unread" type="checkbox" checked> Открывать диалоги с новыми сообщениями для чтения</label><p class="hint">Открытие переписки может снять отметку «непрочитано». При первом проходе также проверяются диалоги с доступным превью. Настройка применяется при запуске мониторинга. Если история или автор сообщения не распознаны, ответ приостанавливается до проверки.</p></details>
+      <label class="check"><input id="dialogs-scan-read" type="checkbox" disabled> Проверять прочитанные чаты, где ещё не передан WeChat</label>
+      <p id="dialogs-scan-read-note" class="hint" role="status">Используется ваш WeChat из шага 2. Проверяется доступная история, включая ваши исходящие сообщения. Если ранняя история недоступна, приглашение можно проверить только в тестовом режиме без отправки.</p>
+      <details class="dialogs-inline-details"><summary>Как читаются сообщения</summary><label class="check"><input id="dialogs-read-unread" type="checkbox" checked> Открывать диалоги с новыми сообщениями для чтения</label><p class="hint">Открытие переписки может снять отметку «непрочитано». Проверка прочитанных чатов не зависит от этой настройки. Если история или автор сообщения не распознаны, ответ приостанавливается до проверки.</p></details>
     </section>
 
     <section id="dialogs-conversations" class="panel" aria-labelledby="dialogs-conversations-heading">
@@ -77,7 +79,7 @@
         <section id="dialogs-detail" class="dialogs-detail" hidden aria-label="Выбранная переписка">
           <div class="panel-heading"><div><h3 id="dialogs-supplier"></h3><p id="dialogs-conversation-status" class="hint"></p></div><a id="dialogs-source" target="_blank" rel="noopener noreferrer" hidden>Открыть чат ↗</a></div>
           <div class="actions"><button id="dialogs-takeover" class="button secondary" type="button">Взять разговор на себя</button><button id="dialogs-mute" class="button secondary" type="button">Пауза переписки</button></div>
-          <p id="dialogs-history-note" class="hint"></p><p id="dialogs-reader-detail" class="hint" role="status" hidden></p><p id="dialogs-coverage" class="hint" hidden></p>
+          <p id="dialogs-history-note" class="hint"></p><p id="dialogs-reader-detail" class="hint" role="status" hidden></p><p id="dialogs-coverage" class="hint" hidden></p><p id="dialogs-wechat-assessment" class="hint" role="status" hidden></p>
           <div id="dialogs-history" class="dialogs-history" aria-label="История переписки"></div>
           <p id="dialogs-conversation-test-note" class="dialogs-conversation-test-note" role="status" hidden></p>
           <div class="dialogs-draft">

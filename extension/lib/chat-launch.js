@@ -6,6 +6,24 @@ export const CHAT_CENTERS=Object.freeze({
   mic:'https://membercenter.made-in-china.com/message/index.html',
 });
 export const CHAT_LAUNCH_TIMEOUT_MS=120000;
+// The member center is only a launch page. Its embedded lite widget can expose
+// readable rows, but that must never make the mailbox a full messenger.
+export function isMICBootstrapPage(value) {
+  try {
+    const url=new URL(value);
+    return url.protocol==='https:'&&url.hostname==='membercenter.made-in-china.com'&&url.pathname==='/message/index.html'&&!url.username&&!url.password&&!url.port;
+  } catch {return false;}
+}
+export function isMICMessengerPage(value) {
+  try {
+    const url=new URL(value);
+    if(url.protocol!=='https:'||url.hostname!=='webim.made-in-china.com'||url.pathname!=='/super-tm/'||url.username||url.password||url.port)return false;
+    const fragment=decodeURIComponent(url.hash.slice(1));
+    if(/^\/?(?:login|signin|sign-in)(?:[/?#&]|$)/i.test(fragment))return false;
+    const queryIndex=url.hash.indexOf('?'),params=[url.searchParams,new URLSearchParams(queryIndex<0?'':url.hash.slice(queryIndex+1))];
+    return params.every(query=>['isLiteTM','isSAChat'].every(key=>query.getAll(key).every(value=>value==='false')));
+  } catch {return false;}
+}
 export function managedChatRoute(name,value) {
   try {
     const url=new URL(value),center=new URL(CHAT_CENTERS[name]);

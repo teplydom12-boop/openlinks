@@ -1,6 +1,6 @@
 import {
   normalizeDialogs, bindDialogTab, unbindDialogTab, mergeDialogSnapshot,
-  setConversationControl, draftRequest, acceptDraft, setDialogSettings, addDialogEvent, buildDraftPrompt, conversationKey,
+  setConversationControl, contactAssessment, contactReadChecked, contactLedgerStatus, recordContactRead, reserveContactRecord, mayPrepareWechat, wechatContactFingerprint, draftRequest, acceptDraft, setDialogSettings, addDialogEvent, buildDraftPrompt, conversationKey,
   attachmentSourceFingerprint,saveProduct,productExtractionRequest,buildProductExtractionPrompt,acceptProductExtraction,approveProduct,productFingerprint,
 } from './lib/dialogs.js';
 import {generateDialogDraft, extractProductKeyPoints, validateModel, validateProvider, providerInfo, parseProductKeyPoints} from './lib/dialog-ai.js';
@@ -11,7 +11,7 @@ import {withTabOwnership} from './lib/tab-ownership.js';
 import {loadProductImage} from './lib/product-files.js';
 import {resolveChatAttachments,pruneChatAttachmentCache} from './lib/chat-attachments.js';
 import {sameJsonValue} from './lib/json-values.js';
-import {CHAT_CENTERS,CHAT_LAUNCH_TIMEOUT_MS,managedChatRoute,validMICBootstrapURL} from './lib/chat-launch.js';
+import {CHAT_CENTERS,CHAT_LAUNCH_TIMEOUT_MS,managedChatRoute,validMICBootstrapURL,isMICBootstrapPage,isMICMessengerPage} from './lib/chat-launch.js';
 import {captureMICChat} from './lib/mic-chat-launch.js';
 
 export const DIALOGS_KEY = 'openlinksDialogs';
@@ -116,7 +116,7 @@ export function createDialogMonitor({api=globalThis.chrome, fetchImpl=globalThis
       if(!row.active || row.busy)continue;
       const key=conversationKey(row.platform,row.id),item=state.conversations[key];
       if(state.traversal[row.platform].pending)continue;
-      try {if(mayAuto(item,await attemptFingerprint(state,draftRequest(state,key),config)))return key;}catch{}
+      try {const request=draftRequest(state,key);if(request.purpose!=='wechat'&&mayAuto(item,await attemptFingerprint(state,request,config)))return key;}catch{}
     }
     return null;
   }
@@ -247,10 +247,10 @@ export function createDialogMonitor({api=globalThis.chrome, fetchImpl=globalThis
     }
     return {ready:true,busy:false,documentToken:parent.documentToken};
   }
-  async function bootstrapMICChat(state,binding,observed) {
+  async function bootstrapMICChat(state,binding,observed,expanded=false) {
     const managed=binding.managed,tab=await managedTab('mic',binding);
-    if(!tab||tab.url!==CHAT_CENTERS.mic||tab.status!=='complete'||tab.pendingUrl)return;
-    const before=micBootstrapSource(observed);
+    if(!tab||!isMICBootstrapPage(tab.url)||tab.status!=='complete'||tab.pendingUrl)return;
+    const before=micBootstrapSource(observed,tab.url);
     if(before.busy){managed.pending=false;markHealth(state,'mic','paused','В чате есть черновик или вы работаете во вкладке. Завершите ввод и повторите проверку подключения.');return;}
     if(!before.ready)return;
     try {protectTestBinding(await loadFolder(),'mic',tab.id);}catch {managed.pending=false;markHealth(state,'mic','paused','Сначала завершите тестовый цикл в этом чате; сохранённый черновик не изменялся.');return;}
@@ -259,7 +259,10 @@ export function createDialogMonitor({api=globalThis.chrome, fetchImpl=globalThis
       const results=await timeout(api.scripting.executeScript({target:{tabId:tab.id,frameIds:[0]},world:'MAIN',func:captureMICChat}),5000);
       const reply=results?.length===1&&results[0].frameId===0?results[0].result:null;
       if(reply?.ok!==true) {
-        if(reply?.status==='loading')return;
+        if(reply?.status==='loading'){
+          if(reply.reason==='widget_ready'&&!expanded){const refreshed=await scanPlatform(state,'mic');if(state.bindings.mic===binding)await bootstrapMICChat(state,binding,refreshed,true);}
+          return;
+        }
         managed.pending=false;
         const consumed=['attempt_consumed','no_capture','ambiguous_open','invalid_chat_url','expand_failed','open_restore_failed'].includes(reply?.reason);
         markHealth(state,'mic',consumed?'error':'paused',consumed?'Попытка открытия полного чата не завершена. Проверьте черновик; когда поле пустое, обновите рабочую вкладку и повторите проверку подключения.':'Не удалось безопасно открыть полный чат. Проверьте созданную вкладку, вход и черновик; затем повторите проверку подключения.');return;
@@ -267,7 +270,7 @@ export function createDialogMonitor({api=globalThis.chrome, fetchImpl=globalThis
       if(!validMICBootstrapURL(reply.url)){managed.pending=false;markHealth(state,'mic','error','Площадка вернула неподдерживаемый адрес полного чата. Автоматический переход отменён.');return;}
       const current=await managedTab('mic',binding);
       if(!current||current.url!==tab.url||current.pendingUrl||current.status!=='complete'){managed.pending=false;markHealth(state,'mic','paused','Вкладка изменилась во время открытия чата. Повторите проверку подключения.');return;}
-      const fresh=await scanPlatform(state,'mic'),after=micBootstrapSource(fresh);
+      const fresh=await scanPlatform(state,'mic'),after=micBootstrapSource(fresh,tab.url);
       if(state.bindings.mic!==binding||!after.ready||after.documentToken!==before.documentToken){managed.pending=false;markHealth(state,'mic','paused','Состояние чата изменилось. Проверьте вкладку и черновик перед повторным открытием.');return;}
       // Navigate the same owned inactive tab. Never save/log/return the native
       // bootstrap hash, and never invoke the site's real popup or focus APIs.
@@ -278,8 +281,7 @@ export function createDialogMonitor({api=globalThis.chrome, fetchImpl=globalThis
   async function initializeHiddenMIC(state,binding,observed) {
     const managed=binding.managed,tab=await managedTab('mic',binding);
     if(!tab||tab.status!=='complete'||tab.pendingUrl||binding.status!=='unsupported')return;
-    let url;try{url=new URL(tab.url);}catch{return;}
-    if(url.origin!=='https://webim.made-in-china.com'||url.pathname!=='/super-tm/'||/^#\/login(?:[/?]|$)/i.test(url.hash))return;
+    if(!isMICMessengerPage(tab.url))return;
     if(!observed.sources?.length||observed.sources.some(source=>source.conversations?.length))return;
     const before=micBootstrapSource(observed,tab.url);
     if(before.busy){managed.pending=false;markHealth(state,'mic','paused','Завершите ввод в чате и повторите проверку подключения. Черновик не изменялся.');return;}
@@ -323,8 +325,8 @@ export function createDialogMonitor({api=globalThis.chrome, fetchImpl=globalThis
     if(!managed)return;
     const observed=await scanPlatform(state,name);
     if(state.bindings[name]!==binding)return;
-    const tab=name==='mic'?await managedTab(name,binding):null,needsBootstrap=tab?.url===CHAT_CENTERS.mic;
-    if(['login','captcha','paused'].includes(binding.status)||binding.status==='ready'&&!needsBootstrap)managed.pending=false;
+    const tab=name==='mic'?await managedTab(name,binding):null,needsBootstrap=isMICBootstrapPage(tab?.url);
+    if(['login','captcha','paused'].includes(binding.status)||binding.status==='ready'&&!needsBootstrap&&(name!=='mic'||isMICMessengerPage(tab?.url)))managed.pending=false;
     if(!managed.pending)return;
     if(now()>=managed.deadlineAt) {
       managed.pending=false;
@@ -467,7 +469,7 @@ export function createDialogMonitor({api=globalThis.chrome, fetchImpl=globalThis
       const status=valid.some(reply=>reply.status==='loading')?'loading':valid.length?'unsupported':'error';
       markHealth(state,name,status,status==='loading'?'Чат ещё загружается.':'Чат не распознан. Откройте список сообщений и обновите вкладку после установки расширения.');return Object.assign([],{sources:valid});
     }
-    if(name==='mic'&&binding.managed&&tab.url===CHAT_CENTERS.mic) {
+    if(name==='mic'&&binding.managed&&!isMICMessengerPage(tab.url)) {
       markHealth(state,name,'loading','Ожидаю открытия полного списка переписок Made-in-China.');return Object.assign([],{sources:valid});
     }
     const rows=new Map(),ambiguous=new Set();
@@ -490,6 +492,7 @@ export function createDialogMonitor({api=globalThis.chrome, fetchImpl=globalThis
       try {await attachmentResolver({api,state,key:conversationKey(name,row.id),rawConversation:row,tabId:tab.id,frameId:row.frameId,documentToken:row.documentToken,sourceUrl:row.sourceUrl,now:now()});}
       catch {const item=state.conversations[conversationKey(name,row.id)];if(item)item.detail='Не удалось прочитать вложение. Подготовка ответа остаётся заблокированной.';}
     }
+    for(const row of conversations)noteReadScan(state,{...row,platform:name});
     const confirmed=conversations.filter(row=>{
       const item=state.conversations[conversationKey(name,row.id)];return row.identityReliable===true && item?.identityReliable===true && item.orderReliable===true && item.tailKnown===true && item.messages?.length;
     }).map(row=>({platform:name,id:row.id,documentToken:row.documentToken,frameId:row.frameId,active:row.active===true,busy:row.selectionBusy===true,replyFingerprint:row.replyFingerprint,sourceUrl:row.sourceUrl}));
@@ -497,6 +500,18 @@ export function createDialogMonitor({api=globalThis.chrome, fetchImpl=globalThis
     return confirmed;
   }
 
+  function noteReadScan(state,row) {
+    if(!state.settings.scanRead||!row.active||!row.identityReliable)return;
+    const key=conversationKey(row.platform,row.id),item=state.conversations[key];if(!item)return;
+    const assessment=contactAssessment(state,item);
+    if(assessment.status==='blocked_capacity'){if(!state.events.some(event=>event.type==='wechat_capacity'))log(state,'wechat_capacity',assessment.detail,{platform:item.platform,level:'warning'});return;}
+    if(!['shared','not_found','unreadable','no_contact'].includes(assessment.status))return;
+    const record={preview:String(item.preview || '').slice(0,1000),contactFingerprint:assessment.contactFingerprint,status:assessment.status,at:now(),fingerprint:item.fingerprint};
+    const prior=item.readScan;
+    if(contactReadChecked(state,key,record.preview)&&prior?.status===record.status&&prior.fingerprint===record.fingerprint)return;
+    if(!recordContactRead(state,key,record)){if(!state.events.some(event=>event.type==='wechat_capacity'))log(state,'wechat_capacity','Память проверок WeChat заполнена. Новые проверки остановлены; сохранённые подтверждения не удаляются.',{platform:item.platform,level:'warning'});return;}
+    log(state,'wechat_checked',assessment.detail,{key,platform:item.platform,level:assessment.status==='unreadable'?'warning':'decision'});
+  }
   function finishRead(state,name,detail,{failed=false,type='read_completed'}={}) {
     const traversal=state.traversal[name],read=traversal.pending;
     if(!read)return;
@@ -534,7 +549,7 @@ export function createDialogMonitor({api=globalThis.chrome, fetchImpl=globalThis
         finishRead(state,name,draftReady?'Выбранный диалог открыт, последние доступные сообщения прочитаны. Отправка не выполнялась.':'Доступная история выбранного диалога загружена. Часть содержимого не подходит для подготовки ответа; отправка не выполнялась.');return;
       }
       const busy=sources.some(reply=>reply.busy===true || (reply.busy && typeof reply.busy==='object' && Object.values(reply.busy).some(value=>value===true)));
-      if(['alibaba','1688'].includes(name) && allowSelect && state.running && state.readUnread && binding.status==='ready' && source && target?.historyStable===true && now()-read.startedAt<READ_TIMEOUT_MS && !read.revealed && !busy && ![...pending.values()].some(task=>task.platform===name) && !active.some(row=>controls(row)?.paused || controls(row)?.takeover)) {
+      if(['alibaba','1688'].includes(name) && allowSelect && state.running && (state.readUnread || state.settings.scanRead) && binding.status==='ready' && source && target?.historyStable===true && now()-read.startedAt<READ_TIMEOUT_MS && !read.revealed && !busy && ![...pending.values()].some(task=>task.platform===name) && !active.some(row=>controls(row)?.paused || controls(row)?.takeover)) {
         // These adapters can leave a newly selected history scrolled up in a background
         // tab. Only the content adapter's private prior-open permit authorizes
         // one reveal; persist consumption before the request, including lost ACKs.
@@ -554,7 +569,7 @@ export function createDialogMonitor({api=globalThis.chrome, fetchImpl=globalThis
     }
     for(const row of rows)if(row.active===true && observed.some(item=>item.id===row.id) && !row.needsRead)traversal.seenPreviews[keyOf(row)]=String(row.preview || '').slice(0,1000);
     for(const key of Object.keys(traversal.seenPreviews).slice(0,-100))delete traversal.seenPreviews[key];
-    if(!allowSelect || !state.running || !state.readUnread || binding.status!=='ready' || !Number.isInteger(binding.tabId))return;
+    if(!allowSelect || !state.running || !(state.readUnread || state.settings.scanRead) || binding.status!=='ready' || !Number.isInteger(binding.tabId))return;
     if([...pending.values()].some(task=>task.platform===name))return;
     if(rows.some(row=>row.active===true && (controls(row)?.paused || controls(row)?.takeover)))return;
     if(sources.some(reply=>reply.busy===true || (reply.busy && typeof reply.busy==='object' && Object.values(reply.busy).some(value=>value===true)))) {
@@ -566,23 +581,27 @@ export function createDialogMonitor({api=globalThis.chrome, fetchImpl=globalThis
     if(folderConfig?.test.enabled)for(const row of rows){const key=keyOf(row);try{const context=await sendContext(state,key);if(folderConfig.test.completed.some(entry=>entry.context===context))testHandled.add(key);}catch{}}
     if(folderConfig?.enabled&&folderConfig.auto&&approved(state)&&folderConfig.jobs.filter(folderPending).length<FOLDER_LIMITS.pending)for(const row of rows) {
       const key=keyOf(row),item=controls(row);if(!key||!item||row.active||item.draft||item.paused||item.takeover||testHandled.has(key))continue;
-      try {if(folderMayQueue(folderConfig,await folderSignature(state,draftRequest(state,key),folderConfig)))folderWanted.add(key);}catch{}
+      try {const request=draftRequest(state,key);if((request.purpose!=='wechat'||folderConfig.test.enabled)&&folderMayQueue(folderConfig,await folderSignature(state,request,folderConfig)))folderWanted.add(key);}catch{}
     }
+    if(state.settings.scanRead&&rows.some(row=>!row.active&&row.canSelect&&!contactReadChecked(state,keyOf(row),row.preview || '')&&!contactLedgerStatus(state,keyOf(row)).available)&&!state.events.some(event=>event.type==='wechat_capacity'))log(state,'wechat_capacity','Память проверок WeChat заполнена. Новые проверки и приглашения остановлены; сохранённые подтверждения не удаляются.',{platform:name,level:'warning'});
     const candidates=rows.filter(row=>{
       const key=keyOf(row),item=controls(row);
       if(!key || !item || row.active===true || row.identityReliable!==true || row.canSelect!==true || row.selectionBusy || item.paused || item.takeover || traversal.backoff[key]>now())return false;
       if(typeof row.selectionToken!=='string' || !row.selectionToken || row.selectionToken.length>1024 || typeof row.documentToken!=='string' || !row.documentToken || row.documentToken.length>200)return false;
       const preview=String(row.preview || '').slice(0,1000),changed=preview && preview!==traversal.seenPreviews[key];
-      if(testHandled.has(key)&&Object.hasOwn(traversal.seenPreviews,key)&&(!preview||!changed))return false;
+      const readChecked=contactReadChecked(state,key,preview);
+      const readExisting=state.settings.scanRead&&!readChecked&&!item.draft&&contactLedgerStatus(state,key).available;
+      if(testHandled.has(key)&&Object.hasOwn(traversal.seenPreviews,key)&&(!preview||!changed)&&!readExisting)return false;
       const attempt=item.autoDraft,retry=autoConfig && !item.draft && item.unanswered && attempt && attempt.status!=='done' && attempt.attempts<3 && (attempt.status==='pending'?now()-attempt.at>=300000:now()>=(attempt.retryAt || 0));
       const folderReady=folderConfig?.enabled && folderConfig.jobs.some(job=>job.kind==='dialog'&&job.key===key&&(job.status==='done'||job.status==='awaiting_limit'&&now()>=(job.retryAt || 0)));
-      return (row.unread===true && (!preview || changed)) || (row.needsRead===true && changed) || retry || folderReady || folderWanted.has(key);
+      return (state.readUnread&&row.unread===true && (!preview || changed)) || (state.readUnread&&row.needsRead===true && changed) || readExisting || retry || folderReady || folderWanted.has(key);
     }).sort((left,right)=>Number(right.unread===true)-Number(left.unread===true));
     const row=candidates[0];if(!row)return;
     const key=keyOf(row),readEpoch=epoch(key);
+    if(state.settings.scanRead&&contactLedgerStatus(state,key).available&&!reserveContactRecord(state,key))return;
     // Persist intent before the single inbox-row click. A worker restart must not repeat it.
     traversal.pending={id:row.id,startedAt:now(),documentToken:row.documentToken,frameId:row.frameId,sourceUrl:controls(row)?.sourceUrl || binding.url,preview:String(row.preview || '').slice(0,1000)};
-    log(state,'read_requested','Открываю существующий диалог для чтения последних сообщений.',{key,platform:name});await save(state);
+    log(state,'read_requested',row.unread===true?'Открываю существующий непрочитанный диалог для чтения последних сообщений.':'Открываю прочитанный диалог: проверю доступную историю и наличие вашего WeChat.',{key,platform:name});await save(state);
     if(epoch(key)!==readEpoch){finishRead(state,name,'Открытие диалога отменено пользователем.',{type:'read_cancelled'});await save(state);return;}
     let reply;
     try {
@@ -761,7 +780,7 @@ export function createDialogMonitor({api=globalThis.chrome, fetchImpl=globalThis
       const key=conversationKey(row.platform,row.id),item=state.conversations[key];
       if(folder.test.enabled){let context;try{context=await sendContext(state,key);}catch{continue;}if(folder.test.completed.some(entry=>entry.context===context))continue;}
       if(item?.draft)continue;
-      try {if(folderMayQueue(folder,await folderSignature(state,draftRequest(state,key),folder)))return key;}catch{}
+      try {const request=draftRequest(state,key);if((request.purpose!=='wechat'||folder.test.enabled)&&folderMayQueue(folder,await folderSignature(state,request,folder)))return key;}catch{}
     }
     return null;
   }
@@ -838,6 +857,7 @@ export function createDialogMonitor({api=globalThis.chrome, fetchImpl=globalThis
       source=observed.find(row=>row.platform===item.platform&&row.id===item.id&&row.active);
       if(!source||source.busy||state.traversal[item.platform].pending)throw new Error('Откройте диалог и дождитесь полного чтения. Поле чата должно быть свободно.');
       request=draftRequest(state,key);
+      if(request.purpose==='wechat'&&!folder.test.enabled)throw new Error('Приглашение в WeChat из прочитанной переписки доступно только в тестовом режиме.');
       if(folder.test.enabled){const context=await sendContext(state,key);if(folder.test.completed.some(entry=>entry.context===context))throw new Error('Это входящее сообщение уже проверено в тестовом сеансе.');}
     }
     const signature=await folderSignature(state,request,folder);
@@ -858,7 +878,9 @@ export function createDialogMonitor({api=globalThis.chrome, fetchImpl=globalThis
     try {await bridge.call('ack',{id:job.id,outcome});job.ackPending=false;await saveFolder(folder);}catch{}
   }
   async function sendContext(state,key) {
-    const item=state.conversations[key],last=item?.messages.filter(message=>message.direction==='inbound').at(-1);
+    const item=state.conversations[key];
+    if(mayPrepareWechat(state,item))return folderDigest(['wechat',key,wechatContactFingerprint(state.settings.wechat)]);
+    const last=item?.messages.filter(message=>message.direction==='inbound').at(-1);
     if(!last)throw new Error('Последнее входящее сообщение не подтверждено.');
     // One reply per incoming supplier message, even if model, buyer settings or
     // the reviewed text change while the platform has not refreshed its DOM.
@@ -866,6 +888,7 @@ export function createDialogMonitor({api=globalThis.chrome, fetchImpl=globalThis
   }
   async function guardedReply(state,folder,{request,text,source,job=null,jobEpoch}) {
     if(folder.test.enabled)return previewReply(state,folder,{request,text,source,job,jobEpoch});
+    if(request.purpose==='wechat')return {status:'blocked',reason:'Приглашение из прочитанной переписки доступно только в тестовом режиме. Реальная отправка не разрешена.'};
     if(job?.testSessionId||state.conversations[request.key]?.draft?.testSessionId)return {status:'blocked',reason:'Тестовый ответ нельзя отправить поставщику. Создайте новый ответ вне тестового режима.'};
     const context=await sendContext(state,request.key),item=state.conversations[request.key];
     const prior=folder.sendReceipts.find(receipt=>receipt.context===context&&['reserved','sent','unknown'].includes(receipt.status));
@@ -945,7 +968,7 @@ export function createDialogMonitor({api=globalThis.chrome, fetchImpl=globalThis
       test.completed.push({key:test.key,context:test.context,fingerprint:test.fingerprint || '',at:now()});test.history.push({key:test.key,context:test.context,text:test.text,at:now(),simulated:true});
     }
     if(cancelEpoch!==checkEpoch)throw new Error('Тестовый цикл отменён изменением настроек.');
-    Object.assign(test,{phase:'ready',cycleId:crypto.randomUUID(),key:'',jobId:'',context:'',fingerprint:'',text:'',detail:'Ожидаю следующее прочитанное входящее сообщение для одного тестового цикла.',at:now()});
+    Object.assign(test,{phase:'ready',cycleId:crypto.randomUUID(),key:'',jobId:'',context:'',fingerprint:'',text:'',detail:state.settings.scanRead?'Ожидаю подходящий прочитанный чат для одного тестового цикла.':'Ожидаю следующее прочитанное входящее сообщение для одного тестового цикла.',at:now()});
     folder.auto=true;folder.autoSend=false;state.running=true;state.readUnread=true;await saveFolder(folder);await save(state);await schedule();return publicState(state);
   }
   async function sendReviewedDraft(state,folder,message,jobEpoch) {
@@ -955,6 +978,7 @@ export function createDialogMonitor({api=globalThis.chrome, fetchImpl=globalThis
     const validate=()=>{
       if(epoch(message.key)!==jobEpoch)throw new Error('Отправка остановлена: режим, черновик или контекст изменился.');
       const request=draftRequest(state,message.key),item=state.conversations[message.key];
+      if(Object.hasOwn(message,'settingsFingerprint')&&message.settingsFingerprint!==request.settingsFingerprint||Object.hasOwn(message,'purpose')&&(message.purpose || '')!==(request.purpose || ''))throw new Error('Режим проверки или настройки изменились. Проверьте актуальный черновик.');
       if(!folder.test.enabled&&item?.draft?.testSessionId)throw new Error('Тестовый черновик нельзя отправить поставщику. Удалите его и создайте новый ответ вне тестового режима.');
       if(!item?.draft || item.draft.status!=='draft' || item.draft.revision!==request.revision || item.draft.fingerprint!==request.fingerprint || item.draft.productFingerprint!==request.productFingerprint || typeof message.text!=='string' || message.text!==item.draft.text || message.revision!==request.revision || message.fingerprint!==request.fingerprint || message.productFingerprint!==request.productFingerprint)throw new Error('Черновик или задание изменились. Проверьте и сохраните актуальный ответ перед отправкой.');
       return {request,item};
@@ -1176,7 +1200,7 @@ export function createDialogMonitor({api=globalThis.chrome, fetchImpl=globalThis
       case 'DIALOGS_START':
         if(!Object.values(state.bindings).some(binding=>Number.isInteger(binding.tabId)))throw new Error('Сначала откройте чаты площадок.');
         if(folder.enabled || !apiAutoAvailable())state.settings.autoDraft=false;
-        state.running=true;state.readUnread=message.readUnread===true;log(state,'monitor_started',`${state.readUnread?'Мониторинг запущен с открытием существующих непрочитанных диалогов.':'Мониторинг запущен без переключения диалогов.'} ${folder.enabled&&folder.auto?'Автоматическая обработка через папку включена.':state.settings.autoDraft?'Авточерновики включены по утверждённому заданию.':'Автоматическая подготовка ответов отключена.'} ${folder.test.enabled?'Тестовый режим: отправка запрещена, один цикл запускается явной кнопкой.':folder.enabled&&folder.auto&&folder.autoSend?'Автоматическая отправка разрешена после проверки контекста и общего лимита.':'Ввод и отправка сообщений отключены.'}`);await schedule();break;
+        state.running=true;state.readUnread=message.readUnread===true;log(state,'monitor_started',`${state.settings.scanRead?'Мониторинг проверяет прочитанные диалоги и наличие вашего WeChat в доступной истории.':state.readUnread?'Мониторинг запущен с открытием существующих непрочитанных диалогов.':'Мониторинг запущен без переключения диалогов.'} ${folder.enabled&&folder.auto?'Автоматическая обработка через папку включена.':state.settings.autoDraft?'Авточерновики включены по утверждённому заданию.':'Автоматическая подготовка ответов отключена.'} ${folder.test.enabled?'Тестовый режим: отправка запрещена, один цикл запускается явной кнопкой.':folder.enabled&&folder.auto&&folder.autoSend?'Автоматическая отправка разрешена после проверки контекста и общего лимита.':'Ввод и отправка сообщений отключены.'}`);await schedule();break;
       case 'DIALOGS_STOP': cancel();state.running=false;for(const name of PLATFORMS)state.traversal[name].pending=null;log(state,'monitor_stopped','Мониторинг приостановлен.');if(folder.enabled)await schedule();else await clearAlarm();break;
       case 'DIALOGS_SCAN':
         for(const name of message.platform?[platform(message.platform)]:PLATFORMS) {
@@ -1218,6 +1242,7 @@ export function createDialogMonitor({api=globalThis.chrome, fetchImpl=globalThis
           if(state.traversal[item.platform].pending || !observed.some(row=>row.platform===item.platform && row.id===item.id && row.active))throw new Error('Откройте выбранный диалог и обновите историю перед сохранением ответа Claude.');
         }
         const request=message.request || draftRequest(state,message.key);
+        if(Object.hasOwn(message,'settingsFingerprint')&&message.settingsFingerprint!==request.settingsFingerprint||Object.hasOwn(message,'purpose')&&(message.purpose || '')!==(request.purpose || ''))throw new Error('Режим проверки или настройки изменились. Проверьте актуальный черновик.');
         if(request.key!==message.key)throw new Error('Ответ относится к другому диалогу.');
         buildDraftPrompt(state,request);
         if(message.revision!==request.revision || message.fingerprint!==request.fingerprint)throw new Error('Диалог изменился. Обновите страницу перед сохранением черновика.');

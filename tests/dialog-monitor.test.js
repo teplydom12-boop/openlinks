@@ -1490,3 +1490,77 @@ test('MIC navigation during debugger attach skips emulation but still releases o
   h.api.debugger={attach:async()=>{steps.push('attach');h.tabs.get(tab.id).url='https://personal.example/';},sendCommand:async(target,method,params)=>steps.push(params.enabled?'enable':'disable'),detach:async()=>steps.push('detach')};
   await h.monitor.onTabUpdated(tab.id,{status:'complete'},tab);assert.deepEqual(steps,['attach','disable','detach']);assert.equal(h.storage[DIALOGS_KEY].bindings.mic.tabId,null);assert.equal(h.storage[DIALOGS_KEY].bindings.mic.status,'unbound');
 });
+
+test('opt-in read-chat traversal opens already read rows once and survives worker recreation and rebinding',async()=>{
+  const h=harness();await ready(h);const row=unreadRow('read-supplier',{unread:false,needsRead:false,preview:'Our previous quote request'});h.replies.get(1).conversations.push(row);
+  await h.command('START',{readUnread:false});await poll(h);assert.equal(opening(h).length,0);
+  const mode=await h.command('SETTINGS',{settings:{scanRead:true}});assert.equal(mode.ok,true,mode.error);assert.equal(mode.state.settings.wechat,'buyer-wechat');assert.ok(mode.state.product.approval);
+  await poll(h);assert.equal(opening(h).length,1);assert.equal(opening(h)[0].conversationId,'read-supplier');
+  h.replies.get(1).conversations[0].active=false;Object.assign(row,{active:true,orderReliable:true,tailKnown:true,messages:[{id:'out1',direction:'outbound',text:'Our previous quote request'}]});
+  await poll(h);assert.equal(h.storage[DIALOGS_KEY].traversal['1688'].pending,null);const item=h.storage[DIALOGS_KEY].conversations[conversationKey('1688',row.id)];assert.equal(item.readScan.status,'not_found');
+  row.active=false;row.messages=[];h.replies.get(1).conversations[0].active=true;
+  const recreated=createDialogMonitor({api:h.api,now:()=>h.time});await recreated.onAlarm({name:'openlinks-dialogs'});assert.equal(opening(h).length,1);
+  await h.command('BIND_TAB',{platform:'1688',tabId:1});await poll(h);assert.equal(opening(h).length,1);
+  assert.equal(h.calls.some(call=>['PREPARE','SEND','NATIVE_INPUT'].includes(call.type)),false);assert.equal(h.fetches,0);
+});
+
+test('read-chat traversal respects empty preview completion, busy composer, controls and changed previews',async()=>{
+  const h=harness();await ready(h);await h.command('SETTINGS',{settings:{scanRead:true}});const row=unreadRow('read-empty',{unread:false,needsRead:false,preview:''});h.replies.get(1).conversations.push(row);
+  await h.command('START',{readUnread:false});h.replies.get(1).busy={hasDraft:true};await poll(h);assert.equal(opening(h).length,0);
+  h.replies.get(1).busy={hasDraft:false};await h.command('CONTROL',{key:conversationKey('1688',row.id),paused:true});await poll(h);assert.equal(opening(h).length,0);
+  await h.command('CONTROL',{key:conversationKey('1688',row.id),paused:false});await poll(h);assert.equal(opening(h).length,1);
+  h.replies.get(1).conversations[0].active=false;Object.assign(row,{active:true,orderReliable:true,tailKnown:true,messages:[{id:'out',direction:'outbound',text:'WeChat buyer-wechat'}]});await poll(h);
+  row.active=false;row.messages=[];h.replies.get(1).conversations[0].active=true;await poll(h);assert.equal(opening(h).length,1);
+  row.preview='A later response';await poll(h);assert.equal(opening(h).length,2);
+});
+
+test('read-chat WeChat preview uses the saved contact, works after buyer last, and next cycle cannot repeat the same contact',async()=>{
+  const {h,previews}=previewHarness(),host=await folderReady(h,{auto:true});
+  await h.command('SETTINGS',{settings:{scanRead:true}});const row=h.replies.get(1).conversations[0];Object.assign(row,{unread:false,messages:[...row.messages,{id:'buyer-last',direction:'outbound',text:'Please quote 100 units.'}]});
+  let response=await h.command('FOLDER_SETTINGS',{testMode:true});response=await h.command('TEST_NEXT',testTokens(response));assert.equal(response.ok,true,response.error);await poll(h);
+  assert.equal(host.jobs.size,1);assert.equal(host.first.request.purpose,'wechat');assert.match(host.first.prompt,/buyer-wechat/);assert.match(host.first.prompt,/available_history/);
+  const done=await completeTest(h,host,'Please add me on WeChat: buyer-wechat');assert.equal(previews.length,1);assert.deepEqual(done.folder.sendReceipts,[]);
+  await h.command('TEST_NEXT',testTokens(done));await poll(h);assert.equal(host.jobs.size,1);
+  row.messages.push({id:'supplier-new',direction:'inbound',text:'Yes, we have this product.'});row.preview='Yes, we have this product.';await poll(h);assert.equal(host.jobs.size,2,'new supplier inbound still gets an ordinary reply');assert.equal([...host.jobs.values()][1].request.purpose,undefined);
+  const recreated=createDialogMonitor({api:h.api,now:()=>h.time});await recreated.onAlarm({name:'openlinks-dialogs'});assert.equal(host.jobs.size,2);
+  assert.equal(h.calls.some(call=>call.type==='SEND'),false);
+});
+
+test('WeChat follow-up generation cannot silently enter real auto-send mode and a previously shared contact is skipped',async()=>{
+  const {h,previews}=previewHarness(),host=await folderReady(h,{auto:true,autoSend:true});await h.command('SETTINGS',{settings:{scanRead:true}});
+  const row=h.replies.get(1).conversations[0];Object.assign(row,{unread:false,messages:[...row.messages,{id:'buyer-last',direction:'outbound',text:'Please quote 100 units.'}]});await h.command('START',{readUnread:false});await poll(h);assert.equal(host.jobs.size,0);
+  const requested=await h.command('FOLDER_DRAFT',{key});assert.equal(requested.ok,false);assert.match(requested.error,/тестовом режиме/);
+  row.messages.push({id:'shared',direction:'outbound',text:'My WeChat: buyer-wechat'});let response=await h.command('FOLDER_SETTINGS',{testMode:true});await h.command('TEST_NEXT',testTokens(response));await poll(h);
+  assert.equal(host.jobs.size,0);assert.equal(previews.length,0);assert.equal(h.storage[DIALOGS_KEY].conversations[key].readScan.status,'shared');
+});
+
+test('proactive WeChat test completion stays consumed after product revision and model change',async()=>{
+  const {h}=previewHarness(),host=await folderReady(h,{auto:true});await h.command('SETTINGS',{settings:{scanRead:true}});const row=h.replies.get(1).conversations[0];row.messages.push({id:'out',direction:'outbound',text:'Please quote 100 units.'});
+  let response=await h.command('FOLDER_SETTINGS',{testMode:true});await h.command('TEST_NEXT',testTokens(response));await poll(h);const done=await completeTest(h,host,'My WeChat: buyer-wechat');await h.command('TEST_NEXT',testTokens(done));
+  await h.command('PRODUCT_SAVE',{product:{keyPoints:'Model updated; quantity: 200 units.'}});const changed=await h.command('GET');await h.command('PRODUCT_APPROVE',{revision:changed.state.product.revision,fingerprint:changed.productFingerprint});await h.command('FOLDER_SETTINGS',{model:'sonnet'});
+  const held=await h.command('GET');await h.command('TEST_NEXT',testTokens(held));await poll(h);assert.equal(host.jobs.size,1);assert.equal(h.storage.openlinksClaudeFolder.test.completed.length,1);
+});
+
+test('MIC mailbox with site suffix never becomes ready and synchronous widget expansion rechecks frames immediately',async()=>{
+  for(const changedDraft of [false,true]) {
+    const h=harness();await h.command('OPEN_CHATS',{platform:'mic'});const tab=micBootstrapReady(h);tab.url=CHAT_CENTERS.mic+'?source=center#/messages';h.tabs.get(tab.id).url=tab.url;h.replies.get(tab.id).url=tab.url;h.frameLists.get(tab.id)[0].url=tab.url;
+    h.replies.get(`${tab.id}:1`).status='ready';h.replies.get(`${tab.id}:1`).conversations=snapshot('mic').conversations;let captures=0;
+    h.api.scripting={executeScript:async()=>{captures++;if(captures===1){if(changedDraft)h.replies.get(`${tab.id}:1`).busy.hasDraft=true;return [{frameId:0,result:{ok:false,status:'loading',reason:'widget_ready'}}];}return [{frameId:0,result:{ok:true,url:micNativeURL}}];}};
+    await h.monitor.onTabUpdated(tab.id,{status:'complete'},tab);
+    assert.equal(Object.keys(h.storage[DIALOGS_KEY].conversations).length,0);assert.equal(h.storage[DIALOGS_KEY].bindings.mic.status,changedDraft?'paused':'loading');assert.equal(captures,changedDraft?1:2);assert.equal(h.tabUpdates.filter(patch=>patch.url).length,changedDraft?0:1);assert.deepEqual(h.windowUpdates,[]);
+  }
+});
+
+test('a completed old test does not prevent the new read-only contact pass or buy another Claude reply',async()=>{
+  const {h}=previewHarness(),host=await testCycleReady(h),done=await completeTest(h,host);await h.command('TEST_NEXT',testTokens(done));await h.command('SETTINGS',{settings:{scanRead:true}});
+  const row=h.replies.get(1).conversations[0];Object.assign(row,{active:false,unread:false,preview:'',canSelect:true,selectionToken:'old-tested-row',messages:[]});
+  await h.command('START',{readUnread:false});await h.command('TEST_NEXT',testTokens(await h.command('GET')));await poll(h);
+  assert.equal(opening(h).length,1);assert.equal(opening(h)[0].conversationId,row.id);assert.equal(host.jobs.size,1);assert.equal(h.storage.openlinksClaudeFolder.test.completed.length,1);
+});
+
+test('full durable contact ledger stops new read-only checks but preserves ordinary unread traversal',async()=>{
+  const h=harness();await ready(h);await h.command('SETTINGS',{settings:{scanRead:true}});h.storage[DIALOGS_KEY].contactLedger.saturated=true;
+  h.replies.get(1).conversations.push(unreadRow('read-capacity',{unread:false,preview:'Already read',needsRead:false}));await h.command('START',{readUnread:false});await poll(h);assert.equal(opening(h).length,0);
+  assert.equal(h.storage[DIALOGS_KEY].events.filter(event=>event.type==='wechat_capacity').length,1);await poll(h);assert.equal(h.storage[DIALOGS_KEY].events.filter(event=>event.type==='wechat_capacity').length,1);
+  h.replies.get(1).conversations.push(unreadRow('unread-still-allowed'));await h.command('START',{readUnread:true});await poll(h);assert.equal(opening(h).length,1);assert.equal(opening(h)[0].conversationId,'unread-still-allowed');assert.equal(h.fetches,0);
+});

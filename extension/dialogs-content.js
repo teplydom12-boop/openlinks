@@ -305,6 +305,25 @@
     return scrollers.every(node=>node.scrollTop>=-2&&node.scrollHeight-node.clientHeight-node.scrollTop<=3)?'':'История прокручена выше последних сообщений.';
   }
   function atTail(history) {return tailReason(history)==='';}
+  // A stable latest page is not proof that older messages were loaded. Only
+  // the observed 1688 server boundary has a verified start-of-history meaning.
+  // Alibaba/MIC may paginate or virtualize; their short rendered histories do
+  // not establish that the buyer never shared a contact in an older message.
+  function historyStartKnown(history) {
+    if(platform()!=='1688'||!history.matches('.ww_box .ww_message .message-list'))return false;
+    const viewers=select(history,'.rc-scrollbars-view');
+    if(viewers.length!==1)return false;
+    const markers=select(viewers[0],':scope > div:first-child > span');
+    return markers.length===1&&!markers[0].closest(MESSAGE+','+EXCLUDED)&&textOf(markers[0])==='暂无更多消息';
+  }
+  function wholeHistory(startKnown,readComplete,parsed,history) {
+    if(!startKnown||!readComplete||!parsed.reliable||!parsed.structuralReliable||parsed.coverage.limited||parsed.coverage.unknownSenders||parsed.coverage.unreadAttachments||parsed.coverage.unsupportedMessages)return false;
+    // Lower-level selectors/text readers have a DOM traversal bound. Do not
+    // promote a truncated traversal to proof of absence in the whole history.
+    const walker=document.createTreeWalker(history,NodeFilter.SHOW_ELEMENT|NodeFilter.SHOW_TEXT);let count=0;
+    while(walker.nextNode())if(++count>LIMIT.nodes)return false;
+    return true;
+  }
   function historyDetail(label,stable,parsed,history){return [!stable?`Ожидание устойчивой истории ${label}.`:'',parsed.pendingFormat?'1688 ещё отображает временную заглушку формата; ожидается повторная проверка.':'',!parsed.reliable?parsed.reason||'Порядок сообщений не подтверждён.':'',tailReason(history),parsed.unsupportedMedia?'Содержимое вложения не прочитано; подготовка ответа заблокирована.':'',parsed.messages.some(message=>message.direction==='unknown')?'Есть сообщения без подтверждённого отправителя.':''].filter(Boolean).join(' ');}
   function readHistory(history,count) {
     if(platform()==='mic'&&history.matches('.conversation-area .window-center-messages-main > .msg-list')){
@@ -313,7 +332,7 @@
       const row=active[0],id=identity(row),parsed=readMessages(history,null,false,row),fingerprint=JSON.stringify([id,parsed.messages]);
       if(!activeMicEvidence||activeMicEvidence.fingerprint!==fingerprint)activeMicEvidence={fingerprint,since:Date.now()};
       const stable=Date.now()-activeMicEvidence.since>=1000,readComplete=stable&&atTail(history)&&!parsed.pendingFormat,tailKnown=readComplete&&!parsed.unsupportedMedia;
-      return {id,identityReliable:true,title:title(row),url:safeUrl(location.href),unread:unread(row),active:true,orderReliable:parsed.reliable,historyStable:stable,readComplete,historyTailKnown:readComplete,historyOrderReliable:parsed.structuralReliable,tailKnown,messages:parsed.messages,coverage:parsed.coverage,needsRead:!tailKnown,detail:historyDetail('Made-in-China',stable,parsed,history)};
+      return {id,identityReliable:true,title:title(row),url:safeUrl(location.href),unread:unread(row),active:true,orderReliable:parsed.reliable,historyStable:stable,readComplete,historyTailKnown:readComplete,historyOrderReliable:parsed.structuralReliable,historyStartKnown:false,historyComplete:false,tailKnown,messages:parsed.messages,coverage:parsed.coverage,needsRead:!tailKnown,detail:historyDetail('Made-in-China',stable,parsed,history)};
     }
     if(platform()==='alibaba'&&history.matches('.buyer-messenger-container .message-box .im-message-flow .scroll-box')){
       const active=select(document,INBOX_ALIBABA).filter(row=>rowActive(row));
@@ -321,7 +340,7 @@
       const row=active[0],id=identity(row),parsed=readMessages(history,null,true),fingerprint=JSON.stringify([id,parsed.messages]);
       if(!activeAlibabaEvidence||activeAlibabaEvidence.fingerprint!==fingerprint)activeAlibabaEvidence={fingerprint,since:Date.now()};
       const stable=Date.now()-activeAlibabaEvidence.since>=1000,readComplete=stable&&atTail(history)&&!parsed.pendingFormat,tailKnown=readComplete&&!parsed.unsupportedMedia;
-      return {id,identityReliable:true,title:title(row),url:safeUrl(location.href),unread:unread(row),active:true,orderReliable:parsed.reliable,historyStable:stable,readComplete,historyTailKnown:readComplete,historyOrderReliable:parsed.structuralReliable,tailKnown,messages:parsed.messages,coverage:parsed.coverage,needsRead:!tailKnown,detail:historyDetail('Alibaba',stable,parsed,history)};
+      return {id,identityReliable:true,title:title(row),url:safeUrl(location.href),unread:unread(row),active:true,orderReliable:parsed.reliable,historyStable:stable,readComplete,historyTailKnown:readComplete,historyOrderReliable:parsed.structuralReliable,historyStartKnown:false,historyComplete:false,tailKnown,messages:parsed.messages,coverage:parsed.coverage,needsRead:!tailKnown,detail:historyDetail('Alibaba',stable,parsed,history)};
     }
     // The full 1688 inbox can retain the original touid URL while another row
     // is selected. Until its current thread is proven, that URL is not identity.
@@ -329,15 +348,15 @@
       const active=select(document,INBOX_1688).filter(row=>row.classList.contains('active'));
       if(active.length!==1||!liveThreadId(active[0])||select(document,'.ww_box .message-list').length!==1||select(history,'.message-list-empty').length)return null;
       const row=active[0],id=identity(row),parsed=readMessages(history,row);
-      const fingerprint=JSON.stringify([id,parsed.messages]);
+      const startKnown=historyStartKnown(history),fingerprint=JSON.stringify([id,parsed.messages,startKnown]);
       if(!active1688Evidence||active1688Evidence.fingerprint!==fingerprint)active1688Evidence={fingerprint,since:Date.now()};
       const stable=Date.now()-active1688Evidence.since>=1000,readComplete=stable&&atTail(history)&&!parsed.pendingFormat,tailKnown=readComplete&&!parsed.unsupportedMedia;
-      return {id,identityReliable:true,title:title(row),url:safeUrl(location.href),unread:unread(row),active:true,orderReliable:parsed.reliable,historyStable:stable,readComplete,historyTailKnown:readComplete,historyOrderReliable:parsed.structuralReliable,tailKnown,messages:parsed.messages,coverage:parsed.coverage,needsRead:!tailKnown,detail:historyDetail('1688',stable,parsed,history)};
+      return {id,identityReliable:true,title:title(row),url:safeUrl(location.href),unread:unread(row),active:true,orderReliable:parsed.reliable,historyStable:stable,readComplete,historyTailKnown:readComplete,historyOrderReliable:parsed.structuralReliable,historyStartKnown:startKnown,historyComplete:wholeHistory(startKnown,readComplete,parsed,history),tailKnown,messages:parsed.messages,coverage:parsed.coverage,needsRead:!tailKnown,detail:historyDetail('1688',stable,parsed,history)};
     }
     const root=history.closest(ROOT)||history,id=identity(root,count===1)||identity(history,count===1);
     if(!id)return null;
     const parsed=readMessages(history),tailKnown=atTail(history)&&!parsed.unsupportedMedia;
-    return {id,identityReliable:provenAccount(root),title:title(root),url:safeUrl(location.href),unread:unread(root),active:true,orderReliable:parsed.reliable,historyTailKnown:atTail(history),historyOrderReliable:parsed.structuralReliable,tailKnown,messages:parsed.messages,coverage:parsed.coverage,needsRead:!tailKnown,detail:!provenAccount(root)?'Аккаунт покупателя не подтверждён; подготовка ответа заблокирована.':!parsed.reliable?'Порядок или содержимое сообщений неоднозначны.':!tailKnown?'Последние сообщения ещё не загружены или история прокручена вверх.':''};
+    return {id,identityReliable:provenAccount(root),title:title(root),url:safeUrl(location.href),unread:unread(root),active:true,orderReliable:parsed.reliable,historyTailKnown:atTail(history),historyOrderReliable:parsed.structuralReliable,historyStartKnown:false,historyComplete:false,tailKnown,messages:parsed.messages,coverage:parsed.coverage,needsRead:!tailKnown,detail:!provenAccount(root)?'Аккаунт покупателя не подтверждён; подготовка ответа заблокирована.':!parsed.reliable?'Порядок или содержимое сообщений неоднозначны.':!tailKnown?'Последние сообщения ещё не загружены или история прокручена вверх.':''};
   }
   function frames() {return [...document.querySelectorAll('iframe[src],frame[src]')].slice(0,100).map(frame=>({url:safeUrl(frame.src)?frame.src:'',visible:visible(frame)})).filter(frame=>frame.url);}
   function modelContext(){
@@ -401,17 +420,17 @@
       const leafHistories=histories.filter(node=>!histories.some(other=>other!==node&&node.contains(other)));
       const conversations=leafHistories.map(history=>readHistory(history,leafHistories.length)).filter(Boolean);
       const byId=new Map();
-      for(const entry of conversations){if(byId.has(entry.id)){const other=byId.get(entry.id);other.orderReliable=false;other.tailKnown=false;other.readComplete=false;other.historyTailKnown=false;other.historyOrderReliable=false;other.detail='Найдено несколько историй одного диалога; нужно уточнить структуру страницы.';}else byId.set(entry.id,entry);}
+      for(const entry of conversations){if(byId.has(entry.id)){const other=byId.get(entry.id);other.orderReliable=false;other.tailKnown=false;other.readComplete=false;other.historyTailKnown=false;other.historyOrderReliable=false;other.historyStartKnown=false;other.historyComplete=false;other.detail='Найдено несколько историй одного диалога; нужно уточнить структуру страницы.';}else byId.set(entry.id,entry);}
       for(const item of select(document,ITEM).slice(0,LIMIT.conversations)){
         const id=identity(item);if(!id)continue;
         const previewNode=select(item,'[data-message-preview],.message-preview,.conversation-preview,.last-message'+(platform()==='1688'&&item.matches(INBOX_1688)?',.conversation-secondary-line > .desc':platform()==='alibaba'&&item.matches(INBOX_ALIBABA)?',.msg-wrapper .latest-msg > div':platform()==='mic'&&item.matches(INBOX_MIC)?',.rg-last-msg .last-msg':''))[0];const preview=textOf(previewNode,LIMIT.text,true);
         const existing=byId.get(id);if(existing){if(unread(item)!==null)existing.unread=unread(item);if(!existing.title)existing.title=title(item);if(preview)existing.preview=preview;continue;}
-        byId.set(id,{id,identityReliable:provenAccount(item),title:title(item),url:safeUrl(item.matches('a[href]')?item.href:select(item,'a[href]')[0]?.href||location.href),unread:unread(item),active:item.matches(INBOX)&&rowActive(item),orderReliable:false,tailKnown:false,preview,needsRead:true,messages:[],...selectable(item,id)});
+        byId.set(id,{id,identityReliable:provenAccount(item),title:title(item),url:safeUrl(item.matches('a[href]')?item.href:select(item,'a[href]')[0]?.href||location.href),unread:unread(item),active:item.matches(INBOX)&&rowActive(item),orderReliable:false,tailKnown:false,historyStartKnown:false,historyComplete:false,preview,needsRead:true,messages:[],...selectable(item,id)});
       }
       result.conversations=[...byId.values()].slice(0,LIMIT.conversations);
       const nextReplyEvidence=new Map();
       for(const row of result.conversations.filter(item=>item.active)){
-        const signature=JSON.stringify([row.id,row.identityReliable,row.orderReliable,row.tailKnown,row.historyOrderReliable,row.historyTailKnown,row.needsRead,row.messages,row.coverage]);
+        const signature=JSON.stringify([row.id,row.identityReliable,row.orderReliable,row.tailKnown,row.historyOrderReliable,row.historyTailKnown,row.historyStartKnown,row.historyComplete,row.needsRead,row.messages,row.coverage]);
         const prior=replyEvidence.get(row.id),entry=prior?.signature===signature?prior:{signature,token:crypto.randomUUID()};
         row.replyFingerprint=entry.token;nextReplyEvidence.set(row.id,entry);
       }
@@ -422,14 +441,17 @@
       requestModelEvidence(result);return result;
     } catch {return {...result,status:'error',detail:'Не удалось прочитать структуру чата. Отправка и ввод не выполнялись.',conversations:[]};}
   }
-  function guardReply(expected) {
+  function guardReply(expected,options={}) {
     const invalid=reason=>({ok:false,reason});
     if(!expected || expected.documentToken!==DOCUMENT_TOKEN || expected.platform!==platform() || expected.sourceUrl!==location.href || typeof expected.id!=='string' || typeof expected.replyFingerprint!=='string' || !expected.replyFingerprint)return invalid('Страница или разрешение на ответ изменились.');
+    const contactPreview=expected.purpose==='wechat'&&options?.preview===true;
+    if(expected.purpose==='wechat'&&!contactPreview)return invalid('Обращение с WeChat доступно только как тестовый черновик без отправки.');
     const current=snapshot(),active=current.conversations.filter(row=>row.active);
     if(current.status!=='ready' || active.length!==1)return invalid('Не подтверждён один открытый диалог без ограничений площадки.');
     const row=active[0];
     if(row.id!==expected.id || row.replyFingerprint!==expected.replyFingerprint || !row.identityReliable)return invalid('Получатель, история или вложения изменились. Ответ остановлен.');
-    if((row.historyOrderReliable??row.orderReliable)!==true || (row.historyTailKnown??row.tailKnown)!==true || row.messages.some(message=>message.direction==='unknown') || row.messages.filter(message=>message.direction!=='system').at(-1)?.direction!=='inbound')return invalid('Последнее входящее сообщение и порядок истории не подтверждены.');
+    const last=row.messages.filter(message=>message.direction!=='system').at(-1)?.direction;
+    if((row.historyOrderReliable??row.orderReliable)!==true || (row.historyTailKnown??row.tailKnown)!==true || row.messages.some(message=>message.direction==='unknown') || (last!=='inbound'&&!(contactPreview&&last==='outbound')))return invalid('Последнее сообщение и порядок истории не подтверждены.');
     return {ok:true,busy:current.busy};
   }
   function guardPreviewCleanup(expected) {

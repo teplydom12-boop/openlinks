@@ -253,6 +253,22 @@ with sync_playwright() as p:
         assert send()['clicked'] is False
     passed('test previews fill real synthetic composers, permanently forbid SEND and clean only owned text on both platforms')
 
+    for platform in ['alibaba','mic']:
+        load(platform)
+        page.evaluate("""()=>{
+          const history=document.querySelector('[data-message-history]');
+          history.insertAdjacentHTML('beforeend','<div class=message-item data-direction=outbound data-message-id=buyer-last><span data-message-text>Thank you for the quotation.</span></div>');
+          const row=OpenLinksDialogsReader.snapshot().conversations.find(item=>item.active);
+          guard.replyFingerprint=row.replyFingerprint;guard.purpose='wechat';
+        }""")
+        assert not prepare()['ok']
+        assert page.locator('textarea').input_value()==''
+        result=preview();assert result['ok'] and result['preview'],result
+        assert send()['clicked'] is False
+        assert page.evaluate('syntheticClicks')==0
+        assert clear_preview()['cleared']
+    passed('read chats ending in buyer text allow WeChat test previews but reject live preparation and SEND')
+
     load();assert preview()['ok']
     page.evaluate("document.querySelector('[data-message-history]').insertAdjacentHTML('beforeend','<div class=message-item data-direction=inbound data-message-id=new><span data-message-text>New supplier reply</span></div>')")
     assert clear_preview()['cleared'] and page.locator('textarea').input_value()==''

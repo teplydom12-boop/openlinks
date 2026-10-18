@@ -69,6 +69,15 @@ test('dialog TXT keeps the full approved context, recipient language rules and o
   assert.deepEqual(result.request,request);assert.deepEqual(state,before);
 });
 
+test('manual WeChat test export preserves purpose, saved contact and limited-history context',()=>{
+  const state=dialog();setDialogSettings(state,{...state.settings,wechat:'buyer-contact',scanRead:true});approveProduct(state,productFingerprint(state),3);
+  observe(state,[...state.conversations[key].messages,{id:'buyer-2',direction:'outbound',text:'Thank you for the offer.'}],{unread:false});
+  const request=draftRequest(state,key),result=buildManualDialogPrompt(state,request,{now});
+  assert.equal(request.purpose,'wechat');assert.deepEqual(result.request,request);
+  assert.match(result.text,/buyer-contact/);assert.match(result.text,/available_history/);assert.match(result.text,/wechat_invitation_test/);
+  assert.throws(()=>buildManualDialogPrompt(state,{...request,purpose:undefined},{now}),/изменились/);
+});
+
 test('manual dialog export preserves approval, stale context and unread-history guards',()=>{
   const unapproved=dialog(),request=draftRequest(unapproved,key);saveProduct(unapproved,{rules:'Updated rule'});
   assert.throws(()=>buildManualDialogPrompt(unapproved,request,{now}),/утвердите/);

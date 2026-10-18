@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {sendDialogReply,clearDialogTestDraft,recoverDialogTestDraftEmpty} from '../extension/dialog-send.js';
-import {initialDialogs,saveProduct,approveProduct,productFingerprint,mergeDialogSnapshot,bindDialogTab,conversationKey,draftRequest} from '../extension/lib/dialogs.js';
+import {initialDialogs,saveProduct,approveProduct,productFingerprint,mergeDialogSnapshot,bindDialogTab,conversationKey,draftRequest,setDialogSettings} from '../extension/lib/dialogs.js';
 import {withTabOwnership} from '../extension/lib/tab-ownership.js';
 
 function harness(platform='alibaba') {
@@ -127,6 +127,35 @@ test('dry-run stop while intent is persisted prevents preparation',async()=>{
   const h=harness();let continued=true;
   const result=await h.send({dryRun:true,previewOperation:'test-cycle',shouldContinue:()=>continued,reservePreview:async()=>{continued=false;return {ok:true};}});
   assert.equal(result.status,'blocked');assert.ok(result.cleanupToken);assert.deepEqual(h.calls,[]);assert.deepEqual(h.reservations,[]);
+});
+function wechatHarness() {
+  const h=harness();
+  setDialogSettings(h.state,{...h.state.settings,wechat:'buyer-wx-123',scanRead:true},5);
+  approveProduct(h.state,productFingerprint(h.state),6);
+  h.snapshot.conversations[0].unread=false;
+  h.snapshot.conversations[0].messages.push({id:'buyer-last',text:'Thank you for the quotation.',direction:'outbound'});
+  mergeDialogSnapshot(h.state,h.snapshot,7);
+  h.options.request=draftRequest(h.state,h.key);
+  const base=h.action;h.action=async message=>({...await base(message),...(message.type==='PREPARE'?{preview:true}:{})});
+  return h;
+}
+test('a read chat ending in buyer text permits only a guarded WeChat preview',async()=>{
+  const h=wechatHarness();assert.equal(h.options.request.purpose,'wechat');
+  const result=await h.send({dryRun:true,previewOperation:'wechat-test',reservePreview:async()=>({ok:true})});
+  assert.equal(result.status,'previewed');assert.equal(result.clicked,false);
+  assert.equal(h.calls.find(call=>call.type==='PREPARE').dialogGuard.purpose,'wechat');
+  assert.ok(!h.calls.some(call=>call.type==='SEND'));assert.deepEqual(h.reservations,[]);
+});
+test('WeChat invitation cannot reserve or send outside test mode',async()=>{
+  const h=wechatHarness();const result=await h.send();assert.equal(result.status,'blocked');
+  assert.match(result.reason,/тестовом режиме/);assert.deepEqual(h.calls,[]);assert.deepEqual(h.reservations,[]);
+});
+test('fresh outbound contact, lost history or changed purpose blocks WeChat insertion',async()=>{
+  for(const change of [h=>h.snapshot.conversations[0].messages.at(-1).text='My WeChat is buyer-wx-123',h=>h.snapshot.conversations[0].tailKnown=false,h=>h.snapshot.conversations[0].messages[0].direction='unknown',h=>h.options.request={...h.options.request,purpose:undefined}]) {
+    const h=wechatHarness();change(h);
+    const result=await h.send({dryRun:true,previewOperation:'wechat-test',reservePreview:async()=>({ok:true})});
+    assert.equal(result.status,'blocked');assert.ok(!h.calls.some(call=>['PREPARE','SEND'].includes(call.type)));assert.deepEqual(h.reservations,[]);
+  }
 });
 function cleanupFixture() {
   const h=harness(),token={operation:'test-cycle',platform:'alibaba',id:h.snapshot.conversations[0].id,documentToken:h.source.documentToken,sourceUrl:h.source.sourceUrl,text:h.options.text};

@@ -58,6 +58,7 @@ with sync_playwright() as p:
         assert result['status']=='ready' and result['platform']==platform
         assert current['id']=='account:synthetic-buyer/thread:thread-active' and current['identityReliable']
         assert current['tailKnown'] and current['orderReliable'] and current['unread'] is False
+        assert current['historyStartKnown'] is False and current['historyComplete'] is False
         assert [m['direction'] for m in current['messages']]==['outbound','inbound']
         assert current['messages'][0]['at']==1792314000000 and current['messages'][-1]['text']=='We have stock.'
         assert len(result['conversations'])==2
@@ -233,6 +234,7 @@ with sync_playwright() as p:
     assert [message['direction'] for message in current['messages']]==['outbound','system','inbound']
     assert current['messages'][-1]['text']=='We have stock.' and not current.get('canSelect')
     assert snapshot()['busy']['hasDraft'] is False
+    assert current['historyStartKnown'] is False and current['historyComplete'] is False
     passed('observed 1688 active composite thread reads noneditable PRE text, system rows and layered sender evidence after stable history')
 
     page.evaluate('document.querySelector(".message-item:not(.self) .headPic").src="data:image/png;base64,b3RoZXI="')
@@ -345,10 +347,36 @@ with sync_playwright() as p:
     passed('1688 file reference preserves name, size and HTTPS URL without clicking download or fetching its contents')
 
     load_active1688();page.evaluate('const history=document.querySelector(".message-list"),wrapper=document.createElement("div");wrapper.className="ww_message";history.parentElement.insertBefore(wrapper,history);wrapper.append(history);history.style.cssText="height:40px;overflow:hidden";document.querySelector(".rc-scrollbars-view").insertAdjacentHTML("afterbegin","<div><span>暂无更多消息</span></div>")')
-    active();page.wait_for_timeout(1100);current=active();assert current['orderReliable'] and current['readComplete']
+    current=active();assert current['historyStartKnown'] and not current['historyComplete']
+    page.wait_for_timeout(1100);current=active();assert current['orderReliable'] and current['readComplete'] and current['historyComplete']
+    old_fingerprint=current['replyFingerprint']
     page.evaluate('document.querySelector(".rc-scrollbars-view > div:first-child > span").textContent="Unrecognized new content"')
-    assert not active()['orderReliable']
+    current=active();assert not current['orderReliable'] and not current['historyStartKnown'] and not current['historyComplete'] and current['replyFingerprint']!=old_fingerprint
     passed('1688 exact observed history-boundary label is excluded, unknown boundary text is blocked, and only the real inner scroller gates tail')
+
+    def complete_1688():
+        load_active1688()
+        page.evaluate('const history=document.querySelector(".message-list"),wrapper=document.createElement("div");wrapper.className="ww_message";history.parentElement.insertBefore(wrapper,history);wrapper.append(history);document.querySelector(".rc-scrollbars-view").insertAdjacentHTML("afterbegin","<div><span>暂无更多消息</span></div>")')
+        active();page.wait_for_timeout(1100)
+        assert active()['historyComplete']
+    complete_1688()
+    page.evaluate('document.querySelector(".rc-scrollbars-view > div:first-child").remove();document.body.insertAdjacentHTML("beforeend","<div class=rc-scrollbars-view><div><span>暂无更多消息</span></div></div>")')
+    current=active();assert not current['historyStartKnown'] and not current['historyComplete']
+    complete_1688()
+    page.evaluate('document.querySelector(".rc-scrollbars-view > div:first-child > span").hidden=true')
+    assert not active()['historyStartKnown'] and not active()['historyComplete']
+    complete_1688()
+    page.evaluate('document.querySelector(".message-item:not(.self) .nick").textContent="Unknown sender"')
+    active();page.wait_for_timeout(1100);current=active()
+    assert current['historyStartKnown'] and current['readComplete'] and not current['historyComplete']
+    complete_1688()
+    page.evaluate('document.querySelector(".message-item:not(.self) .content-row > .content").insertAdjacentHTML("beforeend","<img alt=unread-image style=width:32px;height:32px>")')
+    active();page.wait_for_timeout(1100);current=active()
+    assert current['historyStartKnown'] and current['readComplete'] and not current['historyComplete']
+    complete_1688()
+    page.evaluate('const body=document.querySelector(".message-item.self .content-row > .content");for(let i=0;i<3001;i++)body.append(document.createElement("span"))')
+    current=active();assert current['historyStartKnown'] and current['readComplete'] and not current['historyComplete']
+    passed('whole-history proof is scoped to the active native boundary and fails for hidden/foreign markers, unknown senders, unread attachments and DOM traversal bounds')
 
     load_active1688();page.evaluate('const history=document.querySelector(".message-list"),wrapper=document.createElement("div");wrapper.className="ww_message";history.parentElement.insertBefore(wrapper,history);wrapper.append(history);document.querySelector(".rc-scrollbars-view").style.cssText="height:120px;overflow-y:auto";document.querySelector(".conversation-item").classList.remove("active")')
     opened,request=open_first();assert opened['ok']
@@ -389,6 +417,16 @@ with sync_playwright() as p:
     assert snapshot()['conversations'][0]['id']!=old_id
     passed('observed MIC preserves complete peer suffix, uses document-local identity, and selects only the row without its close control')
 
+    for html,url in [(OBSERVED_1688,'https://air.1688.com/chat'),(OBSERVED_ALIBABA,'https://message.alibaba.com/message/default.htm'),(OBSERVED_MIC,'https://webim.made-in-china.com/super-tm/')]:
+        load(html,url);before=snapshot()
+        row=next(item for item in before['conversations'] if item['unread'] is False and item.get('canSelect'))
+        request={'conversationId':row['id'],'documentToken':before['documentToken'],'selectionToken':row['selectionToken']}
+        result=page.evaluate('(request)=>OpenLinksDialogsReader.openConversation(request)',request)
+        assert result['ok'] and result['openedId']==row['id'] and len(page.evaluate('selectedThreads'))==1
+        assert page.evaluate('readerSideEffects')=={'click':1,'input':0,'change':0,'submit':0,'focus':0}
+    passed('all three native readers may select already-read sidebar rows without composer, send or focus actions')
+
+    load(OBSERVED_MIC,'https://webim.made-in-china.com/super-tm/')
     before=snapshot();row=before['conversations'][0];old_request={'conversationId':row['id'],'documentToken':before['documentToken'],'selectionToken':row['selectionToken']}
     page.evaluate('document.body.insertAdjacentHTML("beforeend", "<input id=test-login type=password>")')
     assert snapshot()['status']=='login'
@@ -414,6 +452,7 @@ with sync_playwright() as p:
         page.evaluate('(html)=>{document.querySelector(".contact-item-container").classList.add("selected");document.body.insertAdjacentHTML("beforeend","<div class=buyer-messenger-container><div class=message-box><div class=im-message-flow><div class=scroll-box>"+html+"</div></div></div></div>")}',history_alibaba)
     load_active_alibaba();assert not active()['readComplete'];page.wait_for_timeout(1100);current=active()
     assert current['readComplete'] and current['tailKnown'] and current['orderReliable'] and current['identityReliable']
+    assert current['historyStartKnown'] is False and current['historyComplete'] is False
     assert [message['direction'] for message in current['messages']]==['outbound','inbound','system']
     assert [message['text'] for message in current['messages']]==['Do you have stock?','Yes, we have stock.','Platform security notice']
     assert not current.get('canSelect')
@@ -496,6 +535,7 @@ with sync_playwright() as p:
         page.evaluate('(html)=>{document.querySelector(".lst-item").classList.add("active");document.querySelector(".conversation-area").innerHTML="<div class=window-center-messages-main><div class=msg-list>"+html+"</div></div>"}',history_mic)
     load_active_mic();assert not active()['readComplete'];page.wait_for_timeout(1100);current=active()
     assert current['readComplete'] and current['tailKnown'] and current['orderReliable'] and current['identityReliable']
+    assert current['historyStartKnown'] is False and current['historyComplete'] is False
     assert [message['direction'] for message in current['messages']]==['system','system','inbound']
     assert current['messages'][-1]['text']=='Which quantity do you need?' and current['messages'][-1]['id']=='10000000-0000-0000-0000-000000000001'
     passed('observed MIC active thread captures UUID message, original text and positive contact/avatar/name evidence')
@@ -548,6 +588,28 @@ with sync_playwright() as p:
     load_active_mic();page.evaluate('const template=document.querySelector(".msg-box"),history=document.querySelector(".msg-list"),rows=[];for(let i=0;i<500;i++){const row=template.cloneNode(true);row.querySelector(".contact-chatInfo").id="10000000-0000-0000-0000-"+String(i).padStart(12,"0");row.insertAdjacentHTML("beforeend","<div class=msg-system>Platform notice</div>");rows.push(row)}history.replaceChildren(...rows)')
     current=active();assert len(current['messages'])<=500 and current['coverage']['limited'] and current['coverage']['totalRows']>500 and not current['historyOrderReliable']
     passed('MIC message plus system-notice expansion respects the 500-message bound and reports omitted history explicitly')
+
+    load();set_history('<div class="message-item outgoing" data-message-id="last-outbound">Previous buyer message.</div>')
+    current=active();expected={'platform':'1688','sourceUrl':page.url,'documentToken':snapshot()['documentToken'],'id':current['id'],'replyFingerprint':current['replyFingerprint'],'purpose':'wechat'}
+    assert not page.evaluate('(e)=>OpenLinksDialogsReader.guardReply(e)',expected)['ok']
+    assert not page.evaluate('(e)=>OpenLinksDialogsReader.guardReply(e,{preview:false})',expected)['ok']
+    assert page.evaluate('(e)=>OpenLinksDialogsReader.guardReply(e,{preview:true})',expected)['ok']
+    normal={key:value for key,value in expected.items() if key!='purpose'}
+    assert not page.evaluate('(e)=>OpenLinksDialogsReader.guardReply(e,{preview:true})',normal)['ok']
+    page.evaluate('document.querySelector(".message-item").textContent="Changed buyer message."')
+    assert not page.evaluate('(e)=>OpenLinksDialogsReader.guardReply(e,{preview:true})',expected)['ok']
+    current=active();expected['replyFingerprint']=current['replyFingerprint']
+    assert page.evaluate('(e)=>OpenLinksDialogsReader.guardReply(e,{preview:true})',expected)['ok']
+    page.evaluate('document.querySelector("[data-chat-root]").setAttribute("data-thread-id","other-recipient")')
+    assert not page.evaluate('(e)=>OpenLinksDialogsReader.guardReply(e,{preview:true})',expected)['ok']
+    passed('WeChat purpose permits a last-outbound TEST preview only; purpose alone, normal replies, changed history and recipient remain blocked')
+
+    load();current=active();expected={'platform':'1688','sourceUrl':page.url,'documentToken':snapshot()['documentToken'],'id':current['id'],'replyFingerprint':current['replyFingerprint'],'purpose':'wechat'}
+    assert not page.evaluate('(e)=>OpenLinksDialogsReader.guardReply(e)',expected)['ok']
+    assert page.evaluate('(e)=>OpenLinksDialogsReader.guardReply(e,{preview:true})',expected)['ok']
+    normal={key:value for key,value in expected.items() if key!='purpose'}
+    assert page.evaluate('(e)=>OpenLinksDialogsReader.guardReply(e)',normal)['ok']
+    passed('WeChat is preview-only even with last inbound; ordinary inbound reply guard retains its existing contract')
 
     assert not errors, errors
     browser.close()

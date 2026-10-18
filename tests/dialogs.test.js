@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import {initialDialogs as emptyDialogs,saveProduct,approveProduct,productFingerprint,normalizeDialogs,mergeDialogSnapshot,bindDialogTab,unbindDialogTab,conversationKey,draftRequest,acceptDraft,setConversationControl,validateDialogSettings,setDialogSettings,buildDraftPrompt,DIALOG_LIMITS,attachmentSourceFingerprint,resolveConversationAttachments,canPrepareDraft} from '../extension/lib/dialogs.js';
+import {initialDialogs as emptyDialogs,saveProduct,approveProduct,productFingerprint,normalizeDialogs,mergeDialogSnapshot,bindDialogTab,unbindDialogTab,conversationKey,draftRequest,acceptDraft,setConversationControl,validateDialogSettings,setDialogSettings,buildDraftPrompt,DIALOG_LIMITS,attachmentSourceFingerprint,resolveConversationAttachments,canPrepareDraft,contactAssessment,mayPrepareWechat,recordContactRead,contactReadChecked,contactLedgerStatus,reserveContactRecord,wechatContactFingerprint} from '../extension/lib/dialogs.js';
 
 function initialDialogs(){const state=emptyDialogs();saveProduct(state,{keyPoints:'Model A, quantity and price need clarification.'},1);approveProduct(state,productFingerprint(state),2);return state;}
 const key=conversationKey('1688','account:me/thread:supplier');
@@ -339,4 +339,143 @@ test('a corrected system row observed during the unstable first poll remains an 
   observe(state,current,{historyTailKnown:false,historyOrderReliable:true,coverage:{}},30);const item=state.conversations[key];assert.equal(item.messages.length,8);assert.equal(item.archivedMessages.length,0);
   const result=observe(state,current,{historyTailKnown:true,historyOrderReliable:true,coverage:{}},40);assert.equal(item.messages.length,4);assert.equal(item.archivedMessages.length,4);assert.equal(result.addedMessages,0);assert.equal(item.orderReliable,true);assert.equal(canPrepareDraft(state,key),true);
   const revision=item.revision;observe(state,current,{historyTailKnown:true,historyOrderReliable:true,coverage:{}},50);assert.equal(item.revision,revision);assert.deepEqual(normalizeDialogs(state).conversations[key],item);
+});
+
+test('read-chat WeChat mode preserves buyer settings and approval, and enables an honest test draft after buyer last',()=>{
+  const state=initialDialogs();setDialogSettings(state,{wechat:'Buyer_123',brief:'Buy machinery',language:'Chinese'});approveProduct(state,productFingerprint(state));
+  const approved=state.product.approval;setDialogSettings(state,{scanRead:true});
+  assert.equal(state.settings.wechat,'Buyer_123');assert.equal(state.settings.brief,'Buy machinery');assert.deepEqual(state.product.approval,approved);
+  observe(state,[msg('1','Please quote 100 pieces','outbound')],{unread:false});
+  assert.equal(state.conversations[key].unanswered,false);assert.equal(canPrepareDraft(state,key),true);
+  const request=draftRequest(state,key);assert.equal(request.purpose,'wechat');const prompt=buildDraftPrompt(state,request),context=JSON.parse(prompt.user);
+  assert.equal(context.purpose,'wechat_invitation_test');assert.equal(context.contactAssessment.status,'not_found');assert.equal(context.contactAssessment.historyScope,'available_history');assert.equal(context.buyerWechat,'Buyer_123');assert.match(prompt.system,/более ранняя история может отсутствовать/);
+  acceptDraft(state,request,{text:'You can contact me on WeChat: Buyer_123',testSessionId:'test-origin'});
+  const restored=normalizeDialogs(state);assert.equal(restored.conversations[key].draft.purpose,'wechat');assert.equal(restored.conversations[key].draft.testSessionId,'test-origin');
+  setDialogSettings(restored,{scanRead:false});assert.equal(restored.conversations[key].draft,null);assert.throws(()=>draftRequest(restored,key));
+});
+
+test('own WeChat matching excludes seller contact and substrings but accepts NFKC and case equivalents',()=>{
+  for(const [text,direction,shared] of [
+    ['My WeChat is Buyer_123','inbound',false],['My contact is anotherBuyer_123','outbound',false],
+    ['Please add Buyer_123-extra','outbound',false],['微信：ＢＵＹＥＲ＿１２３','outbound',true],
+    ['WeChat: buyer_123.','outbound',true],['buyer_123','unknown',false],
+  ]) {
+    const state=initialDialogs();setDialogSettings(state,{wechat:'Buyer_123',scanRead:true});approveProduct(state,productFingerprint(state));
+    observe(state,[msg('contact',text,direction)]);
+    assert.equal(contactAssessment(state,key).status==='shared',shared,`${direction}: ${text}`);
+  }
+});
+
+test('positive outgoing WeChat proof survives pruning, reload and changed contact without storing a second raw contact',()=>{
+  const state=initialDialogs();setDialogSettings(state,{wechat:'Buyer_123',scanRead:true});approveProduct(state,productFingerprint(state));
+  observe(state,[msg('shared','My WeChat: Buyer_123','outbound')]);
+  const item=state.conversations[key];assert.equal(contactAssessment(state,key).status,'shared');assert.equal(item.wechatEvidence.length,1);assert.equal(JSON.stringify(item.wechatEvidence).includes('Buyer_123'),false);
+  // The bounded transcript can lose its old first message; a positive proof must survive.
+  item.messages=[{...item.messages[0],id:'later',key:'id:later',text:'Please quote',direction:'outbound'}];
+  const restored=normalizeDialogs(state);assert.equal(contactAssessment(restored,key).status,'shared');assert.equal(canPrepareDraft(restored,key),false);
+  setDialogSettings(restored,{wechat:'NewBuyer_456'});approveProduct(restored,productFingerprint(restored));assert.equal(contactAssessment(restored,key).status,'not_found');
+  restored.conversations[key].archivedMessages=[{key:'old-out',direction:'outbound',text:'NewBuyer_456',reason:'reader-correction'}];assert.equal(contactAssessment(restored,key).status,'not_found');
+});
+
+test('incomplete history is explicit and unreadable, unsafe or controlled conversations cannot become contact previews',()=>{
+  for(const options of [{identityReliable:false},{tailKnown:false},{orderReliable:false},{coverage:{limited:true}}]) {
+    const state=initialDialogs();setDialogSettings(state,{wechat:'Buyer_123',scanRead:true});approveProduct(state,productFingerprint(state));
+    observe(state,[msg('1','A buyer message','outbound')],options);assert.equal(mayPrepareWechat(state,key),false);assert.equal(canPrepareDraft(state,key),false);
+  }
+  const state=initialDialogs();setDialogSettings(state,{wechat:'Buyer_123',scanRead:true});approveProduct(state,productFingerprint(state));
+  observe(state,[msg('1','A buyer message','outbound')],{historyStartKnown:true,historyComplete:true});
+  assert.equal(contactAssessment(state,key).historyScope,'complete_history');assert.equal(normalizeDialogs(state).conversations[key].historyComplete,true);
+  const before=draftRequest(state,key);observe(state,[msg('1','A buyer message','outbound')],{historyComplete:false});assert.equal(contactAssessment(state,key).historyScope,'available_history');assert.throws(()=>acceptDraft(state,before,{text:'Outdated proof'}));
+  setConversationControl(state,key,{takeover:true});assert.equal(mayPrepareWechat(state,key),false);
+});
+
+test('ordinary incoming replies keep their purpose while proactive requests cannot change purpose',()=>{
+  const state=initialDialogs();setDialogSettings(state,{wechat:'Buyer_123',scanRead:true});approveProduct(state,productFingerprint(state));observe(state,[msg('1','How many?')]);
+  assert.equal(draftRequest(state,key).purpose,undefined);assert.equal(JSON.parse(buildDraftPrompt(state,draftRequest(state,key)).user).contactAssessment.status,'not_found');
+  observe(state,[msg('1','How many?'),msg('2','100 units','outbound')]);
+  const request=draftRequest(state,key);assert.equal(request.purpose,'wechat');assert.throws(()=>acceptDraft(state,{...request,purpose:undefined},{text:'Changed purpose'}));
+  observe(state,[msg('1','How many?'),msg('2','100 units','outbound'),msg('3','WeChat Buyer_123','outbound')]);
+  assert.throws(()=>draftRequest(state,key));assert.throws(()=>acceptDraft(state,request,{text:'Duplicate invitation'}));
+});
+
+test('history completeness requires start proof and is lost on truncation or unreadable content',()=>{
+  const settings={wechat:'Buyer_123',scanRead:true};
+  for(const options of [{historyComplete:true,historyStartKnown:false},{historyComplete:true,historyStartKnown:true,coverage:{limited:true}}]) {
+    const state=initialDialogs();setDialogSettings(state,settings);approveProduct(state,productFingerprint(state));observe(state,[msg('x','Quote','outbound')],options);assert.equal(state.conversations[key].historyComplete,false);
+  }
+  const state=initialDialogs();setDialogSettings(state,settings);approveProduct(state,productFingerprint(state));
+  observe(state,Array.from({length:81},(_,i)=>msg(String(i),'Quote','outbound',i)),{historyStartKnown:true,historyComplete:true});assert.equal(state.conversations[key].historyComplete,false);
+  state.conversations[key].historyComplete=true;state.conversations[key].historyStartKnown=false;assert.equal(normalizeDialogs(state).conversations[key].historyComplete,false);
+});
+
+test('corrected current or archived author evidence cannot permanently suppress a contact check',()=>{
+  const state=initialDialogs();setDialogSettings(state,{wechat:'Buyer_123',scanRead:true});approveProduct(state,productFingerprint(state));
+  observe(state,[msg('same-server','My WeChat: Buyer_123','outbound')]);assert.equal(contactAssessment(state,key).status,'shared');
+  observe(state,[msg('same-server','My WeChat: Buyer_123','inbound')]);assert.equal(contactAssessment(state,key).status,'not_found');assert.equal(state.conversations[key].wechatEvidence.length,0);
+  observe(state,[msg('same-server','My WeChat: Buyer_123','outbound')]);const saved=structuredClone(state);saved.conversations[key].messages[0].direction='inbound';
+  const restored=normalizeDialogs(saved);assert.equal(restored.conversations[key].wechatEvidence.length,0);assert.equal(contactAssessment(restored,key).status,'not_found');
+  const archived=structuredClone(state);archived.conversations[key].archivedMessages=[{...archived.conversations[key].messages[0],reason:'reader-correction'}];archived.conversations[key].messages=[msg('other','Quote','outbound')];
+  assert.equal(contactAssessment(normalizeDialogs(archived),key).status,'not_found');
+});
+
+function ledgerObserve(state,id,messages,at=1000) {
+  return mergeDialogSnapshot(state,{platform:'1688',status:'ready',conversations:[{id,identityReliable:true,active:true,orderReliable:true,tailKnown:true,unread:false,preview:'Our previous request',messages}]},at);
+}
+function contactState(){const state=initialDialogs();setDialogSettings(state,{wechat:'Buyer_123',scanRead:true});approveProduct(state,productFingerprint(state));return state;}
+
+test('compact contact ledger survives transcript eviction, reload and repeated read scans without raw text',()=>{
+  let state=contactState();const id='old-supplier',oldKey=conversationKey('1688',id);
+  ledgerObserve(state,id,[msg('old-proof','My WeChat: Buyer_123','outbound')],1);
+  assert.equal(recordContactRead(state,oldKey,{preview:'Private seller preview',contactFingerprint:wechatContactFingerprint(state.settings.wechat),status:'shared',fingerprint:state.conversations[oldKey].fingerprint,at:1}),true);
+  for(let i=0;i<105;i++)ledgerObserve(state,'new-'+i,[msg('m-'+i,'Our quote request','outbound')],i+2);
+  assert.equal(state.conversations[oldKey],undefined);assert.equal(contactReadChecked(state,oldKey,'Private seller preview'),true);
+  state=normalizeDialogs(JSON.parse(JSON.stringify(state)));assert.equal(contactReadChecked(state,oldKey,'Private seller preview'),true);
+  ledgerObserve(state,id,[msg('later','A different buyer request','outbound')],200);
+  assert.equal(contactAssessment(state,oldKey).status,'shared');assert.equal(mayPrepareWechat(state,oldKey),false);
+  const encoded=JSON.stringify(state.contactLedger);assert.equal(encoded.includes('Buyer_123'),false);assert.equal(encoded.includes('Private seller preview'),false);assert.equal(encoded.includes('old-proof'),false);assert.equal(encoded.includes('old-supplier'),false);
+  assert.equal(state.contactLedger.bytes,Buffer.byteLength(JSON.stringify(state.contactLedger.records)));
+});
+
+test('compact ledger migrates old local fields including records beyond the transcript cap',()=>{
+  const state=contactState();ledgerObserve(state,'legacy',[msg('legacy-message','My WeChat: Buyer_123','outbound')]);const original=state.conversations[conversationKey('1688','legacy')];
+  delete state.contactLedger;original.wechatEvidence=[{contactFingerprint:wechatContactFingerprint('Buyer_123'),messageKey:original.messages[0].key,at:1}];original.readScan={preview:'legacy private preview',contactFingerprint:wechatContactFingerprint('Buyer_123'),status:'shared',fingerprint:original.fingerprint,at:1};
+  const extra=structuredClone(original);extra.id='legacy-extra';extra.key=conversationKey('1688',extra.id);
+  for(let i=0;i<100;i++){const copy=structuredClone(original);copy.id='filler-'+i;copy.key=conversationKey('1688',copy.id);state.conversations[copy.key]=copy;}state.conversations[extra.key]=extra;const corrected=structuredClone(extra);corrected.id='legacy-corrected';corrected.key=conversationKey('1688',corrected.id);corrected.messages[0].direction='inbound';state.conversations[corrected.key]=corrected;
+  const restored=normalizeDialogs(state);assert.equal(contactReadChecked(restored,corrected.key,'legacy private preview'),false);assert.equal(contactLedgerStatus(restored,corrected.key).recorded,false);assert.equal(Object.keys(restored.conversations).length,100);assert.equal(restored.conversations[extra.key],undefined);assert.equal(contactReadChecked(restored,extra.key,'legacy private preview'),true);
+  ledgerObserve(restored,extra.id,[msg('new','Later buyer text','outbound')],2000);assert.equal(contactAssessment(restored,extra.key).status,'shared');assert.equal(JSON.stringify(restored.contactLedger).includes('legacy private preview'),false);
+});
+
+test('a corrected sender removes the durable proof even after eviction and another restart',()=>{
+  let state=contactState();const id='corrected-after-eviction',target=conversationKey('1688',id);
+  ledgerObserve(state,id,[msg('same-id','My WeChat: Buyer_123','outbound')],1);recordContactRead(state,target,{preview:'known-preview',contactFingerprint:wechatContactFingerprint('Buyer_123'),status:'shared',fingerprint:state.conversations[target].fingerprint,at:1});
+  for(let i=0;i<101;i++)ledgerObserve(state,'evict-'+i,[msg('x','Later','outbound')],i+2);
+  state=normalizeDialogs(state);ledgerObserve(state,id,[msg('same-id','My WeChat: Buyer_123','inbound')],300);
+  assert.equal(contactAssessment(state,target).status,'not_found');assert.equal(state.conversations[target].wechatEvidence.length,0);assert.equal(contactReadChecked(state,target,'known-preview'),false);
+  for(let i=0;i<101;i++)ledgerObserve(state,'evict-again-'+i,[msg('x','Later','outbound')],i+400);
+  state=normalizeDialogs(state);ledgerObserve(state,id,[msg('another','Buyer request','outbound')],600);assert.equal(contactAssessment(state,target).status,'not_found');
+});
+
+test('ledger proof capacity never evicts an earlier contact and blocks unrecordable invitations',()=>{
+  let state=contactState();const id='eight-contacts',target=conversationKey('1688',id);const history=[];
+  for(let i=0;i<9;i++){setDialogSettings(state,{wechat:'Buyer_'+i});history.push(msg(String(i),'WeChat: Buyer_'+i,'outbound'));ledgerObserve(state,id,history,i);}
+  const record=Object.values(state.contactLedger.records)[0];assert.equal(record.wechatEvidence.length,8);assert.equal(record.overflow,true);assert.ok(record.wechatEvidence.some(proof=>proof.contactFingerprint===wechatContactFingerprint('Buyer_0')));
+  setDialogSettings(state,{wechat:'Buyer_9'});approveProduct(state,productFingerprint(state));assert.equal(contactAssessment(state,target).status,'blocked_capacity');assert.equal(mayPrepareWechat(state,target),false);
+  history.push(msg('incoming','Can you confirm the amount?','inbound'));ledgerObserve(state,id,history,20);assert.equal(draftRequest(state,target).purpose,undefined,'ordinary incoming replies still work');
+  state=normalizeDialogs(state);setDialogSettings(state,{wechat:'Buyer_0'});assert.equal(contactAssessment(state,target).status,'shared');assert.equal(contactLedgerStatus(state,target).available,false,'overflow preserves positive proof but never retries unrecordable reads');
+});
+
+test('ledger record and serialized byte limits fail closed without silent record replacement',()=>{
+  const state=contactState();for(let i=0;i<DIALOG_LIMITS.contactRecords;i++)assert.equal(reserveContactRecord(state,conversationKey('1688','reserved-'+i)),true);
+  const before=JSON.stringify(state.contactLedger.records);assert.equal(reserveContactRecord(state,conversationKey('1688','excess')),false);assert.equal(JSON.stringify(state.contactLedger.records),before);
+  ledgerObserve(state,'excess',[msg('buyer','Please quote','outbound')]);assert.equal(contactAssessment(state,conversationKey('1688','excess')).status,'blocked_capacity');
+  const oversized=contactState();oversized.contactLedger.records=Object.fromEntries(Array.from({length:5001},(_,i)=>[i.toString(16)+':1',{wechatEvidence:Array.from({length:8},(_,j)=>({contactFingerprint:(i*8+j).toString(16)+':1',messageKeyFingerprint:'abcdef0123456789:999999',at:8640000000000000})),readScan:{previewFingerprint:'abcdef0123456789:999999',contactFingerprint:'abcdef0123456789:999999',status:'shared',at:8640000000000000,fingerprint:'😀'.repeat(100)},overflow:false}]));
+  const restored=normalizeDialogs(oversized);assert.equal(restored.contactLedger.saturated,true);assert.ok(restored.contactLedger.bytes<=DIALOG_LIMITS.contactLedgerBytes);assert.ok(Object.keys(restored.contactLedger.records).length<=DIALOG_LIMITS.contactRecords);assert.equal(restored.contactLedger.bytes,Buffer.byteLength(JSON.stringify(restored.contactLedger.records)));assert.equal(JSON.stringify(restored.contactLedger).includes('😀'),false);
+  const first=Object.keys(restored.contactLedger.records)[0];assert.equal(first,'0:1');const reloaded=normalizeDialogs(restored);assert.deepEqual(reloaded.contactLedger,restored.contactLedger);
+});
+
+test('a valid pruned ledger proof wins over a stale contradictory embedded proof',()=>{
+  const state=contactState(),id='proof-priority',target=conversationKey('1688',id);ledgerObserve(state,id,[msg('proof-A','My WeChat Buyer_123','outbound')]);
+  const item=state.conversations[target];item.wechatEvidence=[{contactFingerprint:wechatContactFingerprint('Buyer_123'),messageKey:'id:proof-B',at:1}];item.messages=[{...item.messages[0],key:'id:proof-B',id:'proof-B',direction:'inbound'}];
+  const restored=normalizeDialogs(state);assert.equal(contactAssessment(restored,target).status,'shared');assert.equal(restored.conversations[target].wechatEvidence.length,1);
+  assert.deepEqual(restored.contactLedger.records,state.contactLedger.records);
 });

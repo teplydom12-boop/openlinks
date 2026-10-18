@@ -63,7 +63,7 @@ with sync_playwright() as p:
         assert len(context.pages)==1
 
     load(expanded=False)
-    assert run()['reason']=='widget_expanding'
+    assert run()['reason']=='widget_ready'
     assert page.evaluate('bubbleClicks===1&&expandClicks===0&&nativeCalls===0')
     assert run()=={'ok':True,'url':CHAT}
     assert page.evaluate('bubbleClicks===1&&expandClicks===1&&nativeCalls===0')
@@ -72,7 +72,7 @@ with sync_playwright() as p:
     assert page.evaluate('expandClicks===1')
     assert page.evaluate("Object.getOwnPropertySymbols(document).map(k=>document[k]).filter(v=>v&&typeof v==='object'&&'expand'in v).every(v=>Object.values(v).every(x=>typeof x==='boolean'))")
     no_input()
-    passed('bubble expands once, next call captures one synchronous auth URL without real popup, input or focus; result is consumed')
+    passed('bubble expands once and requests immediate guarded rescan; next call captures one synchronous auth URL without popup, input or focus')
 
     load()
     before=page.content()
@@ -82,7 +82,7 @@ with sync_playwright() as p:
     no_input()
     passed('already expanded widget opens directly and does not persist the captured URL in DOM')
 
-    for url in ['https://www.made-in-china.com/','https://membercenter.made-in-china.com/message/index.html?other=1','https://membercenter.made-in-china.com/message/index.html#other','https://membercenter.made-in-china.com/elsewhere/','https://shop.en.made-in-china.com/message/index.html']:
+    for url in ['https://www.made-in-china.com/','https://membercenter.made-in-china.com/elsewhere/','https://shop.en.made-in-china.com/message/index.html']:
         load(url=url)
         assert run()['reason']=='wrong_page'
         assert page.evaluate('bubbleClicks===0&&expandClicks===0&&nativeCalls===0')
@@ -90,7 +90,19 @@ with sync_playwright() as p:
     page.evaluate("Object.defineProperty(document,'readyState',{value:'interactive',configurable:true})")
     assert run()['reason']=='page_loading'
     assert page.evaluate('expandClicks===0')
-    passed('only exact complete member center page is eligible')
+    for suffix in ['?from=messages','#all','?from=messages#all']:
+        load(url=CENTER+suffix)
+        assert run()=={'ok':True,'url':CHAT}
+        assert restored()
+        no_input()
+    passed('only complete member center origin/path is eligible; tracking and UI-state suffixes do not strand the mailbox')
+
+    load(expanded=False)
+    assert run()['reason']=='widget_ready'
+    page.evaluate("document.querySelector('#webtm-wrapper').insertAdjacentHTML('beforeend','<textarea>Newly revealed draft</textarea>')")
+    assert run()['reason']=='widget_draft'
+    assert page.evaluate('bubbleClicks===1&&expandClicks===0&&nativeCalls===0')
+    passed('an editor revealed by the first action is guarded before the full messenger action')
 
     load()
     page.evaluate("document.body.insertAdjacentHTML('beforeend','<iframe src=\"'+location.href+'\"></iframe>')")

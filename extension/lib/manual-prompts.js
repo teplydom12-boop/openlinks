@@ -3,11 +3,11 @@ import {buildProductExtractionPrompt,buildDraftPrompt,DIALOG_PLATFORMS} from './
 // The manual path uses the same approved, current context as API requests. It
 // neither reads provider settings nor changes state or marks images as analysed.
 const PRODUCT_REQUEST_FIELDS=['revision','fingerprint'];
-const DIALOG_REQUEST_FIELDS=['key','revision','fingerprint','settingsFingerprint','productFingerprint'];
+const DIALOG_REQUEST_FIELDS=['key','revision','fingerprint','settingsFingerprint','productFingerprint','purpose'];
 const IMAGE_FIELDS=['mime','page','width','height'];
 
 function requestCopy(request,fields){
-  return Object.fromEntries(fields.map(name=>[name,request[name]]));
+  return Object.fromEntries(fields.filter(name=>request[name]!==undefined).map(name=>[name,request[name]]));
 }
 function filename(kind,platform,now){
   if(!Number.isFinite(now)||now<0||now>253402300799999)throw new Error('Некорректное время экспорта.');
