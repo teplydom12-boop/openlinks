@@ -1,0 +1,24 @@
+<!doctype html>
+<!-- Synthetic contact rows using observed Alibaba class/data-attribute names.
+     Every identifier, name, timestamp and message below is invented. -->
+<meta charset=utf-8>
+<style>body{font:16px sans-serif}.contact-item-container{width:320px;padding:16px;border:1px solid #ccc}.contact-company{height:20px}textarea{width:300px;height:60px}</style>
+<div class=buyer-conversation-list><div class=normal-list-container id=normal-list-container-id>
+ <div class=contact-item-container data-cid="910000001-910000009#11011@icbu" data-ali-id=synthetic-peer-one data-unread-count=1 data-lastmsg-id=920000001 data-modify-time=1792314000000 role=button tabindex=0>
+  <div class=contact-left></div><div class=contact-right><div class=contact-info><span class=name>Synthetic seller</span><span class=contact-time>09:00</span></div>
+   <div class=contact-company>Synthetic company</div><div class=msg-wrapper><div class=latest-msg><span class="read-status unread">Unread by supplier</span><div><p>We can provide a sample.</p></div></div></div>
+  </div>
+ </div>
+ <div class=contact-item-container data-cid="910000002-910000009#11011@icbu" data-ali-id=synthetic-peer-two data-unread-count=0 data-lastmsg-id=920000002 data-modify-time=1792314000001 role=button tabindex=0>
+  <div class=contact-left></div><div class=contact-right><div class=contact-info><span class=name>Second synthetic seller</span><span class=contact-time>09:01</span></div>
+   <div class=contact-company>Another synthetic company</div><div class=msg-wrapper><div class=latest-msg><span class="read-status unread">Unread by supplier</span><div><p>Our previous message.</p></div></div></div>
+  </div>
+ </div>
+</div></div>
+<textarea></textarea><button id=send>Send</button>
+<script>
+window.readerSideEffects={click:0,input:0,change:0,submit:0,focus:0};
+for(const key of Object.keys(readerSideEffects))document.addEventListener(key,event=>{readerSideEffects[key]++;if(key==='submit')event.preventDefault();},true);
+window.selectedThreads=[];
+for(const row of document.querySelectorAll('.contact-item-container'))row.addEventListener('click',()=>{selectedThreads.push(row.getAttribute('data-cid'));row.classList.add('selected');});
+</script>

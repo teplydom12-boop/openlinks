@@ -2,15 +2,20 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import {readFileSync} from 'node:fs';
 import {initialState} from '../extension/lib/core.js';
+import {initialDialogs,bindDialogTab} from '../extension/lib/dialogs.js';
 import {domReply} from './debugger-harness.js';
 const listener=()=>{const list=[];return {list,addListener(fn){list.push(fn);}};};
 let stored,clicks,contactClicks,commands,requests,beforeClick,probeKind,sendResult,frameUrl,tabCount,opened,missing,obstacle,prepareOk,lookupPages,fetches,probeRoute,updated,probeKey,listedTabs,frameList,tabReplies,frameProbes,deliveries;
 let scheduled,removed,canClose,nativeRequired,debuggerFailure,debuggerCalls,nativeFailure,chatReady;
+let extraStorage={};
 const metadataFixture=readFileSync(new URL('./fixtures/1688-metadata.html',import.meta.url),'utf8');
 globalThis.fetch=async(url,options)=>{fetches.push({url,credentials:options.credentials});const html=lookupPages.get(url);if(html===undefined)throw new Error('No local metadata fixture');return new Response(html,{headers:{'content-type':'text/html'}});};
 const runtime={onMessage:listener(),onStartup:listener(),onInstalled:listener(),getURL:path=>'chrome-extension://test/'+path};
 const alarms={onAlarm:listener(),create:async(name,options)=>{scheduled.push({name,...options});}};
-globalThis.chrome={runtime,alarms,storage:{local:{get:async()=>({openlinksState:structuredClone(stored)}),set:async data=>{stored=structuredClone(data.openlinksState);}}},
+globalThis.chrome={runtime,alarms,storage:{local:{get:async keys=>{
+ const all={...extraStorage,openlinksState:stored};
+ return structuredClone(keys==null?all:Object.fromEntries((Array.isArray(keys)?keys:[keys]).map(key=>[key,all[key]])));
+},set:async data=>{if(Object.hasOwn(data,'openlinksState'))stored=structuredClone(data.openlinksState);for(const [key,value] of Object.entries(data))if(key!=='openlinksState')extraStorage[key]=structuredClone(value);},setAccessLevel:async()=>{}}},
  tabs:{onUpdated:listener(),onCreated:listener(),create:async data=>{opened.push(data.url);return {id:++tabCount};},update:async(id,data)=>{updated.push({id,...data});},query:async()=>structuredClone(listedTabs),get:async id=>tabReplies.get(id) || ({id,url:frameUrl}),
  remove:async id=>{removed.push(id);},
  sendMessage:async(tab,data,options)=>{
@@ -35,9 +40,11 @@ chrome.debugger={
  sendCommand:async(target,method,params)=>{debuggerCalls.push({target,method,params});return domReply(method);},
 };
 const ui={id:'test',url:'chrome-extension://test/dashboard.html'};
-const message=(type,extra={},sender=ui)=>new Promise(resolve=>runtime.onMessage.list[0]({type,...extra},sender,resolve));
+const message=(type,extra={},sender=ui)=>new Promise(resolve=>{
+ for(const listen of runtime.onMessage.list)listen({type,...extra},sender,resolve);
+});
 async function tick(){alarms.onAlarm.list[0]({name:'openlinks-tick'});await message('GET');}
-function reset(){stored=initialState();stored.settings.message='Hello';clicks=0;contactClicks=0;commands=[];requests=[];beforeClick=null;probeKind='chat';sendResult=true;frameUrl='https://a.en.alibaba.com/chat';tabCount=0;opened=[];missing=false;obstacle=null;prepareOk=true;lookupPages=new Map();fetches=[];probeRoute=null;updated=[];probeKey='#contact';listedTabs=[];frameList=null;tabReplies=new Map();frameProbes=new Map();deliveries=[];scheduled=[];removed=[];canClose=true;nativeRequired=false;debuggerFailure=null;debuggerCalls=[];nativeFailure=null;chatReady=true;}
+function reset(){stored=initialState();extraStorage={};stored.settings.message='Hello';clicks=0;contactClicks=0;commands=[];requests=[];beforeClick=null;probeKind='chat';sendResult=true;frameUrl='https://a.en.alibaba.com/chat';tabCount=0;opened=[];missing=false;obstacle=null;prepareOk=true;lookupPages=new Map();fetches=[];probeRoute=null;updated=[];probeKey='#contact';listedTabs=[];frameList=null;tabReplies=new Map();frameProbes=new Map();deliveries=[];scheduled=[];removed=[];canClose=true;nativeRequired=false;debuggerFailure=null;debuggerCalls=[];nativeFailure=null;chatReady=true;}
 async function review(url='https://a.en.alibaba.com/'){await message('IMPORT',{text:url});await message('START');await tick();await tick();}
 async function openingTimedOut(){stored.queue[0].chatOpening.at=Date.now()-21000;await tick();}
 
@@ -700,4 +707,126 @@ test('draft replacement is logged before native activation without storing the o
  const replacement=stored.events.filter(e=>e.type==='draft_replaced');assert.equal(replacement.length,1);
  assert.match(replacement[0].detail,/очищен/);assert.equal(replacement[0].jobId,stored.activeId);
  assert.ok(stored.events.findIndex(e=>e.type==='draft_replaced')<stored.events.findIndex(e=>e.type==='editor_input'));
+});
+
+function reserveMonitorTab(tabId,platform='alibaba',url='https://onetalk.alibaba.com/message/weblite.htm') {
+ const state=extraStorage.openlinksDialogs || initialDialogs();
+ bindDialogTab(state,platform,tabId,url);extraStorage.openlinksDialogs=state;
+}
+test('dialog commands have a single runtime responder and do not overwrite outreach state',async()=>{
+ reset();await message('IMPORT',{text:'https://shop.en.alibaba.com/'});const queue=structuredClone(stored);
+ let responded=false;
+ assert.equal(runtime.onMessage.list[0]({type:'DIALOGS_GET'},ui,()=>{responded=true;}),undefined);
+ const reply=await message('DIALOGS_GET');assert.equal(reply.ok,true);assert.equal(reply.state.mode,'observe');
+ assert.equal(responded,false);assert.deepEqual(stored,queue);
+});
+test('bound inboxes stay protected while paused and independent outreach still runs in its own tab',async()=>{
+ reset();reserveMonitorTab(99);assert.equal(extraStorage.openlinksDialogs.running,false);
+ await review();await message('APPROVE');await tick();
+ assert.equal(stored.queue[0].status,'attempted');assert.equal(clicks,1);
+ assert.ok(!deliveries.some(command=>command.tabId===99));assert.deepEqual(removed,[]);
+ assert.equal(extraStorage.openlinksDialogs.bindings.alibaba.tabId,99);
+});
+test('outreach and dialog binding reject an inbox already owned by the other module',async()=>{
+ reset();reserveMonitorTab(99);tabReplies.set(99,{id:99,url:'https://onetalk.alibaba.com/message/weblite.htm'});
+ await review();const job=stored.queue[0];
+ assert.equal((await message('BIND_TAB',{tabId:99})).ok,false);assert.equal(stored.queue[0].tabId,job.tabId);
+ assert.equal((await message('DIALOGS_BIND_TAB',{platform:'alibaba',tabId:job.tabId})).ok,false);
+ assert.equal(extraStorage.openlinksDialogs.bindings.alibaba.tabId,99);
+});
+test('legacy conflicting tab ownership cannot prepare, type or send in a monitored inbox',async()=>{
+ for(const [platform,url] of [['1688','https://air.1688.com/chat'],['alibaba','https://onetalk.alibaba.com/message/weblite.htm'],['mic','https://webim.made-in-china.com/super-tm/']]) {
+  reset();frameUrl=url;nativeRequired=platform==='1688';
+  await message('IMPORT',{text:url});await message('START');await tick();
+  reserveMonitorTab(1,platform,url);await tick();
+  assert.equal(stored.queue[0].status,'retry_wait',platform);
+  assert.ok(!commands.some(type=>['PREPARE','SEND','NATIVE_INPUT','CONTACT','OPEN_CHAT','DISMISS_CHALLENGE'].includes(type)),platform);
+  assert.equal(clicks,0);assert.equal(contactClicks,0);assert.deepEqual(debuggerCalls,[]);assert.deepEqual(updated,[]);
+  assert.equal(stored.slots.filter(slot=>slot.kind==='send').length,0);
+ }
+});
+test('manual skip preserves monitored source and messenger tabs independently',async()=>{
+ for(const reserved of [1,20]) {
+  reset();const store='https://shop.en.alibaba.com/',chat='https://onetalk.alibaba.com/message/weblite.htm';frameUrl=store;probeKind='waiting';
+  await review(store);chrome.tabs.onCreated.list[0]({id:20,openerTabId:1,url:chat});await message('GET');
+  tabReplies.set(1,{id:1,url:store});tabReplies.set(20,{id:20,url:chat});reserveMonitorTab(reserved,'alibaba',reserved===1?store:chat);
+  await message('SKIP',{id:stored.activeId});assert.deepEqual(removed,reserved===1?[20]:[1]);
+  assert.ok(stored.events.some(event=>event.type==='skip_tab_kept' && /мониторинг/.test(event.detail)));
+ }
+});
+test('a finished chat subsequently bound for monitoring cannot be closed by its old timer',async t=>{
+ reset();await review();await message('APPROVE');await tick();const closing=stored.pendingClosures[0];
+ assert.equal((await message('DIALOGS_BIND_TAB',{platform:'alibaba',tabId:closing.tabId})).ok,true);
+ t.mock.method(Date,'now',()=>closing.at);await fireClose(closing.token);
+ assert.deepEqual(removed,[]);assert.equal(stored.pendingClosures.length,0);
+ assert.ok(stored.events.some(event=>event.type==='chat_close_cancelled' && /мониторинг/.test(event.detail)));
+});
+test('1688 recipient reconciliation excludes monitored inboxes and may choose an unreserved matching tab',async()=>{
+ reset();const store='https://current.1688.com/';frameUrl=store;probeKind='waiting';await review(store);
+ stored.chatRoutes[store]={url:messenger1688};tabReplies.set(1,{id:1,url:store});reserveMonitorTab(30,'1688',messenger1688);
+ listedTabs=[{id:30,url:messenger1688}];await tick();assert.equal(stored.queue[0].tabId,1);
+ listedTabs.push({id:31,url:messenger1688});await tick();assert.equal(stored.queue[0].tabId,31);
+ assert.ok(!deliveries.some(command=>command.tabId===30));
+});
+test('popup and same-tab discovery never adopts or resumes a reserved monitor tab',async()=>{
+ for(const [platform,store,chat] of [['1688','https://current.1688.com/',messenger1688],['alibaba','https://shop.en.alibaba.com/','https://onetalk.alibaba.com/message/weblite.htm'],['mic','https://shop.en.made-in-china.com/','https://webim.made-in-china.com/super-tm/']]) {
+  reset();frameUrl=store;probeKind='waiting';await review(store);reserveMonitorTab(20,platform,chat);
+  chrome.tabs.onCreated.list[0]({id:20,openerTabId:1,url:chat});await message('GET');
+  chrome.webNavigation.onCreatedNavigationTarget.list[0]({tabId:20,sourceTabId:1,url:chat});await message('GET');
+  assert.equal(stored.queue[0].tabId,1,platform);
+  reserveMonitorTab(1,platform,chat);const before=structuredClone(stored);
+  chrome.tabs.onUpdated.list[0](1,{url:chat},{id:1,url:chat});await message('GET');
+  await message('PAGE_READY',{}, {id:'test',url:chat,tab:{id:1},frameId:0});
+  assert.deepEqual(stored,before,platform);assert.equal(clicks,0);
+ }
+});
+test('binding a finished chat while its close check is in flight prevents removal',async t=>{
+ reset();await review();await message('APPROVE');await tick();const closing=stored.pendingClosures[0];
+ const original=chrome.tabs.sendMessage;
+ t.mock.method(chrome.tabs,'sendMessage',async(tab,data,options)=>{
+  const reply=await original(tab,data,options);if(data.type==='CAN_CLOSE')reserveMonitorTab(tab);return reply;
+ });
+ t.mock.method(Date,'now',()=>closing.at);await fireClose(closing.token);
+ assert.deepEqual(removed,[]);assert.equal(extraStorage.openlinksDialogs.bindings.alibaba.tabId,closing.tabId);
+ assert.ok(stored.events.some(event=>event.type==='chat_close_cancelled' && /мониторинг/.test(event.detail)));
+});
+test('concurrent inbox and outreach binding grant ownership to exactly one module',async()=>{
+ for(const monitorFirst of [false,true]) {
+  reset();await review();tabReplies.set(99,{id:99,url:'https://onetalk.alibaba.com/message/weblite.htm'});
+  const bindQueue=()=>message('BIND_TAB',{tabId:99}),bindMonitor=()=>message('DIALOGS_BIND_TAB',{platform:'alibaba',tabId:99});
+  const replies=await Promise.all(monitorFirst?[bindMonitor(),bindQueue()]:[bindQueue(),bindMonitor()]);
+  assert.equal(replies.filter(reply=>reply.ok).length,1);
+  assert.notEqual(stored.queue[0].tabId===99,extraStorage.openlinksDialogs?.bindings.alibaba.tabId===99);
+ }
+});
+test('concurrent popup adoption cannot take an inbox being reserved for monitoring',async()=>{
+ for(const [platform,store,chat] of [['1688','https://current.1688.com/',messenger1688],['alibaba','https://shop.en.alibaba.com/','https://onetalk.alibaba.com/message/weblite.htm'],['mic','https://shop.en.made-in-china.com/','https://webim.made-in-china.com/super-tm/']]) {
+  reset();frameUrl=store;probeKind='waiting';await review(store);tabReplies.set(20,{id:20,url:chat});
+  chrome.tabs.onCreated.list[0]({id:20,openerTabId:1,url:chat});
+  await message('DIALOGS_BIND_TAB',{platform,tabId:20});await message('GET');
+  assert.notEqual(stored.queue[0].tabId===20,extraStorage.openlinksDialogs?.bindings[platform].tabId===20,platform);
+ }
+});
+test('binding and closing a finished chat cannot leave a successful binding to a removed tab',async t=>{
+ reset();await review();await message('APPROVE');await tick();const closing=stored.pendingClosures[0],originalGet=chrome.tabs.get;
+ t.mock.method(chrome.tabs,'get',async id=>{if(removed.includes(id))throw new Error('Tab closed');return originalGet(id);});
+ t.mock.method(Date,'now',()=>closing.at);
+ alarms.onAlarm.list[0]({name:'openlinks-close:'+closing.token});
+ const result=await message('DIALOGS_BIND_TAB',{platform:'alibaba',tabId:closing.tabId});await message('GET');
+ assert.equal(result.ok && removed.includes(closing.tabId),false);
+ if(result.ok)assert.equal(extraStorage.openlinksDialogs.bindings.alibaba.tabId,closing.tabId);
+ else assert.deepEqual(removed,[closing.tabId]);
+});
+test('tab ownership validation is serialized even while Chrome lookup is delayed',async t=>{
+ for(const monitorFirst of [false,true]) {
+  reset();await review();tabReplies.set(99,{id:99,url:'https://onetalk.alibaba.com/message/weblite.htm'});
+  let release,lookups=0;const gate=new Promise(resolve=>{release=resolve;}),original=chrome.tabs.get;
+  const mock=t.mock.method(chrome.tabs,'get',async id=>{if(id===99 && ++lookups===1)await gate;return original(id);});
+  const bindQueue=()=>message('BIND_TAB',{tabId:99}),bindMonitor=()=>message('DIALOGS_BIND_TAB',{platform:'alibaba',tabId:99});
+  const first=(monitorFirst?bindMonitor:bindQueue)();await new Promise(resolve=>setImmediate(resolve));
+  const second=(monitorFirst?bindQueue:bindMonitor)();await new Promise(resolve=>setImmediate(resolve));
+  const observed=lookups;release();const replies=await Promise.all([first,second]);mock.mock.restore();
+  assert.equal(observed,1,'The other module must not validate the same tab while ownership is being claimed');
+  assert.equal(replies.filter(reply=>reply.ok).length,1);
+ }
 });

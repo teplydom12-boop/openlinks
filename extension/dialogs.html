@@ -1,0 +1,68 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>OpenLinks · Диалоги с поставщиками</title>
+  <link rel="stylesheet" href="dashboard.css"><link rel="stylesheet" href="dialogs-dashboard.css">
+</head>
+<body>
+  <aside class="sidebar">
+    <a class="brand" href="dashboard.html"><span class="brand-icon">↗</span> OpenLinks</a>
+    <p class="sidebar-label">РАБОЧЕЕ ПРОСТРАНСТВО</p>
+    <nav aria-label="Основная навигация">
+      <a class="nav" href="dashboard.html">▤ <span>Очередь поставщиков</span></a>
+      <a class="nav active" href="dialogs.html" aria-current="page">☷ <span>Диалоги с поставщиками</span></a>
+    </nav>
+    <div class="sidebar-bottom"><span class="live-dot"></span> История хранится в Chrome<p>Передача текста в OpenAI — только по кнопке создания черновика.</p></div>
+  </aside>
+  <main>
+    <header><div><div class="eyebrow">КОММУНИКАЦИЯ С ПОСТАВЩИКАМИ</div><h1>Диалоги с поставщиками</h1></div><div id="dialogs-run-state" class="state">Загрузка…</div></header>
+    <div id="dialogs-feedback" role="status" hidden></div>
+    <section class="panel dialogs-intro">
+      <div><h2>Мониторинг и черновики</h2><p>Этот блок читает чаты и помогает подготовить ответы. Он не вводит текст в чат и не отправляет сообщения. Очередь первичных обращений управляется отдельно.</p></div>
+      <div class="dialogs-monitor-controls"><div class="actions"><button id="dialogs-stop" class="button secondary" disabled>Остановить мониторинг</button><button id="dialogs-start" class="button primary" disabled>Начать мониторинг</button><button id="dialogs-scan" class="button secondary" disabled>Проверить сейчас</button></div><label class="check"><input id="dialogs-read-unread" type="checkbox" checked> Открывать диалоги с новыми сообщениями для чтения</label><p class="hint">Открытие переписки может снять отметку «непрочитано». При первом проходе могут открыться и прочитанные диалоги с превью. Сообщения не отправляются. Настройка применяется при запуске мониторинга; открываются только распознанные диалоги.</p></div>
+    </section>
+    <section aria-labelledby="dialogs-tabs-heading">
+      <div class="panel-heading"><h2 id="dialogs-tabs-heading">Три вкладки чатов</h2><button id="dialogs-refresh-tabs" class="link-button">Обновить список вкладок</button></div>
+      <p class="hint">Откройте центр сообщений каждой площадки в своём аккаунте и выберите его вкладку. Читается доступная на странице история; «непрочитано» в списке и «требует ответа» в открытой переписке — разные признаки.</p>
+      <div id="dialogs-bindings" class="dialogs-platforms"></div>
+    </section>
+    <section class="panel">
+      <div class="panel-heading"><h2>Переписки</h2><span id="dialogs-count" class="tiny-tag">0</span></div>
+      <div class="dialogs-filters"><div><label for="dialogs-filter">Показать</label><select id="dialogs-filter"><option value="all">Все переписки</option><option value="unanswered">Требуют ответа</option><option value="unread">Непрочитанные по данным площадки</option><option value="takeover">Под моим управлением</option><option value="paused">На паузе</option></select></div><div><label for="dialogs-search">Найти поставщика или сообщение</label><input id="dialogs-search" type="search" placeholder="Имя поставщика, площадка или текст"></div></div>
+      <div class="dialogs-workspace">
+        <div><div id="dialogs-list" class="dialogs-list" aria-label="Список переписок"></div><p id="dialogs-empty" class="hint">Загрузка переписок…</p></div>
+        <section id="dialogs-detail" class="dialogs-detail" hidden aria-label="Выбранная переписка">
+          <div class="panel-heading"><div><h3 id="dialogs-supplier"></h3><p id="dialogs-conversation-status" class="hint"></p></div><a id="dialogs-source" target="_blank" rel="noopener noreferrer" hidden>Открыть страницу ↗</a></div>
+          <div class="actions"><button id="dialogs-takeover" class="button secondary">Взять разговор на себя</button><button id="dialogs-mute" class="button secondary">Пауза для этой переписки</button></div>
+          <p id="dialogs-history-note" class="hint"></p>
+          <p id="dialogs-reader-detail" class="hint" role="status" hidden></p>
+          <div id="dialogs-history" class="dialogs-history" aria-label="История переписки"></div>
+          <div class="dialogs-draft">
+            <div class="panel-heading"><h3>Черновик ответа</h3><button id="dialogs-generate" class="button secondary" disabled>Подготовить ответ с ИИ</button></div>
+            <p id="dialogs-generate-hint" class="hint"></p><p id="dialogs-draft-reason" class="hint" hidden></p>
+            <label for="dialogs-draft-text">Текст для проверки и редактирования</label><textarea id="dialogs-draft-text" rows="6" maxlength="6000" placeholder="Здесь появится черновик. Его можно изменить и сохранить локально."></textarea>
+            <p id="dialogs-draft-status" class="hint" aria-live="polite"></p>
+            <div class="actions"><button id="dialogs-save-draft" class="button primary" disabled>Сохранить черновик</button><button id="dialogs-discard-draft" class="link-button danger" disabled>Удалить черновик</button></div>
+            <p class="hint">Сохранение черновика не отправляет сообщение поставщику.</p>
+          </div>
+        </section>
+        <div id="dialogs-select-hint" class="dialogs-select-hint">Выберите переписку, чтобы увидеть историю и подготовить ответ.</div>
+      </div>
+    </section>
+    <details class="panel dialogs-settings" open>
+      <summary>Задание для ИИ и подключение</summary>
+      <form id="dialogs-settings-form">
+        <label for="dialogs-brief">Задание по закупке</label><textarea id="dialogs-brief" rows="5" maxlength="12000" placeholder="Товар, характеристики, количество, что уточнить у продавца, какие условия допустимы и что нужно согласовать с вами."></textarea>
+        <div class="dialogs-form-grid"><div><label for="dialogs-wechat">Ваш WeChat (необязательно)</label><input id="dialogs-wechat" type="text" maxlength="256" placeholder="WeChat ID"></div><div><label for="dialogs-language">Язык ответа (необязательно)</label><input id="dialogs-language" type="text" maxlength="100" placeholder="Например: английский"></div></div>
+        <div class="dialogs-form-grid"><div><label for="dialogs-model">Модель OpenAI API</label><input id="dialogs-model" type="text" maxlength="200" autocomplete="off" placeholder="Название модели, доступной вашему API-аккаунту"></div><div><label for="dialogs-api-key">API-ключ OpenAI</label><input id="dialogs-api-key" type="password" autocomplete="off" spellcheck="false" placeholder="Введите ключ для сохранения или замены"><p id="dialogs-key-status" class="hint">Ключ не сохранён.</p><label class="check"><input id="dialogs-clear-key" type="checkbox"> Удалить сохранённый ключ</label></div></div>
+        <p class="hint">По кнопке «Подготовить ответ с ИИ» выбранная переписка, задание и WeChat передаются в OpenAI API. Это отдельный сервис с оплатой по условиям вашего API-аккаунта. Мониторинг сам запросы к ИИ не запускает. Ключ хранится локально в расширении и не попадает в журнал.</p>
+        <button id="dialogs-save-settings" class="button primary" type="submit" disabled>Сохранить задание и настройки</button>
+      </form>
+    </details>
+    <details class="panel"><summary>Журнал мониторинга</summary><p class="hint">Время показано в часовом поясе вашего компьютера. Журнал содержит действия и результаты проверок.</p><ol id="dialogs-events" class="dialogs-events"></ol><p id="dialogs-events-empty" class="hint">Событий пока нет.</p></details>
+    <details class="panel"><summary>Диагностика чтения страниц</summary><p class="hint">Если чат не распознаётся, можно сохранить его структуру для проверки. Диагностика ставит очередь первичных обращений на паузу; сообщения не отправляются. Файл может содержать переписку — не публикуйте его в GitHub или открытом доступе.</p><a id="dialogs-diagnostics" class="link-button" href="diagnostics.html" target="_blank" rel="noopener noreferrer">Открыть страницу диагностики ↗</a><p class="hint">Сбор начнётся только после нажатия «Сохранить диагностику» на открывшейся странице.</p></details>
+    <footer>OpenLinks · Мониторинг чатов без отправки сообщений</footer>
+  </main><script src="dialogs-dashboard.js" type="module"></script>
+</body>
+</html>

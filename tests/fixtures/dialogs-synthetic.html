@@ -1,0 +1,46 @@
+<!doctype html>
+<!-- Synthetic inbox structure. No captured account, supplier or message data. -->
+<meta charset="utf-8">
+<title>OpenLinks synthetic inbox</title>
+<style>
+  body { font:16px sans-serif; margin:20px; }
+  .columns { display:flex; gap:24px; }
+  aside { width:250px; }
+  .conversation-item { padding:8px; }
+  [data-chat-root] { width:480px; }
+  [data-message-history] { height:190px; overflow-y:auto; border:1px solid #ddd; }
+  .message-item { padding:8px; min-height:30px; }
+  textarea { width:350px; height:65px; }
+  iframe { width:350px; height:150px; }
+</style>
+<body data-account-id="synthetic-buyer">
+<div class="columns">
+  <aside>
+    <div class="conversation-item" data-thread-id="thread-active" data-unread="false">
+      <strong data-conversation-title>Supplier same name</strong><p data-message-preview>We have stock.</p>
+    </div>
+    <div class="conversation-item" data-thread-id="thread-other" data-unread-count="2">
+      <strong data-conversation-title>Supplier same name</strong><p data-message-preview>Second supplier preview only.</p>
+    </div>
+    <div class="conversation-item" data-unread="true">
+      <strong data-conversation-title>Missing identity</strong><p data-message-preview>Never invent a supplier ID.</p>
+    </div>
+  </aside>
+  <section data-chat-root data-thread-id="thread-active">
+    <h2 data-conversation-title>Supplier same name</h2>
+    <div data-message-history>
+      <div class="message-item outgoing" data-message-id="message-1" data-timestamp="2026-10-18T09:00:00Z">
+        <span data-message-text>Do you have model A?</span><time datetime="2026-10-18T09:00:00Z">09:00</time>
+      </div>
+      <div class="message-item incoming" data-message-id="message-2">
+        <span data-message-text>We have stock.</span><span class="message-status">Delivered</span>
+      </div>
+    </div>
+    <textarea>Untouched buyer draft</textarea><button id="send">Send</button>
+  </section>
+</div>
+<script>
+window.readerSideEffects={click:0,input:0,change:0,submit:0,focus:0};
+for(const key of Object.keys(readerSideEffects))document.addEventListener(key,event=>{readerSideEffects[key]++;if(key==='submit')event.preventDefault();},true);
+</script>
+</body>

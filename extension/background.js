@@ -4,6 +4,8 @@ import './routes-1688-shared.js';
 import './supplier-chat.js';
 import {activate1688} from './lib/native-input.js';
 import {localTimestamp} from './lib/time.js';
+import {installDialogMonitor,isMonitoredTab} from './dialog-monitor.js';
+import {withTabOwnership} from './lib/tab-ownership.js';
 const {makeRule,mergeRule}=globalThis.OpenLinksRules;
 const routes1688=globalThis.OpenLinks1688;
 const supplierChat=globalThis.OpenLinksSupplierChat;
@@ -53,12 +55,20 @@ async function frames(job) {
     try { return classify(frame.url).platform === job.platform; } catch { return false; }
   });
 }
+async function assertOutreachTab(tabId) {
+  if(await isMonitoredTab(tabId))throw new Error('Вкладка закреплена за мониторингом диалогов. Для очереди выберите отдельную вкладку.');
+}
 async function call(job, frameId, type, extra = {}) {
+  // Observation, stopping an existing opener, and releasing an input marker are
+  // safe on a reserved inbox. All queue commands that change it are blocked.
+  if(!['PROBE','CHAT_READY','STOP_OPEN_CHAT','PICK_STOP','CAN_CLOSE'].includes(type) &&
+    !(type==='NATIVE_INPUT' && extra.stage==='release'))await assertOutreachTab(job.tabId);
   return chrome.tabs.sendMessage(job.tabId, {
     type, jobId:job.id, message:job.message, profile:job.profile, ...extra,
   }, {frameId});
 }
 async function prepareChat(state,job) {
+  await assertOutreachTab(job.tabId);
   if(job.platform==='1688') {
     const tab=await chrome.tabs.get(job.tabId);
     if(tab.status==='loading' || tab.pendingUrl)return {ok:false,waiting:true,reason:'Жду полной загрузки вкладки 1688',waitMs:1000};
@@ -118,7 +128,11 @@ async function retryFailure(state,job,reason,stage='chat') {
 }
 async function scheduleClose(state,job) {
   if(job.needsTabCheck || !Number.isInteger(job.tabId) || !Number.isInteger(job.frameId) || !job.reviewUrl)return;
+  return withTabOwnership(job.tabId,()=>scheduleOwnedClose(state,job));
+}
+async function scheduleOwnedClose(state,job) {
   try {
+    await assertOutreachTab(job.tabId);
     const tab=await chrome.tabs.get(job.tabId);
     if(classify(tab.url).platform!==job.platform || tab.pendingUrl)return;
     const closing={token:crypto.randomUUID(),jobId:job.id,tabId:job.tabId,frameId:job.frameId,pageUrl:job.reviewUrl,topUrl:tab.url,url:job.url,at:job.finishedAt+10000};
@@ -142,6 +156,9 @@ async function scheduleClose(state,job) {
 async function closeChat(token,sender) {
   const state=await load(),closing=state.pendingClosures?.find(item=>item.token===token);
   if(!closing)return {ok:false};
+  return withTabOwnership(closing.tabId,()=>closeOwnedChat(state,closing,token,sender));
+}
+async function closeOwnedChat(state,closing,token,sender) {
   if(sender && (sender.tab?.id!==closing.tabId || sender.frameId!==closing.frameId || sender.url!==closing.pageUrl))return {ok:false};
   if(Date.now()<closing.at){await chrome.alarms.create(CLOSE_PREFIX+token,{when:closing.at});return {ok:false};}
   const job=state.queue.find(item=>item.id===closing.jobId) || {id:closing.jobId,url:closing.url};
@@ -149,6 +166,7 @@ async function closeChat(token,sender) {
   // Consume before closing: duplicate alarms/messages cannot close a reused tab.
   await save(state);
   try {
+    await assertOutreachTab(closing.tabId);
     if(state.queue.some(item=>item.tabId===closing.tabId && !FINAL.has(item.status)))throw new Error('Вкладка используется другой задачей');
     const tab=await chrome.tabs.get(closing.tabId);
     if(tab.url!==closing.topUrl || tab.pendingUrl)throw new Error('Адрес вкладки изменился');
@@ -158,6 +176,7 @@ async function closeChat(token,sender) {
       const top=await chrome.tabs.sendMessage(closing.tabId,{type:'CAN_CLOSE',token},{frameId:0});
       if(!top?.ok)throw new Error('Вы продолжили работу на основной странице');
     }
+    await assertOutreachTab(closing.tabId);
     await chrome.tabs.remove(closing.tabId);
     event(state,'chat_closed',job,'Прошло 10 секунд после отправки; вкладка чата закрыта.');
   } catch(error) {event(state,'chat_close_cancelled',job,'Вкладка оставлена открытой: '+error.message,'observation');}
@@ -168,7 +187,8 @@ async function closeSkippedTabs(state,job) {
   state.pendingClosures=(state.pendingClosures || []).filter(item=>item.jobId!==job.id);
   await save(state);
   for(const tabId of tabIds) {
-    try {
+    await withTabOwnership(tabId,async()=>{try {
+      await assertOutreachTab(tabId);
       if(job.needsTabCheck)throw new Error('После перезапуска вкладка ещё не привязана заново');
       if(state.queue.some(item=>item.id!==job.id && !FINAL.has(item.status) && [item.tabId,item.supplierTabId].includes(tabId)))
         throw new Error('Вкладка используется другой задачей');
@@ -189,11 +209,12 @@ async function closeSkippedTabs(state,job) {
       if((tab.url && tab.url!=='about:blank' && !matches(tab.url)) ||
         (tab.pendingUrl && !matches(tab.pendingUrl)) || (!matches(tab.url) && !matches(tab.pendingUrl)))
         throw new Error('Вкладка больше не открыта на странице этого поставщика');
+      await assertOutreachTab(tabId);
       await chrome.tabs.remove(tabId);
       event(state,'skip_tab_closed',job,`Пропущено пользователем; вкладка ${tabId} закрыта сразу.`);
     } catch(error) {
       event(state,'skip_tab_kept',job,`Пропуск сохранён; вкладка ${tabId} не закрыта: ${error.message}`,'observation');
-    }
+    }});
   }
   await save(state);
 }
@@ -476,7 +497,7 @@ async function tick() {
       const target=routes1688.route(storefront.chatRoute);learned=rememberChat(state,job,target,'pageData текущей витрины');
       if(job.status==='visiting') {
         job.status='contacting';job.chatOpened=true;job.stepAt=Date.now();event(state,'direct_chat',job,'В данных текущей витрины найден адрес получателя. Открываю веб-чат напрямую без поиска кнопки 客服.');
-        await save(state);await chrome.tabs.update(job.tabId,{url:target});return;
+        await save(state);await assertOutreachTab(job.tabId);await chrome.tabs.update(job.tabId,{url:target});return;
       }
     }
     const observed=[...new Set(results.map(result=>routes1688.route(result.pageUrl)).filter(Boolean))];
@@ -527,7 +548,7 @@ async function tick() {
         try {
           if (classify(contact.href).platform !== job.platform) throw new Error('Другая площадка');
           rememberChat(state,job,contact.href,'ссылка штатной кнопки чата');await save(state);
-          await chrome.tabs.update(job.tabId, {url:contact.href});
+          await assertOutreachTab(job.tabId);await chrome.tabs.update(job.tabId, {url:contact.href});
         } catch { await retryFailure(state,job,'Не удалось открыть ссылку чата поддерживаемой площадки.','contact'); }
       } else {
         const reply = await call(job, contact.frameId, 'CONTACT');
@@ -562,6 +583,7 @@ async function dispatch(message, sender) {
     if(!job || !supplierChat.supports(job.platform) || !state.running || job.status!=='contacting' || job.chatOpened ||
       opening?.status!=='opening' || message.jobId!==job.id || message.token!==opening.token || sender.tab?.id!==opening.tabId || sender.frameId!==opening.frameId || classify(sender.url).platform!==job.platform)return {ok:false};
     if(message.phase==='attempt') {
+      await assertOutreachTab(opening.tabId);
       const now=Date.now();
       if(message.attempt!==opening.attempts+1 || message.attempt>supplierChat.MAX_ATTEMPTS || now-opening.at>=supplierChat.TIMEOUT_MS ||
         (opening.lastClick && now-opening.lastClick<supplierChat.RETRY_MS))return {ok:false};
@@ -610,6 +632,7 @@ async function dispatch(message, sender) {
     await alarm(Date.now()+1000);return {ok:true};
   }
   if (message.type === 'PAGE_READY') {
+    if(await isMonitoredTab(sender.tab?.id))return {ok:true};
     const state = await load();
     const job = state.queue.find(j => j.id === state.activeId);
     if(sender.tab?.id && sender.frameId===0 && routes1688.storeKey(sender.url) && routes1688.route(message.chatRoute)) {
@@ -688,15 +711,18 @@ async function dispatch(message, sender) {
     }
     case 'BIND_TAB': {
       if(!job || job.status==='sending' || FINAL.has(job.status))throw new Error('Нет задачи для привязки');
-      const tab=await chrome.tabs.get(Number(message.tabId));
-      if(classify(tab.url).platform!==job.platform)throw new Error('Вкладка другой площадки');
-      if(job.needsTabCheck && job.supplierTabId!==tab.id)delete job.supplierTabId;
-      await stopLearning(state,job);job.tabId=tab.id;
-      job.boundTabUrl=tab.url;
-      if(supplierChat.supports(job.platform)){delete job.chatOpening;job.chatOpened=false;}
-      if(job.status!=='uncertain'){job.status='contacting';job.stepAt=Date.now();job.reason='';state.running=true;}
-      delete job.needsTabCheck;
-      rememberChat(state,job,tab.url);event(state,'chat_tab',job,'Вкладка явно выбрана пользователем. Проверьте получателя.');await save(state);await alarm(Date.now()+1000);return {ok:true};
+      return withTabOwnership(Number(message.tabId),async()=>{
+        const tab=await chrome.tabs.get(Number(message.tabId));
+        await assertOutreachTab(tab.id);
+        if(classify(tab.url).platform!==job.platform)throw new Error('Вкладка другой площадки');
+        if(job.needsTabCheck && job.supplierTabId!==tab.id)delete job.supplierTabId;
+        await stopLearning(state,job);job.tabId=tab.id;
+        job.boundTabUrl=tab.url;
+        if(supplierChat.supports(job.platform)){delete job.chatOpening;job.chatOpened=false;}
+        if(job.status!=='uncertain'){job.status='contacting';job.stepAt=Date.now();job.reason='';state.running=true;}
+        delete job.needsTabCheck;
+        rememberChat(state,job,tab.url);event(state,'chat_tab',job,'Вкладка явно выбрана пользователем. Проверьте получателя.');await save(state);await alarm(Date.now()+1000);return {ok:true};
+      });
     }
     case 'MARK_SENT':
       if (!job || job.status !== 'uncertain') throw new Error('Нет неподтверждённой отправки');
@@ -743,6 +769,7 @@ async function dispatch(message, sender) {
   }
 }
 chrome.runtime.onMessage.addListener((message,sender,respond) => {
+  if(typeof message?.type==='string' && message.type.startsWith('DIALOGS_'))return;
   exclusive(()=>dispatch(message,sender)).then(respond,error=>respond({ok:false,error:error.message}));
   return true;
 });
@@ -789,18 +816,23 @@ async function reconcile1688Chat(state,job) {
   // unrelated chat is eligible only when its recipient matches this store's cache.
   const expected=routes1688.cached(state.chatRoutes,job.url);
   const tabs=await chrome.tabs.query({url:'https://air.1688.com/*'}).catch(()=>[]);
-  const candidates=tabs.filter(tab=>{
+  const candidates=[];
+  for(const tab of tabs) {
     const url=tab.pendingUrl || tab.url,route=routes1688.route(url);
-    if(tab.id===job.tabId || job.ignoredPopupIds?.includes(tab.id) || !routes1688.isMessenger(url))return false;
-    if(expected && route && expected!==route)return false;
+    if(tab.id===job.tabId || job.ignoredPopupIds?.includes(tab.id) || !routes1688.isMessenger(url))continue;
+    if(expected && route && expected!==route)continue;
     const related=(tab.openerTabId!==undefined && [job.tabId,job.supplierTabId].includes(tab.openerTabId)) || job.popupCandidates?.includes(tab.id);
-    return related || (expected && route===expected);
-  });
+    if((related || (expected && route===expected)) && !await isMonitoredTab(tab.id))candidates.push(tab);
+  }
   if(candidates.length===1 && await adoptChatTab(state,candidates[0],true))return;
   const list=await frames(job).catch(()=>[]);
   if(list.some(frame=>routes1688.isMessenger(frame.url)))await note1688Chat(state,job);
 }
 async function adoptChatTab(state,tab,allowKnownRecipient=false) {
+  return withTabOwnership(tab.id,()=>adoptOwnedChatTab(state,tab,allowKnownRecipient));
+}
+async function adoptOwnedChatTab(state,tab,allowKnownRecipient=false) {
+  if(await isMonitoredTab(tab.id))return;
   const job=state.queue.find(j=>j.id===state.activeId);
   if(!job || !['contacting','visiting','blocked','review','retry_wait'].includes(job.status))return;
   if(tab.id===job.tabId) {
@@ -902,3 +934,4 @@ chrome.action.onClicked.addListener(async()=>{
   if(tabs[0]) { await chrome.tabs.update(tabs[0].id,{active:true}); await chrome.windows.update(tabs[0].windowId,{focused:true}); }
   else await chrome.windows.create({url,type:'popup',width:1240,height:900});
 });
+installDialogMonitor();

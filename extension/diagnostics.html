@@ -1,0 +1,17 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>OpenLinks · Диагностика чтения чатов</title>
+  <style>
+    body{font:16px/1.55 system-ui,sans-serif;max-width:780px;margin:48px auto;padding:0 24px;color:#192d3b;background:#f7fafb}main{background:white;padding:28px;border:1px solid #dce5ea;border-radius:14px}h1{font-size:25px;margin-top:0}button{font:inherit;padding:10px 18px;background:#175e68;color:white;border:0;border-radius:7px;cursor:pointer}button:disabled{opacity:.55;cursor:wait}p{margin:14px 0}#status{white-space:pre-line}small{color:#526773}
+  </style>
+</head>
+<body><main>
+  <h1>Диагностика чтения чатов</h1>
+  <p id="read-only-description">Сначала очередь рассылки ставится на паузу. Затем сохраняется структура уже открытых страниц 1688, Alibaba и Made-in-China. Сообщения не отправляются, поля и выбранные диалоги не меняются.</p>
+  <p id="mode"></p><p id="status" role="status" aria-live="polite">Готово к проверке.</p>
+  <button id="run" type="button">Сохранить диагностику</button>
+  <p><small>Результат — один файл .json.gz в загрузках Chrome. Он может содержать текст видимой переписки. Значения полей, пароли и параметры авторизации исключаются. Страница не показывает переписку в журнале.</small></p>
+</main><script src="diagnostics.js" type="module"></script></body>
+</html>

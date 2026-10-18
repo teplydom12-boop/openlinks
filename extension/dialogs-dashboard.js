@@ -1,0 +1,95 @@
+import {displayTime} from './lib/time.js';
+
+const $=selector=>document.querySelector(selector);
+const PLATFORMS={'1688':'1688',alibaba:'Alibaba',mic:'Made-in-China'};
+const STATUS={unbound:['Не выбрана',''],ready:['Чат доступен','good'],ok:['Чат доступен','good'],observing:['Мониторинг','good'],scanning:['Проверка…',''],loading:['Загрузка…',''],unsupported:['Страница не распознана','warn'],partial:['Прочитана часть данных','warn'],closed:['Вкладка закрыта','bad'],missing:['Вкладка не найдена','bad'],error:['Ошибка проверки','bad'],blocked:['Нужно вмешательство','warn'],login:['Нужен вход','warn'],captcha:['Проверка площадки','warn'],paused:['Мониторинг остановлен',''],stale:['Данные устарели','warn'],idle:['Ожидает проверки','']};
+let state=null, ai={model:'',keyStored:false}, tabs=[], selectedKey=null, settingsDirty=false, readUnreadDirty=false, loading=false, generating=new Set(), historySignature='';
+const tabChoices=new Map(), edits=new Map(), busy=new Set();
+
+function node(tag,text,className){const el=document.createElement(tag);if(text!==undefined)el.textContent=text;if(className)el.className=className;return el;}
+function feedback(text,error=false){const el=$('#dialogs-feedback');el.textContent=text;el.classList.toggle('error',error);el.hidden=!text;}
+function chosen(){return state?.conversations?.[selectedKey]||null;}
+function date(at){return at==null?'Время не указано':displayTime(at);}
+function safeUrl(value){try{const u=new URL(value);return u.protocol==='https:'&&!u.username&&!u.password&&!u.port&&/(^|\.)(1688\.com|alibaba\.com|made-in-china\.com)$/.test(u.hostname)?u.href:null;}catch{return null;}}
+async function command(type,payload={}){const result=await chrome.runtime.sendMessage({type:'DIALOGS_'+type,...payload});if(!result?.ok)throw new Error(result?.error||'Расширение не ответило. Перезагрузите эту страницу.');return result;}
+function adopt(result){if(result.state)state=result.state;if(result.ai)ai=result.ai;render();}
+async function refresh(){if(loading)return;loading=true;try{adopt(await command('GET'));}catch(error){feedback(error.message,true);}finally{loading=false;}}
+async function act(name,payload={},message=''){const result=await command(name,payload);if(result.state)adopt(result);else await refresh();if(message)feedback(message);return result;}
+function action(selector,handler){$(selector).addEventListener('click',async()=>{if(busy.has(selector))return;busy.add(selector);$(selector).disabled=true;try{await handler();}catch(error){feedback(error.message,true);}finally{busy.delete(selector);$(selector).disabled=false;if(state)render();}});}
+function makeButton(label,handler,className='button secondary'){const button=node('button',label,className);button.type='button';button.addEventListener('click',async()=>{button.disabled=true;try{await handler();}catch(error){feedback(error.message,true);}finally{if(button.isConnected)button.disabled=false;}});return button;}
+function threadFlags(conversation){const result=[];if(conversation.takeover)result.push(['Под вашим управлением','']);if(conversation.paused)result.push(['На паузе','']);if(conversation.unanswered)result.push(['Требует ответа','warn']);if(conversation.unread===true||Number(conversation.unread)>0)result.push(['Непрочитано на площадке','warn']);if(conversation.needsRead)result.push([conversation.messages?.length||readerDetail(conversation)?'Нужна проверка истории':'Нужно открыть историю','']);if(conversation.draft)result.push([conversation.draft.status==='stale'?'Черновик устарел':'Есть черновик',conversation.draft.status==='stale'?'warn':'good']);return result;}
+function canDraft(conversation){return !!conversation&&conversation.unanswered&&conversation.identityReliable&&conversation.orderReliable&&conversation.tailKnown&&!conversation.needsRead&&!conversation.paused&&!conversation.takeover;}
+function readerDetail(conversation){return typeof conversation?.detail==='string'?conversation.detail.trim().slice(0,1200):'';}
+function draftBlockReason(conversation){
+  if(!conversation)return 'Выберите переписку.';
+  if(conversation.takeover)return 'Вы взяли разговор на себя. Подготовка ответа с ИИ приостановлена.';
+  if(conversation.paused)return 'Переписка на паузе.';
+  if(!conversation.identityReliable)return readerDetail(conversation)||'Пока не удалось надёжно определить поставщика.';
+  if(!conversation.orderReliable||!conversation.tailKnown||conversation.needsRead)return readerDetail(conversation)||'Нужна достоверная последняя часть переписки. Откройте её в выбранной вкладке и повторите проверку.';
+  if(!conversation.unanswered)return 'В доступной истории нет подтверждённого сообщения продавца, требующего ответа.';
+  if(!state.settings?.brief?.trim())return 'Сохраните задание по закупке ниже.';
+  if(!ai.model?.trim()||!ai.keyStored)return 'Укажите модель и сохраните API-ключ OpenAI в настройках ниже.';
+  return 'По нажатию история этой переписки и задание будут переданы в OpenAI. Ответ останется здесь как черновик.';
+}
+
+function renderBindings(){const container=$('#dialogs-bindings');container.replaceChildren();for(const [platform,label] of Object.entries(PLATFORMS)){const binding=state?.bindings?.[platform]||{},card=node('section',undefined,'panel dialogs-platform'),heading=node('div',undefined,'panel-heading');card.dataset.platform=platform;const [status,tone]=STATUS[binding.status]||['Статус проверки: '+(binding.status||'ожидание'),'warn'];heading.append(node('h3',label),node('span',status,'dialogs-status '+tone));const select=node('select');select.id='dialogs-tab-'+platform;select.setAttribute('aria-label','Вкладка '+label);select.append(new Option('Выберите открытую вкладку',''));const options=tabs.filter(tab=>tab.platform===platform);if(binding.tabId!=null&&!options.some(tab=>tab.id===binding.tabId))options.unshift({id:binding.tabId,title:'Сохранённая вкладка',url:binding.url});for(const tab of options)select.append(new Option((tab.title||tab.url||'Вкладка')+' · '+(tab.url||''),String(tab.id)));const choice=tabChoices.get(platform);select.value=choice!=null&&options.some(tab=>String(tab.id)===choice)?choice:(binding.tabId==null?'':String(binding.tabId));select.addEventListener('change',()=>tabChoices.set(platform,select.value));const controls=node('div',undefined,'actions');const bind=makeButton('Выбрать',async()=>{const value=select.value;if(!value)throw new Error('Сначала выберите открытую вкладку '+label+'.');await act('BIND_TAB',{platform,tabId:Number(value)},'Вкладка '+label+' выбрана.');});const scan=makeButton('Проверить',()=>act('SCAN',{platform},'Проверка '+label+' завершена.'));const remove=makeButton('Отвязать',async()=>{tabChoices.delete(platform);await act('UNBIND_TAB',{platform},'Вкладка '+label+' отключена от мониторинга.');},'link-button');bind.disabled=!state;scan.disabled=!state||binding.tabId==null;remove.disabled=binding.tabId==null;controls.append(bind,scan,remove);card.append(heading,select,controls,node('p',binding.detail||(binding.tabId==null?'Выберите вкладку центра сообщений.':'Ожидание проверки выбранной вкладки.'),'hint'),node('p','Последняя проверка: '+(binding.checkedAt==null?'ещё не выполнялась':date(binding.checkedAt)),'hint'));container.append(card);}}
+function filteredConversations(){const query=$('#dialogs-search').value.trim().toLocaleLowerCase(),filter=$('#dialogs-filter').value;return Object.values(state?.conversations||{}).filter(item=>{if(filter==='unanswered'&&!item.unanswered)return false;if(filter==='unread'&&!(item.unread===true||Number(item.unread)>0))return false;if(filter==='takeover'&&!item.takeover)return false;if(filter==='paused'&&!item.paused)return false;const haystack=[item.title,item.platform,PLATFORMS[item.platform],item.url,item.preview,...(item.messages||[]).map(m=>m.text)].filter(Boolean).join(' ').toLocaleLowerCase();return !query||haystack.includes(query);}).sort((a,b)=>Number(b.unanswered)-Number(a.unanswered)||(b.updatedAt||0)-(a.updatedAt||0)||a.key.localeCompare(b.key));}
+function renderList(){const conversations=filteredConversations(),all=Object.values(state?.conversations||{}),list=$('#dialogs-list');$('#dialogs-count').textContent=all.length+' · требуют ответа: '+all.filter(c=>c.unanswered).length;list.replaceChildren();for(const conversation of conversations){const button=node('button',undefined,'dialogs-thread'+(conversation.key===selectedKey?' selected':''));button.type='button';button.dataset.key=conversation.key;button.setAttribute('aria-pressed',String(conversation.key===selectedKey));button.append(node('strong',conversation.title||'Поставщик не определён'),node('p',(PLATFORMS[conversation.platform]||conversation.platform)+' · '+date(conversation.updatedAt),'hint'));const last=(conversation.messages||[]).at(-1);button.append(node('div',last?.text||conversation.preview||'История ещё не прочитана','dialogs-preview'));const flags=node('div',undefined,'dialogs-thread-flags');for(const [label,tone] of threadFlags(conversation))flags.append(node('span',label,'dialogs-status '+tone));button.append(flags);button.addEventListener('click',()=>{selectedKey=conversation.key;historySignature='';renderList();renderDetail();});list.append(button);}$('#dialogs-empty').hidden=conversations.length>0;$('#dialogs-empty').textContent=all.length?'Переписок с такими условиями нет.':'Выберите вкладки и запустите проверку. Здесь появятся прочитанные переписки и доступный список чатов.';}
+function renderHistory(conversation){const signature=JSON.stringify([conversation.key,conversation.messages,readerDetail(conversation)]);if(signature===historySignature)return;historySignature=signature;const history=$('#dialogs-history');history.replaceChildren();for(const message of conversation.messages||[]){const block=node('div',undefined,'dialogs-message '+message.direction),label={inbound:'Поставщик',outbound:'Вы',unknown:'Автор не определён',system:'Система'}[message.direction]||'Автор не определён';block.append(node('p',label+' · '+date(message.at),'dialogs-message-meta'),node('p',message.text||''));history.append(block);}if(!conversation.messages?.length)history.append(node('p',readerDetail(conversation)||'Список чатов обнаружен, но история этой переписки ещё не прочитана. Откройте её на площадке и нажмите «Проверить».','hint'));history.scrollTop=history.scrollHeight;}
+function renderDetail(){
+  const conversation=chosen();
+  $('#dialogs-detail').hidden=!conversation;
+  $('#dialogs-select-hint').hidden=!!conversation;
+  if(!conversation)return;
+  $('#dialogs-supplier').textContent=conversation.title||'Поставщик не определён';
+  $('#dialogs-conversation-status').textContent=[PLATFORMS[conversation.platform],...threadFlags(conversation).map(([label])=>label)].filter(Boolean).join(' · ');
+  const url=safeUrl(conversation.url),link=$('#dialogs-source');
+  link.hidden=!url;
+  if(url)link.href=url;else link.removeAttribute('href');
+  $('#dialogs-takeover').textContent=conversation.takeover?'Вернуть подготовку черновиков':'Взять разговор на себя';
+  $('#dialogs-mute').textContent=conversation.paused?'Снять паузу переписки':'Пауза для этой переписки';
+  const detail=readerDetail(conversation);
+  $('#dialogs-reader-detail').textContent=detail;
+  $('#dialogs-reader-detail').hidden=!detail;
+  $('#dialogs-history-note').hidden=!!detail;
+  $('#dialogs-history-note').textContent=conversation.orderReliable&&conversation.tailKnown&&!conversation.needsRead?'Показана доступная на странице история. Последнее сообщение определено.':'История неполная или порядок сообщений не подтверждён. По одному значку «непрочитано» ответ не создаётся.';
+  renderHistory(conversation);
+  const edit=edits.get(conversation.key),draft=conversation.draft;
+  $('#dialogs-draft-text').value=edit?edit.text:(draft?.text||'');
+  $('#dialogs-draft-reason').hidden=!draft?.reason;
+  $('#dialogs-draft-reason').textContent=draft?.reason||'';
+  const stale=edit&&(edit.revision!==conversation.revision||edit.fingerprint!==conversation.fingerprint);
+  $('#dialogs-draft-status').textContent=stale?'Переписка изменилась после начала редактирования. Проверьте новые сообщения; устаревший черновик не будет сохранён.':edit?'Есть несохранённые изменения.':draft?.status==='stale'?'Черновик устарел: в переписке появились изменения.':draft?'Сохранён локально: '+date(draft.createdAt):'Черновик ещё не создан.';
+  const ready=canDraft(conversation);
+  $('#dialogs-generate-hint').textContent=draftBlockReason(conversation);
+  $('#dialogs-generate').textContent=generating.has(conversation.key)?'Подготовка ответа…':'Подготовить ответ с ИИ';
+  $('#dialogs-generate').disabled=!ready||!state.settings?.brief?.trim()||!ai.model?.trim()||!ai.keyStored||generating.has(conversation.key);
+  $('#dialogs-save-draft').disabled=!ready||!edit?.text.trim()||!!stale||generating.has(conversation.key);
+  $('#dialogs-discard-draft').disabled=(!edit&&!draft)||generating.has(conversation.key);
+  $('#dialogs-draft-text').disabled=!ready||generating.has(conversation.key);
+  for(const id of busy)if($(id))$(id).disabled=true;
+}
+function renderSettings(){if(!settingsDirty){$('#dialogs-brief').value=state.settings?.brief||'';$('#dialogs-wechat').value=state.settings?.wechat||'';$('#dialogs-language').value=state.settings?.language||'';$('#dialogs-model').value=ai.model||'';}$('#dialogs-key-status').textContent=ai.keyStored?'Ключ сохранён. Его значение не показывается.':'Ключ не сохранён.';$('#dialogs-save-settings').disabled=busy.has('#dialogs-save-settings');}
+function renderEvents(){const events=state.events||[],list=$('#dialogs-events');list.replaceChildren();for(const event of [...events].slice(-100).reverse()){const item=node('li'),at=event.at??event.time;item.append(node('time',date(at)),node('span',[(PLATFORMS[event.platform]||event.platform),event.detail||event.message||event.type||event.event].filter(Boolean).join(' · ')));list.append(item);}$('#dialogs-events-empty').hidden=events.length>0;}
+function render(){if(!state)return;const bound=Object.values(state.bindings||{}).some(binding=>binding.tabId!=null);$('#dialogs-run-state').textContent=state.running?'Мониторинг работает':'Мониторинг остановлен';$('#dialogs-run-state').classList.toggle('running',!!state.running);$('#dialogs-start').disabled=!!state.running||!bound;$('#dialogs-stop').disabled=!state.running;$('#dialogs-scan').disabled=!bound;if(state.running||!readUnreadDirty)$('#dialogs-read-unread').checked=state.readUnread!==false;$('#dialogs-read-unread').disabled=!!state.running;renderBindings();renderList();renderDetail();renderSettings();renderEvents();for(const id of busy)if($(id))$(id).disabled=true;}
+async function refreshTabs(){const result=await command('LIST_TABS');tabs=result.tabs||[];renderBindings();}
+
+action('#dialogs-refresh-tabs',refreshTabs);
+action('#dialogs-start',async()=>{await act('START',{readUnread:$('#dialogs-read-unread').checked},'Мониторинг запущен. Отправка сообщений отключена.');readUnreadDirty=false;});
+$('#dialogs-read-unread').addEventListener('change',()=>{readUnreadDirty=true;});
+action('#dialogs-stop',()=>act('STOP',{},'Мониторинг остановлен.'));
+action('#dialogs-scan',()=>act('SCAN',{},'Проверка выбранных вкладок завершена.'));
+action('#dialogs-takeover',()=>{const item=chosen();return act('CONTROL',{key:item.key,takeover:!item.takeover},item.takeover?'Подготовка черновиков снова доступна.':'Разговор под вашим управлением. ИИ-черновики для него приостановлены.');});
+action('#dialogs-mute',()=>{const item=chosen();return act('CONTROL',{key:item.key,paused:!item.paused},item.paused?'Пауза переписки снята.':'Переписка поставлена на паузу.');});
+action('#dialogs-save-draft',async()=>{const item=chosen(),edit=edits.get(item.key);if(!edit)return;await act('SAVE_DRAFT',{key:item.key,text:edit.text,revision:edit.revision,fingerprint:edit.fingerprint},'Черновик сохранён локально.');edits.delete(item.key);});
+action('#dialogs-discard-draft',async()=>{const item=chosen();await act('DISCARD_DRAFT',{key:item.key},'Черновик удалён.');edits.delete(item.key);});
+// Request optional access in the click's user gesture; polling never calls the AI.
+$('#dialogs-generate').addEventListener('click',async()=>{const item=chosen();if(!canDraft(item)||generating.has(item.key))return;const key=item.key;generating.add(key);renderDetail();try{const granted=await chrome.permissions.request({origins:['https://api.openai.com/*']});if(!granted)throw new Error('Доступ к OpenAI API не разрешён. Мониторинг продолжает работать.');await act('GENERATE_DRAFT',{key},'Черновик подготовлен. Проверьте его перед дальнейшим использованием.');edits.delete(key);}catch(error){feedback(error.message,true);}finally{generating.delete(key);renderDetail();}});
+$('#dialogs-draft-text').addEventListener('input',()=>{const item=chosen();if(!item)return;const previous=edits.get(item.key);edits.set(item.key,{text:$('#dialogs-draft-text').value,revision:previous?.revision??item.revision,fingerprint:previous?.fingerprint??item.fingerprint});renderDetail();});
+$('#dialogs-filter').addEventListener('change',renderList);$('#dialogs-search').addEventListener('input',renderList);
+$('#dialogs-settings-form').addEventListener('input',()=>{settingsDirty=true;});
+$('#dialogs-settings-form').addEventListener('submit',async event=>{event.preventDefault();if(busy.has('#dialogs-save-settings'))return;busy.add('#dialogs-save-settings');$('#dialogs-save-settings').disabled=true;try{const apiKey=$('#dialogs-api-key').value.trim(),clearApiKey=$('#dialogs-clear-key').checked;if(apiKey&&clearApiKey)throw new Error('Для замены ключа снимите отметку «Удалить сохранённый ключ».');const payload={settings:{brief:$('#dialogs-brief').value,wechat:$('#dialogs-wechat').value,language:$('#dialogs-language').value},model:$('#dialogs-model').value.trim()};if(apiKey)payload.apiKey=apiKey;if(clearApiKey)payload.clearApiKey=true;const result=await command('SETTINGS',payload);settingsDirty=false;$('#dialogs-api-key').value='';$('#dialogs-clear-key').checked=false;adopt(result);feedback('Задание и настройки сохранены.');}catch(error){feedback(error.message,true);}finally{busy.delete('#dialogs-save-settings');if(state)render();}});
+chrome.storage.onChanged.addListener((changes,area)=>{if(area==='local'&&Object.keys(changes).some(key=>/dialog/i.test(key)))refresh();});
+Promise.allSettled([refresh(),refreshTabs()]).then(results=>{for(const result of results)if(result.status==='rejected')feedback(result.reason?.message||'Не удалось получить список вкладок.',true);});
+setInterval(()=>{if(!document.hidden)refresh();},5000);
+document.addEventListener('visibilitychange',()=>{if(!document.hidden)refresh();});

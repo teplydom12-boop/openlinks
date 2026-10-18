@@ -1,0 +1,32 @@
+<!doctype html>
+<!-- Synthetic data using sidebar class names observed in the user's 1688 DOM.
+     All account/thread IDs, names, previews and messages below are invented. -->
+<meta charset=utf-8>
+<style>
+body {font:16px sans-serif;}
+.ww_conversation_list {width:280px;}
+.conversation-item {padding:12px;border:1px solid #ccc;}
+.avatar-img,.headPic {width:32px;height:32px;}
+.avatar-unread {width:22px;height:22px;}
+pre.edit {width:360px;min-height:50px;border:1px solid #ccc;}
+</style>
+<div class=ww_conversation_list><div class=conversation-list-panel>
+ <div class=conversation-item id="900000001.1-900000002.1#11152@cntaobao">
+  <div class=avatar><img class=avatar-img src="data:image/png;base64,c3ludGhldGlj"><div class=avatar-unread>1</div></div>
+  <div class=content><div class=conversation><div class=name>Synthetic supplier</div></div>
+   <div class=conversation-secondary-line><div class=desc>Do you need a sample?</div></div></div>
+ </div>
+ <div class=conversation-item id="900000001.1-900000003.1#11152@cntaobao">
+  <div class=avatar></div>
+  <div class=content><div class=conversation><div class=name>Another synthetic supplier</div></div>
+   <div class=conversation-secondary-line><div class=desc>Old message preview</div></div></div>
+ </div>
+</div></div>
+<div class=ww_box><div class=message-list><div class=message-list-empty>No conversation selected</div></div></div>
+<div class=ww_input><pre class=edit contenteditable=true></pre><button id=send>Send</button></div>
+<script>
+window.readerSideEffects={click:0,input:0,change:0,submit:0,focus:0};
+for(const key of Object.keys(readerSideEffects))document.addEventListener(key,event=>{readerSideEffects[key]++;if(key==='submit')event.preventDefault();},true);
+window.selectedThreads=[];
+for(const row of document.querySelectorAll('.conversation-item'))row.addEventListener('click',()=>{selectedThreads.push(row.id);row.classList.add('active');});
+</script>

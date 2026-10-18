@@ -1,0 +1,25 @@
+<!doctype html>
+<!-- Synthetic MIC sidebar following observed class/id patterns. All values invented. -->
+<meta charset=utf-8>
+<style>body{font:16px sans-serif}.lst-item{width:330px;padding:14px;border:1px solid #ccc}.avatar img{width:32px;height:32px}.unread-count{width:22px;height:22px}textarea{width:300px;height:60px}</style>
+<div class=conversation-lst><div class=conversation-record-lst><div data-test-id=virtuoso-item-list>
+ <div class=lst-item id=friend-PERSON-synthetic-peer-with-hyphens>
+  <div class=item-lf><div class=avatar><img src="data:image/png;base64,bWljcGVlcg=="></div></div><div class=record-name-box><span class=name>Synthetic MIC supplier</span></div>
+  <div class=rg-com-name>Invented company</div><div class=rg-last-msg><span class=last-msg>Which quantity do you need?</span></div>
+  <div class=record-chatInfo-right><span class=record-time>09:00</span><span class=unread-count>2</span></div><div class=close><button class=close-btn>Close</button></div>
+ </div>
+ <div class=lst-item id=friend-PERSON-synthetic-peer-two>
+  <div class=record-name-box><span class=name>Another MIC supplier</span></div>
+  <div class=rg-com-name>Another invented company</div><div class=rg-last-msg><span class=last-msg>Old preview</span></div>
+  <div class=record-chatInfo-right><span class=record-time>08:00</span></div><div class=close><button class=close-btn>Close</button></div>
+ </div>
+</div></div></div>
+<div class=conversation-area><div class=conversation-empty>Select a conversation</div></div>
+<textarea></textarea><button id=send>Send</button>
+<script>
+window.readerSideEffects={click:0,input:0,change:0,submit:0,focus:0};
+for(const key of Object.keys(readerSideEffects))document.addEventListener(key,event=>{readerSideEffects[key]++;if(key==='submit')event.preventDefault();},true);
+window.selectedThreads=[];window.closedThreads=0;
+for(const row of document.querySelectorAll('.lst-item'))row.addEventListener('click',()=>{selectedThreads.push(row.id);row.classList.add('active');});
+for(const button of document.querySelectorAll('.close-btn'))button.addEventListener('click',()=>closedThreads++);
+</script>
