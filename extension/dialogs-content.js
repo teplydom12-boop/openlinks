@@ -13,6 +13,7 @@
   let rowTokens = new WeakMap(), micEpoch = crypto.randomUUID(), loginObserved = false;
   const usedTokens = new Set();
   let selectionRows = new Map(), lastTrustedInput = 0, active1688Evidence = null, activeAlibabaEvidence = null, activeMicEvidence = null, pendingReveal = null;
+  let modelRequest=null,modelAttempt='',modelAccepted={threadId:'',rows:new Map()};
   const LIMIT = {conversations: 200, messages: 500, text: 12000, nodes: 3000};
   const HISTORY = '[data-message-history],[data-chat-history],[data-message-list],[role="log"],.message-list,.messages-list,.chat-messages,.message-history,.chat-history,.buyer-messenger-container .message-box .im-message-flow .scroll-box,.conversation-area .window-center-messages-main > .msg-list';
   const ROOT = '[data-dialog-root],[data-chat-root],[data-conversation-root],.chat-panel,.chat-window,.conversation-panel,.message-panel,.ww_box,.buyer-messenger-container .message-box,.conversation-area .conversation-window,.conversation-area';
@@ -27,6 +28,7 @@
   const DIRECTION_CLASSES = {incoming:'inbound',received:'inbound','message-incoming':'inbound','message-received':'inbound','msg-incoming':'inbound',outgoing:'outbound',sent:'outbound','message-outgoing':'outbound','message-sent':'outbound','msg-outgoing':'outbound','system-message':'system','message-system':'system'};
   const clean = (value, max=LIMIT.text) => String(value ?? '').replace(/\u0000/g,'').replace(/\r\n?/g,'\n').trim().slice(0,max);
   const identifier = value => typeof value==='string' && value.length>0 && value.length<=256 && value===value.trim() && !/[\u0000-\u001f\u007f]/u.test(value) ? value : '';
+  function rowSignature(node){const text=node.outerHTML;if(text.length>100000)return '';let a=2166136261,b=2246822507;for(let i=0;i<text.length;i++){a=Math.imul(a^text.charCodeAt(i),16777619);b=Math.imul(b^text.charCodeAt(i),3266489909);}return `${(a>>>0).toString(16)}${(b>>>0).toString(16)}:${text.length}`;}
   function platform(url=location.href) {
     try {const host=new URL(url).hostname;return host==='1688.com'||host.endsWith('.1688.com')?'1688':host==='alibaba.com'||host.endsWith('.alibaba.com')?'alibaba':host==='made-in-china.com'||host.endsWith('.made-in-china.com')?'mic':null;} catch {return null;}
   }
@@ -70,14 +72,19 @@
     if(!id&&allowLocation)id=urlId(location.href);
     return id?scoped(id,root):'';
   }
-  function textOf(node,max=LIMIT.text,allowPreview=false) {
+  function micEmotion(node){
+    if(!node?.matches('img.chat-text-sys-emotion')||!/^\[[^\[\]\u0000-\u001f]{1,64}\]$/.test(node.getAttribute('title')||''))return false;
+    try{const url=new URL(node.src);return url.protocol==='https:'&&url.hostname==='webim.made-in-china.com'&&/^\/super-tm\/[a-f\d]{32}\.gif$/i.test(url.pathname)&&!url.search&&!url.hash&&!url.username&&!url.password;}catch{return false;}
+  }
+  function textOf(node,max=LIMIT.text,allowPreview=false,withMicEmotions=false) {
     if(!node)return '';
-    const walker=document.createTreeWalker(node,NodeFilter.SHOW_TEXT);const parts=[];let cursor;
+    const walker=document.createTreeWalker(node,withMicEmotions?NodeFilter.SHOW_TEXT|NodeFilter.SHOW_ELEMENT:NodeFilter.SHOW_TEXT);const parts=[];let cursor;
     while((cursor=walker.nextNode())){
       if(parts.length>=LIMIT.nodes)break;
-      const parent=cursor.parentElement;
+      const element=cursor.nodeType===Node.ELEMENT_NODE,parent=element?cursor:cursor.parentElement;
       const excluded=parent?.closest(EXCLUDED);
       if((excluded&&(!allowPreview||excluded!==node))||!visible(parent))continue;
+      if(element){if(micEmotion(cursor))parts.push(cursor.getAttribute('title'));continue;}
       parts.push(cursor.textContent);
     }
     return clean(parts.join(' ').replace(/[\t \n\r]+/g,' '),max);
@@ -97,22 +104,68 @@
     if(!/^\d{4}-\d{2}-\d{2}T.*(?:Z|[+-]\d{2}:?\d{2})$/i.test(raw))return null;
     const value=Date.parse(raw);return Number.isFinite(value)?value:null;
   }
-  function messageNodes(history) {
+  function messageNodes(history,live1688=false) {
     const found=select(history,MESSAGE).filter(node=>!node.closest(ITEM)&&!node.closest(EXCLUDED));
-    return found.filter(node=>!found.some(other=>other!==node&&other.contains(node)));
+    if(live1688)for(const row of select(history,'.message-item-line'))if(!row.closest(EXCLUDED)&&!found.some(node=>row.contains(node)||node.contains(row)))found.push(row);
+    return found.filter(node=>!found.some(other=>other!==node&&other.contains(node))).sort((a,b)=>a===b?0:a.compareDocumentPosition(b)&Node.DOCUMENT_POSITION_FOLLOWING?-1:1);
+  }
+  function known1688Survey(node) {
+    if(!node.matches('.rc-scrollbars-view > .message-item-line')||node.querySelector('.message-item,.message-item-system,.nick,.content-row'))return false;
+    const cards=node.querySelectorAll('.im-template-msg.dx-msg-wrap'),card=cards[0];
+    if(!card||cards.length!==1||card.querySelectorAll('.tpl-wrapper > .FrameLayout_0 > .FrameLayout_56 > .LinearLayout_57 > .LinearLayout_58 > .LinearLayout_60 > .list-item').length!==5)return false;
+    const expected=['期待您的真实反馈','很不满','不满','一般','满意','很满意'];
+    const labels=select(card,'.FastTextView_59 > span,.FastTextView_63 > span').map(label=>textOf(label));
+    if(select(node,'video,audio,canvas,iframe').length||select(node,'img').some(image=>!image.matches('.LinearLayout_60 > .list-item > .LinearLayout_61 > .ImageView_62 > div > img')))return false;
+    return JSON.stringify(labels)===JSON.stringify(expected)&&textOf(node)===expected.join(' ');
+  }
+  function self1688Message(node){
+    return node?.matches('.message-item.self')&&!node.closest(EXCLUDED)&&select(node,':scope > .item.self').length===1&&select(node,':scope > .item.self > div > .first-line.self').filter(header=>!header.closest(EXCLUDED)).length===1;
+  }
+  function pending1688Format(node){return node.matches('.rc-scrollbars-view > .message-item-line')&&!node.querySelector('.message-item,.message-item-system,img,video,audio')&&node.querySelectorAll(':scope > div > span').length===1&&textOf(node)==='暂不支持的消息类型';}
+  function attachmentUrl(value) {
+    try {const url=new URL(value,location.href);return value&&url.protocol==='https:'&&!url.username&&!url.password&&url.href.length<=4096?url.href:'';}catch{return '';}
+  }
+  function attachmentsOf(body,survey=false,ignored='',ignoreMedia=null) {
+    if(survey)return [];
+    const candidates=selector=>select(body,selector).filter(node=>!ignored||!node.closest(ignored));
+    const attachments=[],seen=new Set(),add=(type,node,name='',url='',text='')=>{
+      const item={type,name:clean(name,300),url:attachmentUrl(url),text:clean(text,1000),contentRead:false};
+      const key=JSON.stringify(item);if(seen.has(key))return;if(attachments.length>=30){attachments.limited=true;return;}seen.add(key);attachments.push(item);
+    };
+    const files=candidates('.file-msg,[data-attachment],a[download]');
+    for(const file of files){
+      const nameNode=select(file,'.file-name,[data-file-name]')[0],link=file.matches('a[href]')?file:select(file,'a[href]')[0];
+      add('file',file,nameNode?.getAttribute('title')||textOf(nameNode)||file.getAttribute('data-file-name')||file.getAttribute('download')||file.getAttribute('title')||'Файл',link?.href||'',textOf(select(file,'.file-size')[0]));
+    }
+    for(const media of candidates('img,video,audio,canvas,iframe')){
+      if(ignoreMedia?.(media))continue;
+      if(files.some(file=>file.contains(media)))continue;
+      const type={IMG:'image',VIDEO:'video',AUDIO:'audio'}[media.tagName]||'unknown';
+      add(type,media,media.getAttribute('alt')||media.getAttribute('title')||'',media.currentSrc||media.src||media.querySelector('source[src]')?.src||'');
+    }
+    for(const link of candidates('a[href]')){
+      if(files.some(file=>file===link||file.contains(link))||link.querySelector('img,video,audio'))continue;
+      const url=attachmentUrl(link.href);if(url)add('link',link,textOf(link),url);
+    }
+    return attachments;
   }
   function readMessages(history,live1688=null,liveAlibaba=false,liveMic=null) {
-    const nodes=messageNodes(history);let reliable=true,unsupportedMedia=false,reason='';const result=[],ids=new Map();
-    if(nodes.length>LIMIT.messages){reliable=false;reason='История превышает предел 500 сообщений.';}
+    const nodes=messageNodes(history,Boolean(live1688));let reliable=true,structuralReliable=true,unsupportedMedia=false,reason='',unsupportedMessages=0,unmatchedTextNodes=0,systemNotices=0,contentLimited=false;const result=[],records=[],ids=new Map();
+    const modelSignatures=new Map(),modelSignatureCounts=new Map();
+    if(live1688&&modelAccepted.threadId===live1688.id)for(const row of select(history,'.rc-scrollbars-view > .message-item-line')){const signature=rowSignature(row);modelSignatures.set(row,signature);modelSignatureCounts.set(signature,(modelSignatureCounts.get(signature)||0)+1);}
+    if(nodes.length>LIMIT.messages){reliable=false;structuralReliable=false;reason='История превышает предел 500 сообщений.';}
     for(const node of nodes.slice(-LIMIT.messages)){
-      const aliBody=liveAlibaba?select(node,'.user-content .session-rich-content,.session-security-text')[0]:null;
-      const micSystem=liveMic&&node.matches('.msg-list-system-tip,.chat-safe-tip-container');
-      const micBody=liveMic?(micSystem?node:select(node,'.chat-content .chat-txt .msg-text')[0]):null;
-      const body=(live1688?select(node,'.content-row > .content')[0]:aliBody||micBody)||select(node,CONTENT).find(child=>!child.closest(EXCLUDED))||node;
+      const aliNotice=liveAlibaba&&node.querySelector(':scope > .item-content-wrap > .item-system-notice');
+      const aliBody=liveAlibaba?select(node,'.user-content .session-rich-content,.session-security-text'+(aliNotice?',:scope > .item-content-wrap > .item-system-notice .notice-content':''))[0]:null;
+      const micAssignment=liveMic&&node.querySelector(':scope > .msg-system-box > .msg-inquiry-assign.iAmBuyer');
+      const micSystem=liveMic&&(node.matches('.msg-list-system-tip,.chat-safe-tip-container')||micAssignment&&!node.querySelector(':scope > .contact-chatInfo,:scope > .mine-chatInfo'));
+      const micBody=liveMic?(micSystem?micAssignment||node:select(node,'.chat-content .chat-txt .msg-text')[0]):null;
+      const body=(live1688?select(node,'.content-row > .content')[0]:aliBody||micBody)||(liveAlibaba?select(node,'.user-content')[0]:liveMic?select(node,'.chat-content')[0]:null)||select(node,CONTENT).find(child=>!child.closest(EXCLUDED))||node;
+      const survey=Boolean(live1688)&&known1688Survey(node);
       let kind=direction(node);
-      if(live1688&&node.matches('.message-item-system'))kind='system';
+      if(live1688&&(node.matches('.message-item-system')||survey))kind='system';
       else if(live1688&&kind==='unknown'&&!node.hasAttribute('data-direction')&&!node.hasAttribute('data-message-direction')){
-        if(node.matches('.message-item.self')&&select(node,':scope > .item.self').length===1&&select(node,'.first-line.self').length===1)kind='outbound';
+        if(self1688Message(node))kind='outbound';
         else if(node.matches('.message-item:not(.self)')&&select(node,':scope > .item:not(.self)').length===1&&select(node,'.first-line:not(.self)').length===1){
           const avatar=select(node,':scope > .item > .headPic')[0],peerAvatar=select(live1688,'.avatar > .avatar-img')[0];
           const name=textOf(select(node,'.first-line > .nick')[0]),peerName=textOf(select(live1688,'.content > .conversation > .name')[0]);
@@ -120,7 +173,7 @@
         }
       }
       if(liveAlibaba){
-        if(node.querySelector(':scope > .session-security-content'))kind='system';
+        if(node.querySelector(':scope > .session-security-content')||aliNotice&&!node.querySelector(':scope > .item-content-left,:scope > .item-content-right'))kind='system';
         else {
           const send=node.querySelector(':scope > .item-content-right > .message-flow-menu-box.send:not(.rec)'),receive=node.querySelector(':scope > .item-content-left > .message-flow-menu-box.rec:not(.send)');
           kind=send&&!receive&&node.classList.contains('item-right')?'outbound':receive&&!send&&node.classList.contains('item-left-text')?'inbound':'unknown';
@@ -129,22 +182,53 @@
       }
       if(liveMic){
         kind=micSystem?'system':'unknown';
-        const contact=node.querySelector(':scope > .contact-chatInfo'),avatar=contact?.querySelector('.avatar img'),peerAvatar=liveMic.querySelector('.item-lf .avatar img');
+        const contact=node.querySelector(':scope > .contact-chatInfo'),mine=node.querySelector(':scope > .mine-chatInfo'),avatar=contact?.querySelector('.avatar img'),peerAvatar=liveMic.querySelector('.item-lf .avatar img');
         const name=contact?textOf(select(contact,'.fromUserName')[0]):'',peerName=title(liveMic);
-        if(!micSystem&&contact&&avatar?.src&&peerAvatar?.src&&avatar.src===peerAvatar.src&&name&&name===peerName)kind='inbound';
+        if(!micSystem&&mine&&!contact&&!mine.classList.contains('contact-chatInfo'))kind='outbound';
+        else if(!micSystem&&contact&&!mine&&!contact.classList.contains('mine-chatInfo')&&avatar?.src&&peerAvatar?.src&&avatar.src===peerAvatar.src&&name&&name===peerName)kind='inbound';
         if(!micBody){reliable=false;unsupportedMedia=true;}
       }
-      let full=textOf(body,LIMIT.text+1);
-      if(live1688&&select(body,'.file-msg').length){full=`[Файл: ${textOf(select(body,'.file-name')[0])||'без названия'}; содержимое не прочитано]`;unsupportedMedia=true;kind='unknown';}
-      else if(live1688&&select(body,'img,video,audio,canvas').length){full=(full?`${full} `:'')+'[Вложение: содержимое не прочитано]';unsupportedMedia=true;kind='unknown';}
-      if(liveAlibaba&&(!aliBody||select(body,'img,video,audio,canvas,iframe').length)){full=aliBody&&full?`${full} [Вложение: содержимое не прочитано]`:'[Вложение: содержимое не прочитано]';unsupportedMedia=true;kind='unknown';}
-      if(liveMic&&(!micBody||select(body,'img,video,audio,canvas,iframe').length)){full=micBody&&full?`${full} [Вложение: содержимое не прочитано]`:'[Вложение: содержимое не прочитано]';unsupportedMedia=true;kind='unknown';}
-      const micId=liveMic?node.querySelector(':scope > .contact-chatInfo[id]')?.id:'',id=identifier(node.getAttribute('data-message-id'))||identifier(node.getAttribute('data-msg-id'))||(/^[a-f\d]{8}(?:-[a-f\d]{4}){3}-[a-f\d]{12}$/i.test(micId||'')?micId:'');
-      if(!full){reliable=false;reason||='Есть сообщение без доступного текста.';continue;}
-      if(full.length>LIMIT.text){reliable=false;reason||='Слишком длинный текст сообщения обрезан.';}
-      const entry={direction:kind,text:full.slice(0,LIMIT.text)};if(id)entry.id=id;const at=timestamp(node);if(at!==null)entry.at=at;
-      if(id&&ids.has(id)){const prior=ids.get(id);if(prior.text!==entry.text||prior.direction!==entry.direction||prior.at!==entry.at){reliable=false;reason||='Один идентификатор относится к разным сообщениям.';}continue;}
-      if(id)ids.set(id,entry);result.push(entry);
+      let full=textOf(body,LIMIT.text+1,false,Boolean(liveMic));
+      const attachmentScope=liveMic?select(node,'.chat-content')[0]||body:liveAlibaba?select(node,'.user-content')[0]||body:live1688?body:node;
+      const attachments=attachmentsOf(attachmentScope,survey,liveAlibaba?'.session-translate':'',liveMic?micEmotion:null),unreadMedia=attachments.filter(item=>item.type!=='link');
+      if(attachments.limited){contentLimited=true;reliable=false;reason||='Список вложений сообщения ограничен 30 элементами.';}
+      const unknownFormat=Boolean(live1688&&node.matches('.message-item-line')&&!survey||liveAlibaba&&!aliBody||liveMic&&!micBody);
+      if(unknownFormat){unsupportedMessages++;reliable=false;reason||='Сохранён текст сообщения с нераспознанным форматом.';}
+      if(unreadMedia.length||unknownFormat){
+        unsupportedMedia=true;
+        const label=unreadMedia[0]?.type==='file'?`[Файл: ${unreadMedia[0].name||'без названия'}; содержимое не прочитано]`:unreadMedia.length?'[Вложение: содержимое не прочитано]':'[Нераспознанный формат сообщения; доступный текст сохранён]';
+        full=(full?`${full} `:'')+label;
+      }
+      const modelRow=live1688&&node.closest('.message-item-line'),modelSignature=modelSignatures.get(modelRow);
+      let accepted=modelRow&&modelSignature&&modelSignatureCounts.get(modelSignature)===1&&modelAccepted.threadId===live1688.id?modelAccepted.rows.get(modelSignature):null;
+      if(accepted){
+        const signals=node.hasAttribute('data-direction')||node.hasAttribute('data-message-direction')||node.hasAttribute('data-sender-role')||[...node.classList].some(cls=>Object.hasOwn(DIRECTION_CLASSES,cls));
+        if(kind==='system')accepted=null;
+        else if(kind!=='unknown'&&kind!==accepted.direction||kind==='unknown'&&signals){kind='unknown';accepted=null;reliable=false;structuralReliable=false;reason||='Направление сообщения в модели противоречит DOM; нужна проверка.';}
+        else kind=accepted.direction;
+      }
+      const micId=liveMic?node.querySelector(':scope > .contact-chatInfo[id],:scope > .mine-chatInfo[id]')?.id:'',id=identifier(node.getAttribute('data-message-id'))||identifier(node.getAttribute('data-msg-id'))||(accepted?accepted.id:'')||(/^[a-f\d]{8}(?:-[a-f\d]{4}){3}-[a-f\d]{12}$/i.test(micId||'')?micId:'');
+      if(!full){reliable=false;unsupportedMessages++;full='[Сообщение без доступного текста]';reason||='Есть сообщение без доступного текста.';}
+      if(full.length>LIMIT.text){reliable=false;contentLimited=true;reason||='Слишком длинный текст сообщения обрезан.';}
+      const entry={direction:kind,text:full.slice(0,LIMIT.text)};if(attachments.length)entry.attachments=attachments;if(unknownFormat)entry.format='unrecognized';if(id)entry.id=id;const at=timestamp(node);if(at!==null)entry.at=at;
+      const aliases=[],alias=(text,direction,kind,ignoredAttachments=[])=>{if(text&&text.length<=6000&&aliases.length<4&&!aliases.some(value=>value.text===text&&value.direction===direction)){const value={text,direction,kind};if(ignoredAttachments.length)value.ignoredAttachments=ignoredAttachments.slice(0,4);aliases.push(value);}};
+      const iconProof=icons=>[...new Map(icons.map(icon=>{const value={type:'image',name:clean(icon.getAttribute('alt')||icon.getAttribute('title')||'',300),url:attachmentUrl(icon.currentSrc||icon.src||'')};return [JSON.stringify(value),value];})).values()].filter(value=>value.url).slice(0,4);
+      const oldMarker='[Вложение: содержимое не прочитано]',oldFormat='[Нераспознанный формат сообщения; доступный текст сохранён]';
+      const translationIcons=liveAlibaba?select(node,'.user-content .session-translate img.translate-icon-small').filter(icon=>!icon.closest('.translate-result.hide')):[];
+      if(liveAlibaba&&!unknownFormat&&!unreadMedia.length&&['inbound','outbound'].includes(kind)&&translationIcons.length){alias(textOf(body)+' '+oldMarker,kind,'platform-ui',iconProof(translationIcons));alias(oldMarker,'unknown','reader-placeholder');}
+      if(liveAlibaba&&aliNotice&&kind==='system'||liveMic&&micAssignment&&micSystem)alias(textOf(node)+' '+oldFormat,'unknown','platform-ui');
+      const emotions=liveMic?select(body,'img.chat-text-sys-emotion').filter(micEmotion):[];
+      if(liveMic&&!unknownFormat&&!unreadMedia.length&&emotions.length){const previous=textOf(body),proof=iconProof(emotions);alias((previous?previous+' ':'')+oldMarker,kind,'platform-ui',proof);alias((previous?previous+' ':'')+oldMarker,'unknown','platform-ui',proof);}
+      if(live1688&&select(body,'.file-msg').length&&attachments.some(value=>value.type==='file'))alias(`[Файл: ${textOf(select(body,'.file-name')[0])||'без названия'}; содержимое не прочитано]`,'unknown','reader-placeholder');
+      if(survey){alias(textOf(node)+' '+oldFormat,'unknown','platform-ui');alias('暂不支持的消息类型 '+oldFormat,'unknown','platform-ui');}
+      if(accepted&&id===accepted.id&&kind===accepted.direction){alias(entry.text,'unknown','model-direction');alias(entry.text,kind,'model-direction');}
+      if(aliases.length)entry.legacyAliases=aliases;
+      if(id&&ids.has(id)){const prior=ids.get(id);if(JSON.stringify(prior)!==JSON.stringify(entry)){reliable=false;structuralReliable=false;reason||='Один идентификатор относится к разным сообщениям.';}continue;}
+      if(id)ids.set(id,entry);result.push(entry);records.push({node,entry});
+      if(liveMic)for(const notice of select(node,':scope > .msg-system,:scope > .diversion-enhanced-reminder')){
+        const text=textOf(notice);if(!text)continue;systemNotices++;
+        const system={direction:'system',text};if(id)system.id=id+':'+notice.classList[0];result.push(system);records.push({node:notice,entry:system});
+      }
     }
     // A partly matched layout must not expose an older recognized message as
     // the actual newest message. Unknown text/media inside history blocks it.
@@ -152,20 +236,37 @@
     while((leaf=walker.nextNode())){
       const parent=leaf.parentElement;
       if(live1688&&parent.matches('.ww_message .message-list .rc-scrollbars-view > div:first-child > span')&&!parent.closest('.message-item-line')&&clean(parent.textContent)==='暂无更多消息')continue;
-      if(clean(leaf.textContent)&&visible(parent)&&!parent.closest(EXCLUDED)&&!nodes.some(node=>node.contains(parent))){reliable=false;reason||=`Не распознан элемент истории (${parent.tagName.toLowerCase()}${parent.classList.length?'.'+[...parent.classList].slice(0,2).join('.'):''}).`;break;}
+      if(clean(leaf.textContent)&&visible(parent)&&!parent.closest(EXCLUDED)&&!nodes.some(node=>node.contains(parent))){
+        reliable=false;structuralReliable=false;unmatchedTextNodes++;reason||=`Не распознан элемент истории (${parent.tagName.toLowerCase()}${parent.classList.length?'.'+[...parent.classList].slice(0,2).join('.'):''}); его текст сохранён отдельно.`;
+        if(result.length<LIMIT.messages){const entry={direction:'unknown',text:clean(leaf.textContent),format:'unrecognized'};result.push(entry);records.push({node:parent,entry});}
+        if(unmatchedTextNodes>=LIMIT.nodes)break;
+      }
     }
-    if(select(history,'img,video,audio,[data-attachment]').some(media=>!media.closest(EXCLUDED)&&!nodes.some(node=>node.contains(media)))){reliable=false;reason||='В истории есть вложение вне распознанных сообщений.';}
+    const orphanMedia=select(history,'img,video,audio,[data-attachment]').filter(media=>!media.closest(EXCLUDED)&&!nodes.some(node=>node.contains(media)));
+    if(orphanMedia.length){
+      reliable=false;structuralReliable=false;unsupportedMedia=true;reason||='В истории есть вложение вне распознанных сообщений; ссылка сохранена отдельно.';
+      for(const media of orphanMedia.slice(0,30))if(result.length<LIMIT.messages){
+        const type={IMG:'image',VIDEO:'video',AUDIO:'audio'}[media.tagName]||'unknown';
+        const entry={direction:'unknown',text:'[Вложение вне распознанного сообщения; содержимое не прочитано]',format:'unrecognized',attachments:[{type,name:clean(media.getAttribute('alt')||media.getAttribute('title'),300),url:attachmentUrl(media.currentSrc||media.src||''),text:'',contentRead:false}]};
+        result.push(entry);records.push({node:media,entry});unsupportedMessages++;
+      }
+    }
+    if(unmatchedTextNodes||orphanMedia.length){records.sort((a,b)=>a.node===b.node?0:a.node.compareDocumentPosition(b.node)&Node.DOCUMENT_POSITION_FOLLOWING?-1:1);result.splice(0,result.length,...records.map(record=>record.entry));}
     // Reverse flex/order/positioned virtual rows cannot imply chronological order.
     const style=getComputedStyle(history);
     if((style.flexDirection==='column-reverse'||style.flexDirection==='row-reverse')&&style.display.includes('flex')){
       if(liveAlibaba&&style.flexDirection==='column-reverse'){
         const tops=nodes.map(node=>node.getBoundingClientRect().top);
         if(tops.every((top,index)=>index===0||top<tops[index-1]))result.reverse();
-        else {reliable=false;reason||='Обратный порядок Alibaba не подтверждён расположением строк.';}
-      }else {reliable=false;reason||='История отображается в обратном CSS-порядке.';}
+        else {reliable=false;structuralReliable=false;reason||='Обратный порядок Alibaba не подтверждён расположением строк.';}
+      }else {reliable=false;structuralReliable=false;reason||='История отображается в обратном CSS-порядке.';}
     }
-    for(const node of nodes){const style=getComputedStyle(node);if(Number(style.order)!==0||['absolute','fixed'].includes(style.position)){reliable=false;reason||='Порядок виртуальных или перемещённых строк истории не подтверждён.';}}
-    return {messages:result,reliable,unsupportedMedia,reason};
+    for(const node of nodes){const style=getComputedStyle(node);if(Number(style.order)!==0||['absolute','fixed'].includes(style.position)){reliable=false;structuralReliable=false;reason||='Порядок виртуальных или перемещённых строк истории не подтверждён.';}}
+    if(result.length>LIMIT.messages){result.splice(0,result.length-LIMIT.messages);contentLimited=true;reliable=false;structuralReliable=false;reason||='История превышает предел 500 сообщений.';}
+    const attachments=result.flatMap(message=>message.attachments||[]);
+    const totalRows=nodes.length+systemNotices+unmatchedTextNodes+orphanMedia.length;
+    const coverage={totalRows,capturedMessages:result.length,unknownSenders:result.filter(message=>message.direction==='unknown').length,attachments:attachments.length,unreadAttachments:attachments.filter(item=>item.type!=='link'&&!item.contentRead).length,unsupportedMessages:unsupportedMessages+unmatchedTextNodes,unmatchedTextNodes,limited:contentLimited||totalRows>LIMIT.messages||unmatchedTextNodes>=LIMIT.nodes||orphanMedia.length>30};
+    return {messages:result,reliable,structuralReliable:structuralReliable&&!coverage.limited,unsupportedMedia,reason,coverage,pendingFormat:Boolean(live1688)&&nodes.some(pending1688Format)};
   }
   function unread(root) {
     if(platform()==='1688'&&root.matches(INBOX_1688))return select(root,'.avatar > .avatar-unread').length>0;
@@ -200,23 +301,23 @@
     return scrollers.every(node=>node.scrollTop>=-2&&node.scrollHeight-node.clientHeight-node.scrollTop<=3)?'':'История прокручена выше последних сообщений.';
   }
   function atTail(history) {return tailReason(history)==='';}
-  function historyDetail(label,stable,parsed,history){return [!stable?`Ожидание устойчивой истории ${label}.`:'',!parsed.reliable?parsed.reason||'Порядок сообщений не подтверждён.':'',tailReason(history),parsed.unsupportedMedia?'Содержимое вложения не прочитано; подготовка ответа заблокирована.':'',parsed.messages.some(message=>message.direction==='unknown')?'Есть сообщения без подтверждённого отправителя.':''].filter(Boolean).join(' ');}
+  function historyDetail(label,stable,parsed,history){return [!stable?`Ожидание устойчивой истории ${label}.`:'',parsed.pendingFormat?'1688 ещё отображает временную заглушку формата; ожидается повторная проверка.':'',!parsed.reliable?parsed.reason||'Порядок сообщений не подтверждён.':'',tailReason(history),parsed.unsupportedMedia?'Содержимое вложения не прочитано; подготовка ответа заблокирована.':'',parsed.messages.some(message=>message.direction==='unknown')?'Есть сообщения без подтверждённого отправителя.':''].filter(Boolean).join(' ');}
   function readHistory(history,count) {
     if(platform()==='mic'&&history.matches('.conversation-area .window-center-messages-main > .msg-list')){
       const active=select(document,INBOX_MIC).filter(row=>rowActive(row));
       if(active.length!==1||!liveThreadId(active[0])||select(document,'.conversation-area .window-center-messages-main > .msg-list').length!==1)return null;
       const row=active[0],id=identity(row),parsed=readMessages(history,null,false,row),fingerprint=JSON.stringify([id,parsed.messages]);
       if(!activeMicEvidence||activeMicEvidence.fingerprint!==fingerprint)activeMicEvidence={fingerprint,since:Date.now()};
-      const stable=Date.now()-activeMicEvidence.since>=1000,readComplete=stable&&atTail(history),tailKnown=readComplete&&!parsed.unsupportedMedia;
-      return {id,identityReliable:true,title:title(row),url:safeUrl(location.href),unread:unread(row),active:true,orderReliable:parsed.reliable,historyStable:stable,readComplete,tailKnown,messages:parsed.messages,needsRead:!tailKnown,detail:historyDetail('Made-in-China',stable,parsed,history)};
+      const stable=Date.now()-activeMicEvidence.since>=1000,readComplete=stable&&atTail(history)&&!parsed.pendingFormat,tailKnown=readComplete&&!parsed.unsupportedMedia;
+      return {id,identityReliable:true,title:title(row),url:safeUrl(location.href),unread:unread(row),active:true,orderReliable:parsed.reliable,historyStable:stable,readComplete,historyTailKnown:readComplete,historyOrderReliable:parsed.structuralReliable,tailKnown,messages:parsed.messages,coverage:parsed.coverage,needsRead:!tailKnown,detail:historyDetail('Made-in-China',stable,parsed,history)};
     }
     if(platform()==='alibaba'&&history.matches('.buyer-messenger-container .message-box .im-message-flow .scroll-box')){
       const active=select(document,INBOX_ALIBABA).filter(row=>rowActive(row));
       if(active.length!==1||!liveThreadId(active[0])||select(document,'.buyer-messenger-container .message-box .im-message-flow .scroll-box').length!==1)return null;
       const row=active[0],id=identity(row),parsed=readMessages(history,null,true),fingerprint=JSON.stringify([id,parsed.messages]);
       if(!activeAlibabaEvidence||activeAlibabaEvidence.fingerprint!==fingerprint)activeAlibabaEvidence={fingerprint,since:Date.now()};
-      const stable=Date.now()-activeAlibabaEvidence.since>=1000,readComplete=stable&&atTail(history),tailKnown=readComplete&&!parsed.unsupportedMedia;
-      return {id,identityReliable:true,title:title(row),url:safeUrl(location.href),unread:unread(row),active:true,orderReliable:parsed.reliable,historyStable:stable,readComplete,tailKnown,messages:parsed.messages,needsRead:!tailKnown,detail:historyDetail('Alibaba',stable,parsed,history)};
+      const stable=Date.now()-activeAlibabaEvidence.since>=1000,readComplete=stable&&atTail(history)&&!parsed.pendingFormat,tailKnown=readComplete&&!parsed.unsupportedMedia;
+      return {id,identityReliable:true,title:title(row),url:safeUrl(location.href),unread:unread(row),active:true,orderReliable:parsed.reliable,historyStable:stable,readComplete,historyTailKnown:readComplete,historyOrderReliable:parsed.structuralReliable,tailKnown,messages:parsed.messages,coverage:parsed.coverage,needsRead:!tailKnown,detail:historyDetail('Alibaba',stable,parsed,history)};
     }
     // The full 1688 inbox can retain the original touid URL while another row
     // is selected. Until its current thread is proven, that URL is not identity.
@@ -226,15 +327,60 @@
       const row=active[0],id=identity(row),parsed=readMessages(history,row);
       const fingerprint=JSON.stringify([id,parsed.messages]);
       if(!active1688Evidence||active1688Evidence.fingerprint!==fingerprint)active1688Evidence={fingerprint,since:Date.now()};
-      const stable=Date.now()-active1688Evidence.since>=1000,readComplete=stable&&atTail(history),tailKnown=readComplete&&!parsed.unsupportedMedia;
-      return {id,identityReliable:true,title:title(row),url:safeUrl(location.href),unread:unread(row),active:true,orderReliable:parsed.reliable,historyStable:stable,readComplete,tailKnown,messages:parsed.messages,needsRead:!tailKnown,detail:historyDetail('1688',stable,parsed,history)};
+      const stable=Date.now()-active1688Evidence.since>=1000,readComplete=stable&&atTail(history)&&!parsed.pendingFormat,tailKnown=readComplete&&!parsed.unsupportedMedia;
+      return {id,identityReliable:true,title:title(row),url:safeUrl(location.href),unread:unread(row),active:true,orderReliable:parsed.reliable,historyStable:stable,readComplete,historyTailKnown:readComplete,historyOrderReliable:parsed.structuralReliable,tailKnown,messages:parsed.messages,coverage:parsed.coverage,needsRead:!tailKnown,detail:historyDetail('1688',stable,parsed,history)};
     }
     const root=history.closest(ROOT)||history,id=identity(root,count===1)||identity(history,count===1);
     if(!id)return null;
-    const parsed=readMessages(history),tailKnown=atTail(history);
-    return {id,identityReliable:provenAccount(root),title:title(root),url:safeUrl(location.href),unread:unread(root),active:true,orderReliable:parsed.reliable,tailKnown,messages:parsed.messages,needsRead:!tailKnown,detail:!provenAccount(root)?'Аккаунт покупателя не подтверждён; подготовка ответа заблокирована.':!parsed.reliable?'Порядок или содержимое сообщений неоднозначны.':!tailKnown?'Последние сообщения ещё не загружены или история прокручена вверх.':''};
+    const parsed=readMessages(history),tailKnown=atTail(history)&&!parsed.unsupportedMedia;
+    return {id,identityReliable:provenAccount(root),title:title(root),url:safeUrl(location.href),unread:unread(root),active:true,orderReliable:parsed.reliable,historyTailKnown:atTail(history),historyOrderReliable:parsed.structuralReliable,tailKnown,messages:parsed.messages,coverage:parsed.coverage,needsRead:!tailKnown,detail:!provenAccount(root)?'Аккаунт покупателя не подтверждён; подготовка ответа заблокирована.':!parsed.reliable?'Порядок или содержимое сообщений неоднозначны.':!tailKnown?'Последние сообщения ещё не загружены или история прокручена вверх.':''};
   }
   function frames() {return [...document.querySelectorAll('iframe[src],frame[src]')].slice(0,100).map(frame=>({url:safeUrl(frame.src)?frame.src:'',visible:visible(frame)})).filter(frame=>frame.url);}
+  function modelContext(){
+    if(platform()!=='1688')return null;
+    const active=select(document,INBOX_1688).filter(row=>rowActive(row)),histories=select(document,'.ww_box .message-list');
+    if(active.length!==1||!liveThreadId(active[0])||histories.length!==1)return null;
+    const rows=select(histories[0],'.rc-scrollbars-view > .message-item-line').slice(-LIMIT.messages),signatures=rows.map(row=>rowSignature(row));
+    return {threadId:active[0].id,rows,signatures,fingerprint:JSON.stringify([active[0].id,signatures])};
+  }
+  function requestModelEvidence(result){
+    if(result.platform!=='1688'||result.status!=='ready'||!result.conversations.some(row=>row.active&&row.identityReliable&&row.messages.some(message=>message.direction==='unknown')))return;
+    const context=modelContext();if(!context||context.fingerprint===modelAttempt)return;
+    if(modelRequest?.fingerprint!==context.fingerprint)modelRequest={...context,token:crypto.randomUUID()};
+    result.modelEvidenceToken=modelRequest.token;
+  }
+  function applyModelEvidence(request){
+    if(request?.documentToken!==DOCUMENT_TOKEN||!modelRequest||request.modelEvidenceToken!==modelRequest.token)return {ok:false,detail:'Разрешение чтения модели или документ устарели.'};
+    const current=snapshot(),context=modelContext(),evidence=request.evidence;
+    if(current.status!=='ready'||!context||context.fingerprint!==modelRequest.fingerprint||request.modelEvidenceToken!==modelRequest.token)return {ok:false,detail:'Выбранный диалог или его сообщения изменились.'};
+    if(!evidence||evidence.status!=='ready'||evidence.platform!=='1688'||evidence.url!==location.href||evidence.threadId!==context.threadId||!Number.isFinite(evidence.capturedAt)||Date.now()-evidence.capturedAt>30000||evidence.capturedAt-Date.now()>5000||!Array.isArray(evidence.rows)||evidence.rows.length>500)return {ok:false,detail:'Источник сведений о сообщениях не подтверждён.'};
+    const members=/^(\d+)\.\d+-(\d+)\.\d+#\d+@cntaobao$/.exec(context.threadId),bySignature=new Map(),conflicts=new Set();
+    const numeric=value=>typeof value==='string'&&/^\d{1,30}$/.test(value)?value:Number.isSafeInteger(value)&&value>=0?String(value):'';
+    for(const record of evidence.rows){
+      if(!record||typeof record.signature!=='string'||!record.signature||context.signatures.filter(signature=>signature===record.signature).length!==1)continue;
+      const row=context.rows[context.signatures.indexOf(record.signature)],messages=messageNodes(row);
+      if(messages.length!==1||!messages[0].matches('.message-item'))continue;
+      const model=record.model,ext=model?.ext,sender=model?.sender,receiver=model?.receiver,id=identifier(model?.code?.messageId);
+      const from=numeric(ext?.senderMainUserId),to=numeric(ext?.receiverMainUserId),fromUser=numeric(ext?.senderUserId),toUser=numeric(ext?.receiverUserId),senderId=numeric(sender?.targetId),receiverId=numeric(receiver?.targetId);
+      if(!members||!id||model?.conversationCode!==context.threadId||!from||!to||from===to||![members[1],members[2]].includes(from)||![members[1],members[2]].includes(to)||!fromUser||!toUser||senderId!==fromUser||![to,toUser].includes(receiverId)||String(sender?.targetType)!=='8'||String(receiver?.targetType)!=='8')continue;
+      const value={id,from,to};if(bySignature.has(record.signature)&&JSON.stringify(bySignature.get(record.signature))!==JSON.stringify(value))conflicts.add(record.signature);else bySignature.set(record.signature,value);
+    }
+    for(const signature of conflicts)bySignature.delete(signature);
+    const buyers=new Set();
+    for(let i=0;i<context.rows.length;i++){
+      const row=context.rows[i],model=bySignature.get(context.signatures[i]),messages=messageNodes(row);
+      if(model&&messages.length===1&&self1688Message(messages[0]))buyers.add(model.from);
+    }
+    modelAttempt=context.fingerprint;modelRequest=null;
+    if(buyers.size!==1)return {ok:false,detail:'Аккаунт покупателя не подтверждён собственным сообщением в этой истории.'};
+    const buyer=[...buyers][0],peer=members[1]===buyer?members[2]:members[1],accepted=new Map();
+    for(const [signature,model] of bySignature){
+      const direction=model.from===buyer&&model.to===peer?'outbound':model.from===peer&&model.to===buyer?'inbound':null;
+      if(direction)accepted.set(signature,{id:model.id,direction});
+    }
+    modelAccepted={threadId:context.threadId,rows:accepted};
+    return {ok:true,applied:accepted.size};
+  }
   function snapshot() {
     selectionRows=new Map();
     const result={platform:platform(),status:'unsupported',url:location.href,detail:'На странице не распознана история с устойчивым идентификатором диалога.',frames:frames(),documentToken:DOCUMENT_TOKEN,busy:busy(),conversations:[]};
@@ -242,7 +388,7 @@
     try {
       if(select(document,'#nc_1_wrapper,.nc-container,.geetest_panel,[id*="captcha" i],[class*="captcha" i],iframe[src*="captcha" i],iframe[src*="recaptcha" i],iframe[src*="hcaptcha" i],iframe[src*="_____tmd_____/punish"],#baxia-dialog-content').length){result.status='captcha';result.detail='Видна проверка CAPTCHA; мониторинг ничего не нажимает.';return result;}
       if(select(document,'input[type="password"],[data-login-required="true"],.login-panel').length||/\/(?:login|signin)(?:[/.?]|$)/i.test(location.pathname+location.hash)){
-        if(!loginObserved){micEpoch=crypto.randomUUID();rowTokens=new WeakMap();usedTokens.clear();active1688Evidence=null;activeAlibabaEvidence=null;activeMicEvidence=null;pendingReveal=null;}loginObserved=true;
+        if(!loginObserved){micEpoch=crypto.randomUUID();rowTokens=new WeakMap();usedTokens.clear();active1688Evidence=null;activeAlibabaEvidence=null;activeMicEvidence=null;pendingReveal=null;modelRequest=null;modelAttempt='';modelAccepted={threadId:'',rows:new Map()};}loginObserved=true;
         result.status='login';result.detail='Нужен вход в аккаунт этой площадки.';return result;
       }
       loginObserved=false;
@@ -251,7 +397,7 @@
       const leafHistories=histories.filter(node=>!histories.some(other=>other!==node&&node.contains(other)));
       const conversations=leafHistories.map(history=>readHistory(history,leafHistories.length)).filter(Boolean);
       const byId=new Map();
-      for(const entry of conversations){if(byId.has(entry.id)){const other=byId.get(entry.id);other.orderReliable=false;other.tailKnown=false;other.readComplete=false;other.detail='Найдено несколько историй одного диалога; нужно уточнить структуру страницы.';}else byId.set(entry.id,entry);}
+      for(const entry of conversations){if(byId.has(entry.id)){const other=byId.get(entry.id);other.orderReliable=false;other.tailKnown=false;other.readComplete=false;other.historyTailKnown=false;other.historyOrderReliable=false;other.detail='Найдено несколько историй одного диалога; нужно уточнить структуру страницы.';}else byId.set(entry.id,entry);}
       for(const item of select(document,ITEM).slice(0,LIMIT.conversations)){
         const id=identity(item);if(!id)continue;
         const previewNode=select(item,'[data-message-preview],.message-preview,.conversation-preview,.last-message'+(platform()==='1688'&&item.matches(INBOX_1688)?',.conversation-secondary-line > .desc':platform()==='alibaba'&&item.matches(INBOX_ALIBABA)?',.msg-wrapper .latest-msg > div':platform()==='mic'&&item.matches(INBOX_MIC)?',.rg-last-msg .last-msg':''))[0];const preview=textOf(previewNode,LIMIT.text,true);
@@ -262,7 +408,7 @@
       if(result.conversations.length){result.status='ready';result.detail=result.conversations.some(item=>item.active)?'Прочитаны доступные сообщения. Предпросмотры других диалогов требуют открытия пользователем.':'Доступен только список диалогов. Откройте нужную переписку, чтобы прочитать сообщения.';}
       else if(select(document,PENDING+(platform()==='mic'?',.conversation-lst .ant-skeleton-active':'')).length){result.status='loading';result.detail='История чата ещё загружается.';}
       else if(result.frames.some(frame=>frame.visible)){result.detail='Чат может находиться во вложенном фрейме; требуется отдельное чтение фрейма.';}
-      return result;
+      requestModelEvidence(result);return result;
     } catch {return {...result,status:'error',detail:'Не удалось прочитать структуру чата. Отправка и ввод не выполнялись.',conversations:[]};}
   }
   function openConversation(request) {
@@ -297,10 +443,10 @@
     return {ok:true,revealedId:request.conversationId};
   }
   for(const type of ['keydown','pointerdown','input','wheel','touchstart'])document.addEventListener(type,event=>{if(event.isTrusted){lastTrustedInput=Date.now();pendingReveal=null;}},{capture:true,passive:true});
-  globalThis.OpenLinksDialogsReader=Object.freeze({snapshot,openConversation,revealLatest});
+  globalThis.OpenLinksDialogsReader=Object.freeze({snapshot,openConversation,revealLatest,applyModelEvidence});
   globalThis.chrome?.runtime?.onMessage?.addListener((message,sender,respond)=>{
-    if(!['DIALOGS_SNAPSHOT','DIALOGS_OPEN_CONVERSATION','DIALOGS_REVEAL_LATEST'].includes(message?.type))return;
+    if(!['DIALOGS_SNAPSHOT','DIALOGS_OPEN_CONVERSATION','DIALOGS_REVEAL_LATEST','DIALOGS_APPLY_MODEL_EVIDENCE'].includes(message?.type))return;
     if(sender?.id!==chrome.runtime.id){respond({status:'error',detail:'Источник запроса не подтверждён.'});return;}
-    respond(message.type==='DIALOGS_SNAPSHOT'?snapshot():message.type==='DIALOGS_OPEN_CONVERSATION'?openConversation(message):revealLatest(message));
+    respond(message.type==='DIALOGS_SNAPSHOT'?snapshot():message.type==='DIALOGS_OPEN_CONVERSATION'?openConversation(message):message.type==='DIALOGS_APPLY_MODEL_EVIDENCE'?applyModelEvidence(message):revealLatest(message));
   });
 })();

@@ -11,6 +11,7 @@ OBSERVED_1688 = (ROOT / 'tests/fixtures/dialogs-1688-observed-structure.html').r
 OBSERVED_ALIBABA = (ROOT / 'tests/fixtures/dialogs-alibaba-observed-structure.html').read_text()
 OBSERVED_MIC = (ROOT / 'tests/fixtures/dialogs-mic-observed-structure.html').read_text()
 READER = ROOT / 'extension/dialogs-content.js'
+MODEL_EVIDENCE = (ROOT / 'extension/chat-model-evidence.js').read_text()
 checks = 0
 TRANSPORT = """
 window.readerListeners=[];
@@ -142,8 +143,9 @@ with sync_playwright() as p:
     passed('unbounded and control-character IDs are rejected instead of silently truncating/colliding')
 
     load();set_history('<div class="message-item incoming" data-message-id=attachment><img alt="Product attachment"></div>')
-    assert not active()['orderReliable'] and active()['messages']==[]
-    passed('unreadable attachment rows invalidate order rather than exposing an earlier message as last')
+    current=active();assert not current['tailKnown'] and len(current['messages'])==1 and current['coverage']['unreadAttachments']==1
+    assert current['messages'][0]['direction']=='inbound' and current['messages'][0]['attachments'][0]['name']=='Product attachment'
+    passed('attachment-only message is retained with its proven sender and unread attachment metadata instead of disappearing')
 
     load();page.evaluate('document.querySelector("[data-chat-root]").outerHTML+=document.querySelector("[data-chat-root]").outerHTML')
     assert len([row for row in snapshot()['conversations'] if row['active']])==1
@@ -155,12 +157,13 @@ with sync_playwright() as p:
     passed('frame discovery reports visibility and accepts same-platform HTTPS URLs only')
 
     load();page.evaluate('document.querySelector("[data-message-history]").insertAdjacentHTML("beforeend", "<div class=unrecognized-bubble>New but unknown row</div>")')
-    assert not active()['orderReliable']
+    current=active();assert not current['orderReliable'] and current['messages'][-1]['text']=='New but unknown row' and current['messages'][-1]['direction']=='unknown'
+    assert current['coverage']['unmatchedTextNodes']==1 and current['coverage']['unsupportedMessages']==1
     load();page.evaluate('document.querySelector("[data-message-history]").insertAdjacentHTML("beforeend", "<img alt=unknown-attachment>")')
     # A visible media box without message semantics also prevents claiming order.
     page.evaluate('document.querySelector("[data-message-history] img").style.cssText="display:block;width:50px;height:50px"')
-    assert not active()['orderReliable']
-    passed('partially matched transcript text and attachments cannot make an earlier recognized row the apparent newest message')
+    current=active();assert not current['orderReliable'] and current['messages'][-1]['attachments'][0]['type']=='image' and current['coverage']['unreadAttachments']==1
+    passed('unmatched transcript text and orphan attachments are retained explicitly with coverage gaps rather than silently omitted')
 
     load();set_history('<div class="message-item incoming" data-message-id="long">'+('x'*12001)+'</div>')
     assert len(active()['messages'][0]['text'])==12000 and not active()['orderReliable']
@@ -240,10 +243,106 @@ with sync_playwright() as p:
     assert active()['messages'][0]['direction']=='unknown'
     passed('1688 mismatched avatar/name or incomplete self markers cannot infer incoming/outgoing direction')
 
+    def prepare_staff_evidence():
+        load_active1688()
+        page.evaluate('''() => {
+          document.querySelector('.message-item:not(.self) .nick').textContent='Synthetic supplier:Synthetic staff';
+          const rows=[...document.querySelectorAll('.message-item-line')],threadId=document.querySelector('.conversation-item.active').id;
+          const model=(incoming,id)=>({conversationCode:threadId,code:{messageId:id},sender:{targetId:incoming?'900000009':'900000001',targetType:'8'},receiver:{targetId:incoming?'900000001':'900000002',targetType:'8'},ext:{senderUserId:incoming?'900000009':'900000001',senderMainUserId:incoming?'900000002':'900000001',receiverUserId:incoming?'900000001':'900000009',receiverMainUserId:incoming?'900000001':'900000002'},selfState:1,msgType:101});
+          Object.defineProperty(rows[0],'__reactProps$synthetic',{value:{message:model(false,'server-outgoing')},configurable:true});
+          Object.defineProperty(rows[2],'__reactProps$synthetic',{value:{message:model(true,'server-staff')},configurable:true});
+        }''')
+        before=snapshot();assert active(before)['messages'][-1]['direction']=='unknown' and before['modelEvidenceToken']
+        evidence=page.evaluate(MODEL_EVIDENCE)
+        return {'documentToken':before['documentToken'],'modelEvidenceToken':before['modelEvidenceToken'],'evidence':evidence}
+
+    request=prepare_staff_evidence();effects=page.evaluate('({...readerSideEffects})');request_count=len(requests)
+    reply=page.evaluate('(request)=>OpenLinksDialogsReader.applyModelEvidence(request)',request)
+    assert reply['ok'] and reply['applied']==2
+    current=active();assert current['messages'][-1]['direction']=='inbound' and current['messages'][-1]['id']=='server-staff' and current['messages'][0]['id']=='server-outgoing'
+    assert current['messages'][-1]['legacyAliases']==[{'text':'We have stock.','direction':'unknown','kind':'model-direction'},{'text':'We have stock.','direction':'inbound','kind':'model-direction'}]
+    assert current['coverage']['unknownSenders']==0 and page.evaluate('readerSideEffects')==effects and len(requests)==request_count
+    assert not page.evaluate('(request)=>OpenLinksDialogsReader.applyModelEvidence(request)',request)['ok']
+    page.evaluate('document.querySelector(".message-item:not(.self) pre").textContent="New text before fresh model evidence"')
+    assert active()['messages'][-1]['direction']=='unknown' and 'id' not in active()['messages'][-1]
+    passed('1688 MAIN metadata proves staff sender through exact main-account pair and self-row anchor, applies stable IDs once, and invalidates on DOM change')
+
+    request=prepare_staff_evidence()
+    assert not page.evaluate('(request)=>OpenLinksDialogsReader.applyModelEvidence({...request,documentToken:"wrong"})',request)['ok']
+    assert not page.evaluate('(request)=>OpenLinksDialogsReader.applyModelEvidence({...request,modelEvidenceToken:"wrong"})',request)['ok']
+    page.evaluate('document.querySelector(".message-item:not(.self) pre").textContent="Changed after model capture"')
+    assert not page.evaluate('(request)=>OpenLinksDialogsReader.applyModelEvidence(request)',request)['ok']
+    request=prepare_staff_evidence();request['evidence']['threadId']='900000001.1-900000099.1#11152@cntaobao'
+    assert not page.evaluate('(request)=>OpenLinksDialogsReader.applyModelEvidence(request)',request)['ok']
+    request=prepare_staff_evidence();request['evidence']['rows'][0]['model']['ext']['senderMainUserId']='900000099'
+    assert not page.evaluate('(request)=>OpenLinksDialogsReader.applyModelEvidence(request)',request)['ok']
+    assert active()['messages'][-1]['direction']=='unknown'
+    passed('model metadata from stale documents/nonces, changed DOM, another thread or an unrelated account never proves staff identity')
+
+    request=prepare_staff_evidence();page.evaluate('document.querySelector(".rc-scrollbars-view").append(document.querySelectorAll(".message-item-line")[2].cloneNode(true))')
+    before=snapshot();request['modelEvidenceToken']=before['modelEvidenceToken'];request['evidence']=page.evaluate(MODEL_EVIDENCE)
+    reply=page.evaluate('(request)=>OpenLinksDialogsReader.applyModelEvidence(request)',request)
+    current=active();assert reply['ok'] and len(current['messages'])==4 and current['messages'][-1]['direction']=='unknown' and current['messages'][-2]['direction']=='unknown'
+    assert all('id' not in message for message in current['messages'][-2:])
+    passed('identical DOM signatures are ambiguous and cannot collapse two staff messages into one server ID')
+
+    request=prepare_staff_evidence();page.evaluate('document.querySelector(".message-item:not(.self) .nick").textContent="Synthetic supplier"')
+    before=snapshot();assert 'modelEvidenceToken' not in before
+    # Keep another staff row unknown so collection is requested while one known
+    # incoming row contains deliberately contradictory account evidence.
+    page.evaluate('document.querySelector(".message-item:not(.self)").setAttribute("data-direction","unknown")')
+    before=snapshot();request['modelEvidenceToken']=before['modelEvidenceToken'];request['evidence']=page.evaluate(MODEL_EVIDENCE)
+    assert page.evaluate('(request)=>OpenLinksDialogsReader.applyModelEvidence(request)',request)['ok']
+    current=active();assert current['messages'][-1]['direction']=='unknown' and 'id' not in current['messages'][-1] and not current['historyOrderReliable']
+    passed('explicit ambiguous or conflicting sender metadata cannot be overridden by MAIN evidence or borrow its server ID')
+
+    request=prepare_staff_evidence();page.evaluate('const self=document.querySelector(".message-item.self");self.closest(".message-item-line").remove();const incoming=document.querySelector(".message-item:not(.self)");incoming.insertAdjacentHTML("beforeend","<blockquote class=quoted-message>"+self.outerHTML+"</blockquote>")')
+    before=snapshot();request['modelEvidenceToken']=before['modelEvidenceToken'];request['evidence']=page.evaluate(MODEL_EVIDENCE)
+    assert not page.evaluate('(request)=>OpenLinksDialogsReader.applyModelEvidence(request)',request)['ok'] and active()['messages'][-1]['direction']=='unknown'
+    passed('a quoted nested self message cannot establish the buyer account or reverse staff directions')
+
     load_active1688(history_1688.replace('We have stock.','<span>Product information</span>').replace('<pre class=edit contenteditable=false><span>Product information</span></pre>','<div class=file-msg><div class=file-name>synthetic-specification.xlsx</div><div class=file-operation>Download</div></div>'))
     current=active();page.wait_for_timeout(1100);current=active()
-    assert not current['tailKnown'] and current['messages'][-1]['direction']=='unknown' and 'содержимое не прочитано' in current['messages'][-1]['text']
-    passed('1688 attachment records remain explicit unread-content placeholders and prevent drafting')
+    assert not current['tailKnown'] and current['messages'][-1]['direction']=='inbound' and 'содержимое не прочитано' in current['messages'][-1]['text']
+    assert current['messages'][-1]['attachments']==[{'type':'file','name':'synthetic-specification.xlsx','url':'','text':'','contentRead':False}]
+    assert current['coverage']['unreadAttachments']==1 and current['coverage']['unknownSenders']==0
+    passed('1688 attachment records retain filename and proven sender independently of unread file contents')
+
+    survey_1688='''<div class=message-item-line><div class="im-template-msg dx-msg-wrap"><div class=tpl-wrapper><div class=FrameLayout_0><div class=FrameLayout_56><div class=LinearLayout_57><div class=LinearLayout_58><div class=FastTextView_59><span>期待您的真实反馈</span></div><div class=LinearLayout_60>'''+''.join('<div class=list-item><div class=LinearLayout_61><div class=FastTextView_63><span>'+label+'</span></div></div></div>' for label in ['很不满','不满','一般','满意','很满意'])+'''</div></div></div></div></div></div></div></div>'''
+    load_active1688(history_1688+survey_1688);active();page.wait_for_timeout(1100);current=active()
+    assert current['orderReliable'] and current['tailKnown'] and len(current['messages'])==4 and current['messages'][-1]['direction']=='system'
+    assert current['messages'][-1]['text']=='期待您的真实反馈 很不满 不满 一般 满意 很满意' and current['coverage']['unsupportedMessages']==0
+    page.evaluate('document.querySelector(".FastTextView_59").insertAdjacentHTML("beforeend","<span>Unrecognized additional content</span>")')
+    current=active();assert not current['orderReliable'] and current['messages'][-1]['direction']=='unknown' and 'Unrecognized additional content' in current['messages'][-1]['text']
+    passed('exact observed 1688 satisfaction survey is preserved as system content; altered or additional content is retained as unknown')
+
+    load_active1688(history_1688+survey_1688);page.evaluate('for(const node of document.querySelectorAll(".im-template-msg,.list-item"))node.style.display="contents"')
+    current=active();assert current['messages'][-1]['direction']=='system' and current['coverage']['unsupportedMessages']==0
+    assert current['messages'][-1]['legacyAliases'][1]['text']=='暂不支持的消息类型 [Нераспознанный формат сообщения; доступный текст сохранён]'
+    passed('1688 survey recognition supports layout wrappers without their own boxes while retaining exact visible labels and narrow correction aliases')
+
+    load_active1688(history_1688+'<div class=message-item-line><div><span>暂不支持的消息类型</span></div></div>');active();page.wait_for_timeout(1100);current=active()
+    assert current['historyStable'] and not current['readComplete'] and not current['historyTailKnown'] and 'повторная проверка' in current['detail']
+    page.evaluate('(html)=>document.querySelector(".message-item-line:last-child").outerHTML=html',survey_1688)
+    active();page.wait_for_timeout(1100);current=active();assert current['readComplete'] and current['messages'][-1]['direction']=='system'
+    passed('exact temporary 1688 unsupported-type placeholder keeps traversal pending until the real supported card has loaded and stabilized')
+
+    load_active1688(history_1688+'<div class=message-item-line><div class="im-template-msg dx-msg-wrap"><span>Unrecognized supplier card text</span></div></div>')
+    current=active();assert len(current['messages'])==4 and current['messages'][-1]['direction']=='unknown' and 'Unrecognized supplier card text' in current['messages'][-1]['text']
+    assert current['messages'][-1]['format']=='unrecognized' and current['coverage']['unsupportedMessages']==1
+    passed('new 1688 native card formats are kept as messages with explicit coverage gaps instead of dropped or classified as surveys')
+
+    load_active1688(history_1688+survey_1688);page.evaluate('document.querySelector(".message-item-line:last-child").insertAdjacentHTML("beforeend","<span>Supplier content beside survey</span><img alt=product style=width:30px;height:30px>")')
+    current=active();assert current['messages'][-1]['direction']=='unknown' and 'Supplier content beside survey' in current['messages'][-1]['text']
+    assert current['coverage']['unreadAttachments']==1 and current['coverage']['unsupportedMessages']==1
+    passed('survey recognition cannot swallow adjacent supplier text or product media into a system message')
+
+    load_active1688();page.evaluate('document.querySelector(".message-item:not(.self) .content-row > .content").innerHTML="<div class=file-msg><div class=file-name title=synthetic-catalog.pdf>Catalog</div><div class=file-size>12 KB</div><a class=download-file href=\\\"https://cdn.example.test/catalog.pdf?version=1\\\">Download</a></div>"')
+    current=active();attachment=current['messages'][-1]['attachments'][0]
+    assert attachment=={'type':'file','name':'synthetic-catalog.pdf','url':'https://cdn.example.test/catalog.pdf?version=1','text':'12 KB','contentRead':False}
+    request_count=len(requests);effects=page.evaluate('({...readerSideEffects})');snapshot();snapshot()
+    assert len(requests)==request_count and page.evaluate('readerSideEffects')==effects
+    passed('1688 file reference preserves name, size and HTTPS URL without clicking download or fetching its contents')
 
     load_active1688();page.evaluate('const history=document.querySelector(".message-list"),wrapper=document.createElement("div");wrapper.className="ww_message";history.parentElement.insertBefore(wrapper,history);wrapper.append(history);history.style.cssText="height:40px;overflow:hidden";document.querySelector(".rc-scrollbars-view").insertAdjacentHTML("afterbegin","<div><span>暂无更多消息</span></div>")')
     active();page.wait_for_timeout(1100);current=active();assert current['orderReliable'] and current['readComplete']
@@ -320,6 +419,17 @@ with sync_playwright() as p:
     assert not current.get('canSelect')
     passed('observed Alibaba selected thread reads original content once, separates system notices, and uses explicit send/rec metadata')
 
+    load_active_alibaba();page.evaluate('document.querySelector(".scroll-box").insertAdjacentHTML("beforeend","<div class=message-item-wrapper><div class=item-content-wrap><div class=\\\"item-system-notice level-1\\\"><div class=notice-container><div class=notice-main><div class=notice-content><span class=notice-text>Synthetic platform notice</span></div></div></div></div></div></div>");document.querySelector(".item-left-text .user-content").insertAdjacentHTML("beforeend","<div class=session-translate><div class=translate-result><p class=target-content>Translated text</p><img class=translate-icon-small style=width:30px;height:30px src=\\\"https://cdn.example.test/platform-translate.png\\\"></div></div>")')
+    current=active();assert current['messages'][-1]['direction']=='system' and current['messages'][-1]['text']=='Synthetic platform notice'
+    assert current['coverage']['unsupportedMessages']==0 and current['coverage']['attachments']==0 and current['coverage']['unknownSenders']==0
+    assert current['messages'][-1]['legacyAliases']==[{'text':'Synthetic platform notice [Нераспознанный формат сообщения; доступный текст сохранён]','direction':'unknown','kind':'platform-ui'}]
+    assert current['messages'][1]['legacyAliases']==[{'text':current['messages'][1]['text']+' [Вложение: содержимое не прочитано]','direction':'inbound','kind':'platform-ui','ignoredAttachments':[{'type':'image','name':'','url':'https://cdn.example.test/platform-translate.png'}]},{'text':'[Вложение: содержимое не прочитано]','direction':'unknown','kind':'reader-placeholder'}]
+    page.wait_for_timeout(1100);assert active()['tailKnown'] and active()['orderReliable']
+    page.evaluate('document.querySelector(".item-left-text .user-content").insertAdjacentHTML("beforeend","<img alt=Actual-product-photo style=width:30px;height:30px src=\\\"https://cdn.example.test/product.png\\\">")')
+    current=active();assert current['coverage']['attachments']==1 and current['messages'][1]['attachments'][0]['name']=='Actual-product-photo'
+    assert 'legacyAliases' not in current['messages'][1]
+    passed('observed Alibaba platform notices remain system messages and translation controls are excluded while real sibling product images are preserved')
+
     page.evaluate('document.querySelector(".message-flow-menu-box.rec").classList.add("send")')
     assert active()['messages'][1]['direction']=='unknown'
     load_active_alibaba();page.evaluate('document.querySelector(".item-left-text .message-flow-menu-box").remove()')
@@ -395,6 +505,49 @@ with sync_playwright() as p:
     load_active_mic();page.evaluate('document.querySelector(".contact-chatInfo .avatar img").src="data:image/png;base64,b3RoZXI="')
     assert active()['messages'][-1]['direction']=='unknown'
     passed('MIC mismatched sender name or avatar stays unknown despite contact-like row styling')
+
+    load_active_mic();page.evaluate('document.querySelector(".msg-list").insertAdjacentHTML("beforeend","<div class=msg-box><div class=msg-system-box><div class=\\\"msg-inquiry-assign iAmBuyer\\\"><div class=content-inquiry-assign><div class=title-inquiry-assign>Chat assigned to <span class=name>Synthetic colleague</span></div><div>Platform assignment notice</div></div></div></div></div>")')
+    current=active();assert current['messages'][-1]['direction']=='system' and 'Synthetic colleague' in current['messages'][-1]['text']
+    assert current['coverage']['unsupportedMessages']==0 and current['coverage']['unknownSenders']==0
+    assert current['messages'][-1]['legacyAliases'][0]['text']==current['messages'][-1]['text']+' [Нераспознанный формат сообщения; доступный текст сохранён]'
+    passed('observed MIC inquiry assignment is retained as platform system content with an exact bounded alias for its former unread-format representation')
+
+    load_active_mic();page.evaluate('document.querySelector(".msg-text").innerHTML="Before <img class=chat-text-sys-emotion title=\\\"[Love]\\\" style=width:24px;height:24px src=\\\"https://webim.made-in-china.com/super-tm/8ede13664ff6b499fc82099056f055fc.gif\\\"><img class=chat-text-sys-emotion title=\\\"[Love]\\\" style=width:24px;height:24px src=\\\"https://webim.made-in-china.com/super-tm/8ede13664ff6b499fc82099056f055fc.gif\\\"> after"')
+    current=active();message=current['messages'][-1];assert message['text']=='Before [Love] [Love] after' and 'attachments' not in message and current['coverage']['unreadAttachments']==0
+    assert message['legacyAliases'][0]['text']=='Before after [Вложение: содержимое не прочитано]'
+    assert message['legacyAliases'][0]['ignoredAttachments']==[{'type':'image','name':'[Love]','url':'https://webim.made-in-china.com/super-tm/8ede13664ff6b499fc82099056f055fc.gif'}]
+    page.evaluate('document.querySelector(".chat-text-sys-emotion").src="https://cdn.example.test/unknown.gif"')
+    current=active();assert current['coverage']['unreadAttachments']==1 and 'legacyAliases' not in current['messages'][-1]
+    passed('MIC official native emoji labels are preserved in message order without OCR claims; unverified images remain unread attachments and have no cleanup alias')
+
+    load_active_mic();page.evaluate('const row=document.querySelector(".contact-chatInfo");row.className="mine-chatInfo";row.querySelector(".fromUserName").textContent="Synthetic buyer";row.parentElement.insertAdjacentHTML("beforeend","<div class=msg-system>Platform system notice</div><div class=diversion-enhanced-reminder>Platform reminder</div>")')
+    current=active();assert current['messages'][2]['direction']=='outbound' and current['messages'][2]['id']=='10000000-0000-0000-0000-000000000001'
+    assert [m['direction'] for m in current['messages'][-2:]]==['system','system'] and current['messages'][-1]['text']=='Platform reminder'
+    assert current['coverage']['unknownSenders']==0 and current['coverage']['capturedMessages']==5
+    page.evaluate('document.querySelector(".mine-chatInfo").classList.add("contact-chatInfo")')
+    assert active()['messages'][2]['direction']=='unknown'
+    passed('observed MIC mine-chatInfo identifies outbound UUID messages; attached platform notices are separately retained and conflicting markers stay unknown')
+
+    load_active_mic();page.evaluate('document.querySelector(".chat-txt .msg-text").innerHTML="<span>Photo of model A</span><img alt=Model-A style=width:30px;height:30px src=\\\"https://cdn.example.test/model-a.png\\\">"')
+    current=active();message=current['messages'][-1]
+    assert message['direction']=='inbound' and 'Photo of model A' in message['text'] and message['attachments'][0]['type']=='image'
+    assert message['attachments'][0]['url']=='https://cdn.example.test/model-a.png' and not message['attachments'][0]['contentRead'] and current['coverage']['unreadAttachments']==1
+    request_count=len(requests);effects=page.evaluate('({...readerSideEffects})');snapshot();snapshot()
+    assert len(requests)==request_count and page.evaluate('readerSideEffects')==effects
+    passed('MIC image preserves caption, source reference and sender while explicitly reporting that image contents remain unread')
+
+    load_active_mic();page.evaluate('document.querySelector(".chat-content").insertAdjacentHTML("beforeend","<img alt=Sibling-photo style=width:30px;height:30px src=\\\"https://cdn.example.test/sibling.png\\\">")')
+    current=active();assert current['messages'][-1]['attachments'][0]['name']=='Sibling-photo' and current['coverage']['unreadAttachments']==1
+    active();page.wait_for_timeout(1100);current=active();assert current['historyTailKnown'] and current['historyOrderReliable'] and not current['tailKnown']
+    passed('MIC media beside the text body is retained and structural history readiness remains separate from unread image contents')
+
+    load_active_mic();page.evaluate('document.querySelector(".chat-content").insertAdjacentHTML("beforeend",Array.from({length:31},(_,i)=>"<img alt=Picture-"+i+" style=width:30px;height:30px>").join(""))')
+    current=active();assert len(current['messages'][-1]['attachments'])==30 and current['coverage']['limited'] and not current['historyOrderReliable']
+    passed('attachment limits are explicit coverage gaps and cannot silently authorize content-complete history')
+
+    load_active_mic();page.evaluate('const template=document.querySelector(".msg-box"),history=document.querySelector(".msg-list"),rows=[];for(let i=0;i<500;i++){const row=template.cloneNode(true);row.querySelector(".contact-chatInfo").id="10000000-0000-0000-0000-"+String(i).padStart(12,"0");row.insertAdjacentHTML("beforeend","<div class=msg-system>Platform notice</div>");rows.push(row)}history.replaceChildren(...rows)')
+    current=active();assert len(current['messages'])<=500 and current['coverage']['limited'] and current['coverage']['totalRows']>500 and not current['historyOrderReliable']
+    passed('MIC message plus system-notice expansion respects the 500-message bound and reports omitted history explicitly')
 
     assert not errors, errors
     browser.close()
