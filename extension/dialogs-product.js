@@ -1,6 +1,7 @@
 import {displayTime} from './lib/time.js';
 import {PRODUCT_FILE_LIMITS, readProductFiles, readProductOriginal, deleteProductFile} from './lib/product-files.js';
 import {productApprovalError} from './lib/dialogs.js';
+import {providerInfo} from './lib/dialog-ai.js';
 
 const $=selector=>document.querySelector(selector);
 const FIELDS={sourceUrl:'url',cardText:'card',characteristics:'characteristics',keyPoints:'points',questions:'questions',rules:'rules',warnings:'warnings'};
@@ -9,7 +10,7 @@ const clone=value=>structuredClone(value);
 const element=(tag,text,className)=>{const el=document.createElement(tag);if(text!==undefined)el.textContent=text;if(className)el.className=className;return el;};
 const emptyProduct=()=>({revision:0,files:[],sourceUrl:'',cardText:'',characteristics:'',keyPoints:'',questions:'',rules:'',warnings:'',approval:null,extraction:null});
 
-export function setupProductUI({command,adopt,feedback,onDirty=()=>{}}){
+export function setupProductUI({command,adopt,feedback,exportPrompt,onDirty=()=>{}}){
   let state=null,ai={},fingerprint='',baseFingerprint='',baseRevision=0,files=[],dirty=false,settingsDirty=false;
   let operation='',autoBusy=false,pendingFiles=[],retryId=null,disablePromise=null;
   const originals=new Map(),removed=new Set(),expanded=new Set();
@@ -72,10 +73,11 @@ export function setupProductUI({command,adopt,feedback,onDirty=()=>{}}){
     for(const el of $('#dialogs-product-form').querySelectorAll('input,textarea'))el.disabled=!!operation;
     $('#dialogs-product-save').disabled=!!operation||!dirty;
     $('#dialogs-product-extract').disabled=!!operation||!configurationReady()||!sourceReady()||settingsDirty;
+    $('#dialogs-product-export').disabled=!!operation||!sourceReady()||settingsDirty;
     $('#dialogs-product-approve').disabled=!!operation||dirty||settingsDirty||!!approvalIssue||approved;
     $('#dialogs-product-approve').textContent=approved?'Версия '+saved.revision+' согласована':'Согласовать версию '+(saved.revision||0);
     $('#dialogs-product-reset').disabled=!!operation||!dirty;
-    $('#dialogs-product-extraction-state').textContent=operation==='extract'?'Извлекаю информацию…':operation==='files'?'Читаю выбранные файлы…':operation==='save'?'Сохраняю…':operation==='approve'?'Согласование…':saved.extraction?'Информация извлечена. Проверьте её перед согласованием.':!configurationReady()?'Для извлечения укажите модель и API-ключ в настройках ниже.':'';
+    $('#dialogs-product-extraction-state').textContent=operation==='extract'?'Извлекаю информацию…':operation==='export'?'Формирую промпт…':operation==='import'?'Применяю ответ Claude…':operation==='files'?'Читаю выбранные файлы…':operation==='save'?'Сохраняю…':operation==='approve'?'Согласование…':saved.extraction?'Информация извлечена. Проверьте её перед согласованием.':!configurationReady()?'Без API-ключа используйте «Промпт для Claude · TXT».':'';
     const auto=!!state.settings?.autoDraft;
     $('#dialogs-auto-draft').checked=auto;$('#dialogs-auto-draft').disabled=autoBusy||(!auto&&(!approved||!configurationReady()));
     $('#dialogs-auto-draft-state').textContent=disablePromise?'Выключаю автоматические черновики после изменения данных…':autoBusy?'Изменяю режим…':auto?(state.running?'Автоматические черновики включены для всех выбранных вкладок. Отправка сообщений отключена.':'Автоматические черновики включены. Начните мониторинг, чтобы обрабатывать новые сообщения.') :!approved?'Автоматические черновики выключены. Сохраните и согласуйте сведения о товаре.':!configurationReady()?'Автоматические черновики выключены. Укажите модель и API-ключ в настройках ниже.':'Автоматические черновики выключены. Можно готовить ответы вручную или включить этот режим.';
@@ -111,20 +113,26 @@ export function setupProductUI({command,adopt,feedback,onDirty=()=>{}}){
   $('#dialogs-product-reset').addEventListener('click',()=>withOperation('reset',async()=>{for(const file of files)if(!(product().files||[]).some(saved=>saved.id===file.id))await forgetFile(file.id);removed.clear();dirty=false;hydrate();feedback('Загружена сохранённая версия. Несохранённые правки сброшены.');}));
   $('#dialogs-product-extract').addEventListener('click',()=>{
     // Keep permission request in the original user gesture, before any storage awaits.
-    const permission=chrome.permissions.request({origins:['https://api.openai.com/*']});
-    withOperation('extract',async()=>{if(!await permission)throw new Error('Доступ к OpenAI API не разрешён. Материалы не передавались.');await save();const result=await command('PRODUCT_EXTRACT',{revision:product().revision||0,fingerprint});dirty=false;adopt(result);hydrate();feedback('Важная информация извлечена. Проверьте факты и вопросы, затем согласуйте версию.');});
+    const provider=providerInfo(ai.provider),permission=chrome.permissions.request({origins:[provider.origin]});
+    withOperation('extract',async()=>{if(!await permission)throw new Error('Доступ к '+provider.label+' API не разрешён. Материалы не передавались.');await save();const result=await command('PRODUCT_EXTRACT',{revision:product().revision||0,fingerprint});dirty=false;adopt(result);hydrate();feedback('Важная информация извлечена. Проверьте факты и вопросы, затем согласуйте версию.');});
   });
+  $('#dialogs-product-export').addEventListener('click',()=>withOperation('export',async()=>{$('#dialogs-prompt-panel').hidden=true;if(settingsDirty)throw new Error('Сначала сохраните настройки задания.');await save();const result=await command('EXPORT_PRODUCT_PROMPT',{revision:product().revision||0,fingerprint});if(result.state)adopt(result);exportPrompt(result.promptExport,{kind:'product'});feedback('Промпт готов. Скопируйте его или скачайте TXT и перенесите в Claude.');}));
   $('#dialogs-product-approve').addEventListener('click',()=>withOperation('approve',async()=>{if(dirty||settingsDirty)throw new Error('Сначала сохраните изменения.');const result=await command('PRODUCT_APPROVE',{revision:product().revision||0,fingerprint});adopt(result);feedback('Информация согласована. Можно готовить черновики ответов.');}));
   $('#dialogs-auto-draft').addEventListener('change',async()=>{
     const enabled=$('#dialogs-auto-draft').checked;
-    const permission=enabled?chrome.permissions.request({origins:['https://api.openai.com/*']}):Promise.resolve(true);
+    const provider=providerInfo(ai.provider),permission=enabled?chrome.permissions.request({origins:[provider.origin]}):Promise.resolve(true);
     autoBusy=true;render();
-    try{if(!await permission)throw new Error('Доступ к OpenAI API не разрешён. Автоматические черновики не включены.');if(enabled&&(!isApproved()||!configurationReady()))throw new Error('Сначала согласуйте сведения о товаре и сохраните настройки OpenAI.');adopt(await command('AUTODRAFT',{enabled}));feedback(enabled?'Автоматические черновики включены. Сообщения не отправляются.':'Автоматические черновики выключены.');}catch(error){feedback(error.message,true);}finally{autoBusy=false;render();}
+    try{if(!await permission)throw new Error('Доступ к '+provider.label+' API не разрешён. Автоматические черновики не включены.');if(enabled&&(!isApproved()||!configurationReady()))throw new Error('Сначала согласуйте сведения о товаре и сохраните настройки '+provider.label+'.');adopt(await command('AUTODRAFT',{enabled}));feedback(enabled?'Автоматические черновики включены. Сообщения не отправляются.':'Автоматические черновики выключены.');}catch(error){feedback(error.message,true);}finally{autoBusy=false;render();}
   });
   return {
     render(nextState,nextAI,nextFingerprint){state=nextState;ai=nextAI;fingerprint=nextFingerprint||nextState?.product?.fingerprint||'';if(!dirty&&!operation)hydrate();render();},
     isDirty:()=>dirty||settingsDirty,
     isApproved,
+    async importResult(request,text,imagesAttached){
+      let applied=false;
+      await withOperation('import',async()=>{if(dirty||settingsDirty)throw new Error('Сначала сохраните изменения и сформируйте новый промпт.');const result=await command('IMPORT_PRODUCT_RESULT',{request,text,imagesAttached});dirty=false;adopt(result);hydrate();applied=true;feedback('Ответ Claude применён. Проверьте факты и вопросы, затем согласуйте новую версию.');});
+      return applied;
+    },
     setSettingsDirty(value){settingsDirty=value;if(value)pauseAutomatic();render();onDirty();},
   };
 }

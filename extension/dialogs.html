@@ -13,7 +13,7 @@
       <a class="nav" href="dashboard.html">▤ <span>Очередь поставщиков</span></a>
       <a class="nav active" href="dialogs.html" aria-current="page">☷ <span>Диалоги с поставщиками</span></a>
     </nav>
-    <div class="sidebar-bottom"><span class="live-dot"></span> История хранится в Chrome<p>Передача в OpenAI — по вашему действию или после включения автоматических черновиков.</p></div>
+    <div class="sidebar-bottom"><span class="live-dot"></span> История хранится в Chrome<p>API выбранного сервиса или ручной промпт для Claude в TXT.</p></div>
   </aside>
   <main>
     <header><div><div class="eyebrow">КОММУНИКАЦИЯ С ПОСТАВЩИКАМИ</div><h1>Диалоги с поставщиками</h1></div><div id="dialogs-run-state" class="state">Загрузка…</div></header>
@@ -29,15 +29,15 @@
         <label for="dialogs-product-url">Ссылка на карточку товара (необязательно)</label><input id="dialogs-product-url" type="url" maxlength="4096" placeholder="https://…">
         <div class="dialogs-form-grid"><div><label for="dialogs-product-card">Описание или текст карточки товара</label><textarea id="dialogs-product-card" rows="6" maxlength="30000" placeholder="Вставьте описание товара, комплектацию и сведения из карточки."></textarea></div><div><label for="dialogs-product-characteristics">Нужные характеристики</label><textarea id="dialogs-product-characteristics" rows="6" maxlength="12000" placeholder="Размеры, материал, модель, количество, требования к качеству и упаковке."></textarea></div></div>
         <div class="dialogs-product-files"><div class="panel-heading"><h3>Файлы товара</h3><label class="file-button">Добавить файлы<input id="dialogs-product-files" type="file" multiple hidden></label></div><p class="hint">Excel, PDF, DOCX, изображения и текст. До 8 файлов. Результат чтения каждого файла показан ниже; неподдерживаемый формат не считается прочитанным.</p><div id="dialogs-product-file-list"></div><p id="dialogs-product-files-empty" class="hint">Файлов пока нет. Можно работать только с описанием.</p><input id="dialogs-product-file-retry" type="file" hidden aria-label="Выбрать файл повторно"></div>
-        <div class="actions"><button id="dialogs-product-extract" class="button secondary" type="button" disabled>Получить важную информацию</button><span id="dialogs-product-extraction-state" class="hint" role="status"></span></div>
-        <p class="hint">Эта кнопка передаёт описание и прочитанные материалы в OpenAI. Проверьте полученные факты, вопросы и ограничения перед согласованием. Исходные файлы хранятся локально в Chrome.</p>
+        <div class="actions"><button id="dialogs-product-extract" class="button secondary" type="button" disabled>Получить важную информацию через API</button><button id="dialogs-product-export" class="button secondary" type="button" disabled>Промпт для Claude · TXT</button><span id="dialogs-product-extraction-state" class="hint" role="status"></span></div>
+        <p class="hint">Через API материалы передаются выбранному сервису. Промпт TXT формируется локально без ключа: перенесите его в Claude вручную, затем вставьте ответ обратно. Проверьте факты и вопросы перед согласованием. Исходные файлы хранятся в Chrome.</p>
         <div class="dialogs-form-grid"><div><label for="dialogs-product-points">Факты и важная информация для переговоров</label><textarea id="dialogs-product-points" rows="7" maxlength="16000" placeholder="Подтверждённые характеристики и требования. Можно заполнить самостоятельно."></textarea></div><div><label for="dialogs-product-questions">Что уточнять у продавца</label><textarea id="dialogs-product-questions" rows="7" maxlength="8000" placeholder="Цена, MOQ, наличие, срок производства, доставка, образец…"></textarea></div></div>
         <label for="dialogs-product-rules">Ваши правила общения</label><textarea id="dialogs-product-rules" rows="4" maxlength="8000" placeholder="Что можно обещать, какие условия требуют моего решения, когда предложить WeChat."></textarea>
         <label for="dialogs-product-warnings">Неясности и ограничения материалов</label><textarea id="dialogs-product-warnings" rows="3" maxlength="4000" placeholder="Каких сведений нет, какие данные противоречат друг другу или требуют проверки."></textarea>
         <p id="dialogs-product-conflict" class="hint" hidden></p><p id="dialogs-product-approval-note" class="hint" aria-live="polite"></p>
         <div class="actions"><button id="dialogs-product-save" class="button secondary" type="submit" disabled>Сохранить изменения</button><button id="dialogs-product-approve" class="button primary" type="button" disabled>Согласовать информацию</button><button id="dialogs-product-reset" class="link-button" type="button" disabled>Сбросить несохранённые изменения</button></div>
       </form>
-      <div class="dialogs-auto-controls"><label class="check"><input id="dialogs-auto-draft" type="checkbox" disabled> Автоматически готовить черновики ответов</label><p id="dialogs-auto-draft-state" class="hint" role="status">Сначала сохраните и согласуйте сведения о товаре.</p><p class="hint">После включения выбранные переписки и согласованные сведения передаются в OpenAI во время мониторинга. Ответы остаются в этом окне; сообщения продавцам не отправляются. По умолчанию используется язык последнего сообщения продавца и естественный деловой стиль.</p></div>
+      <div class="dialogs-auto-controls"><label class="check"><input id="dialogs-auto-draft" type="checkbox" disabled> Автоматически готовить черновики ответов через API</label><p id="dialogs-auto-draft-state" class="hint" role="status">Сначала сохраните и согласуйте сведения о товаре.</p><p class="hint">После включения выбранные переписки и согласованные сведения передаются выбранному сервису во время мониторинга. Ответы остаются в этом окне; сообщения продавцам не отправляются. По умолчанию используется язык последнего сообщения продавца и естественный деловой стиль. Ручной режим TXT не требует API.</p></div>
     </section>
     <section aria-labelledby="dialogs-tabs-heading">
       <div class="panel-heading"><h2 id="dialogs-tabs-heading">Три вкладки чатов</h2><button id="dialogs-refresh-tabs" class="link-button">Обновить список вкладок</button></div>
@@ -57,10 +57,10 @@
           <p id="dialogs-coverage" class="hint" hidden></p>
           <div id="dialogs-history" class="dialogs-history" aria-label="История переписки"></div>
           <div class="dialogs-draft">
-            <div class="panel-heading"><h3>Черновик ответа</h3><button id="dialogs-generate" class="button secondary" disabled>Подготовить ответ с ИИ</button></div>
+            <div class="panel-heading"><h3>Черновик ответа</h3><div class="actions"><button id="dialogs-generate" class="button secondary" disabled>Подготовить ответ через API</button><button id="dialogs-export-draft" class="button secondary" disabled>Промпт для Claude · TXT</button></div></div>
             <p id="dialogs-generate-hint" class="hint"></p><p id="dialogs-draft-reason" class="hint" hidden></p>
             <p id="dialogs-auto-status" class="hint" role="status" hidden></p>
-            <label for="dialogs-draft-text">Текст для проверки и редактирования</label><textarea id="dialogs-draft-text" rows="6" maxlength="6000" placeholder="Здесь появится черновик. Его можно изменить и сохранить локально."></textarea>
+            <label for="dialogs-draft-text">Текст для проверки и редактирования</label><textarea id="dialogs-draft-text" rows="6" maxlength="6000" placeholder="Здесь появится черновик из API. Можно вставить ответ Claude вручную, отредактировать и сохранить локально."></textarea>
             <p id="dialogs-draft-status" class="hint" aria-live="polite"></p>
             <div class="actions"><button id="dialogs-save-draft" class="button primary" disabled>Сохранить черновик</button><button id="dialogs-discard-draft" class="link-button danger" disabled>Удалить черновик</button></div>
             <p class="hint">Сохранение черновика не отправляет сообщение поставщику.</p>
@@ -69,13 +69,22 @@
         <div id="dialogs-select-hint" class="dialogs-select-hint">Выберите переписку, чтобы увидеть историю и подготовить ответ.</div>
       </div>
     </section>
+    <section id="dialogs-prompt-panel" class="panel dialogs-prompt-panel" aria-labelledby="dialogs-prompt-heading" hidden>
+      <div class="panel-heading"><h2 id="dialogs-prompt-heading">Промпт для Claude</h2><button id="dialogs-prompt-close" class="link-button" type="button">Закрыть</button></div>
+      <p id="dialogs-prompt-note" class="hint"></p><p id="dialogs-prompt-warnings" class="hint" hidden></p>
+      <label for="dialogs-prompt-text">Готовый запрос</label><textarea id="dialogs-prompt-text" rows="12" readonly></textarea>
+      <div class="actions"><button id="dialogs-prompt-copy" class="button secondary" type="button">Скопировать промпт</button><button id="dialogs-prompt-download" class="button primary" type="button">Скачать TXT</button></div>
+      <p class="hint">Файл и буфер обмена содержат ваши материалы, а для ответа поставщику — историю выбранной переписки. Отправка в Claude выполняется вами вручную.</p>
+      <div id="dialogs-prompt-import" hidden><label for="dialogs-prompt-response">Ответ Claude с информацией о товаре (JSON)</label><textarea id="dialogs-prompt-response" rows="7" maxlength="40000" placeholder="Вставьте JSON из ответа Claude, включая keyPoints, questions и warnings."></textarea><label id="dialogs-prompt-images-label" class="check" hidden><input id="dialogs-prompt-images" type="checkbox"> Я приложил(а) в Claude все перечисленные изображения вместе с этим промптом</label><p id="dialogs-prompt-import-note" class="hint" role="status"></p><button id="dialogs-prompt-apply" class="button primary" type="button" disabled>Применить ответ Claude</button><p class="hint">После применения проверьте полученные сведения и согласуйте новую версию товара.</p></div>
+    </section>
     <details class="panel dialogs-settings" open>
       <summary>Задание для ИИ и подключение</summary>
       <form id="dialogs-settings-form">
         <label for="dialogs-brief">Дополнительное задание по закупке (необязательно)</label><textarea id="dialogs-brief" rows="4" maxlength="12000" placeholder="Дополнительные пожелания. Основные сведения о товаре и правила заполните в блоке выше."></textarea>
         <div class="dialogs-form-grid"><div><label for="dialogs-wechat">Ваш WeChat (необязательно)</label><input id="dialogs-wechat" type="text" maxlength="256" placeholder="WeChat ID"></div><div><label for="dialogs-language">Язык ответа (необязательно)</label><input id="dialogs-language" type="text" maxlength="100" placeholder="Автоматически — язык продавца"></div></div>
-        <div class="dialogs-form-grid"><div><label for="dialogs-model">Модель OpenAI API</label><input id="dialogs-model" type="text" maxlength="200" autocomplete="off" placeholder="Название модели, доступной вашему API-аккаунту"></div><div><label for="dialogs-api-key">API-ключ OpenAI</label><input id="dialogs-api-key" type="password" autocomplete="off" spellcheck="false" placeholder="Введите ключ для сохранения или замены"><p id="dialogs-key-status" class="hint">Ключ не сохранён.</p><label class="check"><input id="dialogs-clear-key" type="checkbox"> Удалить сохранённый ключ</label></div></div>
-        <p class="hint">OpenAI получает материалы для извлечения информации по вашей кнопке, а переписку и согласованное задание — для ручных или явно включённых автоматических черновиков. API оплачивается по условиям вашего API-аккаунта. Ключ хранится локально в расширении и не попадает в журнал. Изменение задания, WeChat или языка требует повторного согласования товара.</p>
+        <label for="dialogs-provider">Сервис для работы через API</label><select id="dialogs-provider"><option value="anthropic">Claude (Anthropic)</option><option value="openai">OpenAI</option></select>
+        <div class="dialogs-form-grid"><div><label id="dialogs-model-label" for="dialogs-model">Модель API</label><input id="dialogs-model" type="text" maxlength="200" autocomplete="off" placeholder="Название модели, доступной вашему API-аккаунту"></div><div><label id="dialogs-api-key-label" for="dialogs-api-key">API-ключ</label><input id="dialogs-api-key" type="password" autocomplete="off" spellcheck="false" placeholder="Введите ключ для сохранения или замены"><p id="dialogs-key-status" class="hint">Ключ не сохранён.</p><label class="check"><input id="dialogs-clear-key" type="checkbox"> Удалить сохранённый ключ выбранного сервиса</label></div></div>
+        <p class="hint">Ключ и модель сохраняются отдельно для каждого сервиса. API оплачивается по условиям вашего API-аккаунта; подписка на чат Claude не заменяет API-ключ. Ключ хранится локально в расширении и не попадает в журнал. Для ручного промпта TXT ключ не нужен. Изменение задания, WeChat или языка требует повторного согласования товара.</p>
         <button id="dialogs-save-settings" class="button primary" type="submit" disabled>Сохранить задание и настройки</button>
       </form>
     </details>

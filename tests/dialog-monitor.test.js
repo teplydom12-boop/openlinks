@@ -11,7 +11,7 @@ function snapshot(platform='1688',extra={}) {
   return {platform,status:'ready',url:urls[platform],documentToken:'doc-1',frames:[],conversations:[{id:'supplier-1',title:'Supplier',identityReliable:true,active:true,unread:true,orderReliable:true,tailKnown:true,messages:[{id:'m1',direction:'inbound',text:'What quantity do you need?'}]}],...extra};
 }
 function harness({attachmentResolver}={}) {
-  const storage={},calls=[],alarms=[],tabs=new Map([[1,{id:1,url:urls['1688'],status:'complete'}],[2,{id:2,url:urls.alibaba}],[3,{id:3,url:urls.mic}]]);
+  const storage={},calls=[],alarms=[],permissionRequests=[],tabs=new Map([[1,{id:1,url:urls['1688'],status:'complete'}],[2,{id:2,url:urls.alibaba}],[3,{id:3,url:urls.mic}]]);
   const replies=new Map([[1,snapshot()],[2,snapshot('alibaba')],[3,snapshot('mic')]]);
   const frameLists=new Map(),images=new Map();let reads=0,fetches=0,allowed=true,time=1000000,openAction=async message=>({ok:true,openedId:message.conversationId}),revealAction=async message=>({ok:true,revealedId:message.conversationId}),fetchAction=async()=>new Response(JSON.stringify({choices:[{message:{content:'We need 100 units. Could you share your WeChat?'}}]}));
   const listeners=()=>({list:[],addListener(fn){this.list.push(fn);}});
@@ -21,10 +21,10 @@ function harness({attachmentResolver}={}) {
       sendMessage:async(id,message,options)=>{calls.push({id,...structuredClone(message),frameId:options.frameId});if(message.type==='DIALOGS_OPEN_CONVERSATION')return openAction(message,id);if(message.type==='DIALOGS_REVEAL_LATEST')return revealAction(message,id);const value=replies.get(`${id}:${options.frameId}`) || replies.get(id);return typeof value==='function'?value(message):structuredClone(value);},onUpdated:listeners(),onRemoved:listeners()},
     webNavigation:{getAllFrames:async({tabId})=>frameLists.get(tabId) || [{frameId:0,parentFrameId:-1,url:tabs.get(tabId).url}]},
     alarms:{create:async(name,options)=>alarms.push({name,...options}),clear:async()=>true,onAlarm:listeners()},
-    permissions:{contains:async()=>allowed},
+    permissions:{contains:async request=>{permissionRequests.push(structuredClone(request));return typeof allowed==='function'?allowed(request):allowed;}},
   };
   const monitor=createDialogMonitor({api,now:()=>time,attachmentResolver,imageLoader:async key=>{if(!images.has(key))throw new Error('Файл изображения недоступен.');return images.get(key);},fetchImpl:async(...args)=>{fetches++;return fetchAction(...args);}});
-  return {api,monitor,storage,calls,alarms,tabs,replies,frameLists,images,advanceTime:ms=>{time+=ms;},get time(){return time;},get reads(){return reads;},get fetches(){return fetches;},set allowed(value){allowed=value;},set fetchAction(value){fetchAction=value;},set openAction(value){openAction=value;},set revealAction(value){revealAction=value;},command:(type,extra={},sender=ui)=>monitor.handle({type:'DIALOGS_'+type,...extra},sender)};
+  return {api,monitor,storage,calls,alarms,permissionRequests,tabs,replies,frameLists,images,advanceTime:ms=>{time+=ms;},get time(){return time;},get reads(){return reads;},get fetches(){return fetches;},set allowed(value){allowed=value;},set fetchAction(value){fetchAction=value;},set openAction(value){openAction=value;},set revealAction(value){revealAction=value;},command:(type,extra={},sender=ui)=>monitor.handle({type:'DIALOGS_'+type,...extra},sender)};
 }
 async function ready(h) {
   assert.equal((await h.command('BIND_TAB',{platform:'1688',tabId:1})).ok,true);
@@ -452,4 +452,137 @@ test('MV3 background orchestration uses static imports on the service-worker pat
     const source=await readFile(new URL('../extension/'+file,import.meta.url),'utf8');
     assert.doesNotMatch(source,/\bimport\s*\(/,`${file} must not use dynamic import in the MV3 service worker`);
   }
+});
+
+const providerStorageKey='openlinksDialogsProvider';
+const claudeResult=text=>new Response(JSON.stringify({type:'message',role:'assistant',stop_reason:'end_turn',content:[{type:'text',text}]}));
+const extractedProduct={keyPoints:'Buyer requires 100 units.',questions:'What is the MOQ?',warnings:'Confirm the exact model.'};
+async function useClaude(h){
+  const response=await h.command('SETTINGS',{provider:'anthropic',model:'claude-sonnet-4-6',apiKey:'private-anthropic-key'});
+  assert.equal(response.ok,true,response.error);return response;
+}
+async function manualReady(h){await ready(h);await h.command('SETTINGS',{clearApiKey:true});h.allowed=false;}
+async function exportProduct(h){
+  const current=await h.command('GET'),response=await h.command('EXPORT_PRODUCT_PROMPT',{revision:current.state.product.revision,fingerprint:current.productFingerprint});
+  assert.equal(response.ok,true,response.error);return response.promptExport;
+}
+async function exportDialog(h){const response=await h.command('EXPORT_DRAFT_PROMPT',{key});assert.equal(response.ok,true,response.error);return response.promptExport;}
+const saveExternalDraft=(h,request,text='We need 100 units. What is your MOQ?')=>h.command('SAVE_DRAFT',{key,request,revision:request.revision,fingerprint:request.fingerprint,text});
+
+test('legacy OpenAI settings migrate without copying credentials or models into Claude',async()=>{
+  const h=harness();h.storage[providerStorageKey]={model:'legacy-openai-model',apiKey:'private-legacy-key',revision:7};
+  const legacy=await h.command('GET');assert.equal(legacy.ai.provider,'openai');assert.equal(legacy.ai.model,'legacy-openai-model');assert.equal(legacy.ai.keyStored,true);assert.deepEqual(legacy.ai.providers.anthropic,{model:'',keyStored:false});
+  const selected=await h.command('SETTINGS',{provider:'anthropic'});assert.equal(selected.ok,true,selected.error);assert.equal(selected.ai.model,'');assert.equal(selected.ai.keyStored,false);
+  assert.deepEqual(h.storage[providerStorageKey],{provider:'anthropic',profiles:{openai:{model:'legacy-openai-model',apiKey:'private-legacy-key'},anthropic:{model:'',apiKey:''}},revision:8});
+  await useClaude(h);const restored=await h.command('SETTINGS',{provider:'openai'});assert.equal(restored.ai.model,'legacy-openai-model');assert.equal(restored.ai.keyStored,true);assert.equal(restored.ai.providers.anthropic.keyStored,true);
+  await h.command('SETTINGS',{provider:'anthropic',clearApiKey:true});const result=await h.command('GET');assert.equal(result.ai.providers.anthropic.keyStored,false);assert.equal(result.ai.providers.openai.keyStored,true);assert.equal(h.storage[providerStorageKey].profiles.openai.apiKey,'private-legacy-key');
+  assert.doesNotMatch(JSON.stringify([legacy,selected,restored,result]),/private-legacy-key|private-anthropic-key/);
+});
+
+test('Claude requires its own optional origin permission for drafts, extraction and automatic mode',async()=>{
+  const h=harness();await ready(h);await useClaude(h);h.allowed=request=>request.origins.every(origin=>origin==='https://api.openai.com/*');
+  for(const [type,payload] of [['GENERATE_DRAFT',{key}],['PRODUCT_EXTRACT',{}],['AUTODRAFT',{enabled:true}]]){
+    const result=await h.command(type,payload);assert.equal(result.ok,false,type);assert.match(result.error,/Разрешите.*Claude/);
+  }
+  assert.equal(h.fetches,0);assert.ok(h.permissionRequests.length>=3);assert.ok(h.permissionRequests.every(request=>JSON.stringify(request)==='{"origins":["https://api.anthropic.com/*"]}'));
+  const previous=structuredClone(h.storage[providerStorageKey]);assert.equal((await h.command('SETTINGS',{provider:'https://untrusted.example',apiKey:'other-key'})).ok,false);assert.deepEqual(h.storage[providerStorageKey],previous);
+});
+
+test('Claude generation and product extraction use Anthropic transport and remain drafts requiring approval',async()=>{
+  const h=harness();await ready(h);await useClaude(h);const requests=[];
+  h.fetchAction=async(url,options)=>{requests.push({url,options,body:JSON.parse(options.body)});return claudeResult(requests.length===1?'We need 100 units. What is the MOQ?':JSON.stringify(extractedProduct));};
+  const generated=await h.command('GENERATE_DRAFT',{key});assert.equal(generated.ok,true,generated.error);assert.equal(generated.state.conversations[key].draft.status,'draft');assert.match(generated.state.conversations[key].draft.text,/100 units/);
+  const extracted=await h.command('PRODUCT_EXTRACT');assert.equal(extracted.ok,true,extracted.error);assert.equal(extracted.state.product.keyPoints,extractedProduct.keyPoints);assert.equal(extracted.state.product.approval,null);
+  assert.equal(requests.length,2);for(const {url,options,body} of requests){assert.equal(url,'https://api.anthropic.com/v1/messages');assert.equal(options.headers['x-api-key'],'private-anthropic-key');assert.equal(options.headers.Authorization,undefined);assert.equal(body.model,'claude-sonnet-4-6');assert.equal(typeof body.system,'string');assert.equal(body.messages[0].role,'user');assert.equal(body.response_format,undefined);assert.equal(JSON.stringify(body).includes('test-private-key'),false);}
+  assert.ok(h.calls.every(call=>call.type==='DIALOGS_SNAPSHOT'));assert.doesNotMatch(JSON.stringify([generated,extracted]),/private-anthropic-key|test-private-key/);
+});
+
+test('switching provider cancels a pending completion and requires explicit re-enabling of automatic drafts',async()=>{
+  const h=harness(),entered=deferred(),gate=deferred();await autoReady(h);
+  h.fetchAction=async()=>{entered.resolve();await gate.promise;return new Response(JSON.stringify({choices:[{message:{content:'Late OpenAI reply'}}]}));};
+  const pending=h.command('GENERATE_DRAFT',{key});await entered.promise;const switched=await useClaude(h);assert.equal(switched.state.settings.autoDraft,false);gate.resolve();assert.equal((await pending).ok,false);
+  const current=await h.command('GET');assert.equal(current.state.conversations[key].draft,null);assert.equal(current.ai.provider,'anthropic');await poll(h);assert.equal(h.fetches,1);
+});
+
+test('neither provider credential appears in public state, diagnostic events or manual prompt exports',async()=>{
+  const h=harness();await ready(h);await useClaude(h);
+  h.fetchAction=async()=>{throw new Error('private-anthropic-key test-private-key secret-provider-detail');};
+  const failed=await h.command('GENERATE_DRAFT',{key});assert.equal(failed.ok,false);
+  const results=[failed,await h.command('GET'),await exportProduct(h),await exportDialog(h),h.storage[DIALOGS_KEY]];
+  assert.doesNotMatch(JSON.stringify(results),/private-anthropic-key|test-private-key|secret-provider-detail/);
+  assert.equal(h.storage[providerStorageKey].profiles.openai.apiKey,'test-private-key');assert.equal(h.storage[providerStorageKey].profiles.anthropic.apiKey,'private-anthropic-key');
+});
+
+test('manual product and dialogue TXT exports need no API permission or key and re-read the selected conversation',async()=>{
+  const h=harness();await manualReady(h);const before=await h.command('GET');
+  const product=await exportProduct(h);assert.match(product.filename,/\.txt$/);assert.match(product.text,/100 units/);assert.deepEqual(product.request,{revision:before.state.product.revision,fingerprint:before.productFingerprint});
+  h.replies.get(1).conversations[0].messages.push({id:'m2',direction:'inbound',text:'The current MOQ is 75 units.'});
+  const callCount=h.calls.length,dialog=await exportDialog(h);assert.ok(h.calls.length>callCount);assert.match(dialog.text,/current MOQ is 75 units/);assert.match(dialog.filename,/\.txt$/);assert.equal(dialog.request.key,key);assert.ok(dialog.request.settingsFingerprint);assert.ok(dialog.request.productFingerprint);
+  const current=await h.command('GET');assert.deepEqual(current.state.product.approval,before.state.product.approval);assert.equal(current.state.conversations[key].draft,null);assert.equal(h.fetches,0);assert.equal(h.permissionRequests.length,0);assert.ok(h.calls.every(call=>call.type==='DIALOGS_SNAPSHOT'));
+});
+
+test('manual product result is parsed and saved without an API call, but never approves itself',async()=>{
+  const h=harness();await manualReady(h);const exported=await exportProduct(h);
+  const imported=await h.command('IMPORT_PRODUCT_RESULT',{request:exported.request,text:'```json\n'+JSON.stringify(extractedProduct)+'\n```'});
+  assert.equal(imported.ok,true,imported.error);assert.equal(imported.state.product.keyPoints,extractedProduct.keyPoints);assert.equal(imported.state.product.questions,extractedProduct.questions);assert.equal(imported.state.product.approval,null);assert.equal(imported.state.settings.autoDraft,false);
+  assert.equal((await h.command('EXPORT_DRAFT_PROMPT',{key})).ok,false);assert.equal((await h.command('PRODUCT_APPROVE',exported.request)).ok,false);
+  const approved=await h.command('PRODUCT_APPROVE',{revision:imported.state.product.revision,fingerprint:imported.productFingerprint});assert.equal(approved.ok,true,approved.error);assert.ok((await exportDialog(h)).text);assert.equal(h.fetches,0);assert.equal(h.permissionRequests.length,0);
+});
+
+test('manual product result refuses stale, missing and malformed request contexts without replacing current edits',async()=>{
+  const h=harness();await manualReady(h);const exported=await exportProduct(h);
+  await h.command('PRODUCT_SAVE',{product:{keyPoints:'Manually checked newer requirements'}});
+  for(const request of [exported.request,undefined,{revision:'1',fingerprint:'bad'}]){
+    const response=await h.command('IMPORT_PRODUCT_RESULT',{request,text:JSON.stringify(extractedProduct)});assert.equal(response.ok,false);assert.equal((await h.command('GET')).state.product.keyPoints,'Manually checked newer requirements');
+  }
+  const current=await exportProduct(h),invalid=await h.command('IMPORT_PRODUCT_RESULT',{request:current.request,text:'Explanation without valid JSON'});assert.equal(invalid.ok,false);assert.match(invalid.error,/JSON.*keyPoints.*questions.*warnings/);assert.equal((await h.command('GET')).state.product.keyPoints,'Manually checked newer requirements');assert.equal(h.fetches,0);
+});
+
+test('manual product image analysis requires confirmation of attachments and still needs user approval',async()=>{
+  const h=harness();await manualReady(h);await h.command('PRODUCT_SAVE',{product:{files:[{id:'photo',name:'product.png',mime:'image/png',status:'ready',contentHash:'photo-hash',images:[{imageKey:'photo:1',mime:'image/png'}],text:''}]}});
+  const exported=await exportProduct(h);assert.equal(exported.requiredImages.length,1);assert.equal(exported.requiredImages[0].imageKey,'photo:1');assert.match(exported.warnings.join('\n'),/не включены в TXT/);
+  const payload={request:exported.request,text:JSON.stringify(extractedProduct)};
+  for(const imagesAttached of [undefined,false]){const response=await h.command('IMPORT_PRODUCT_RESULT',{...payload,imagesAttached});assert.equal(response.ok,false);assert.match(response.error,/изображения/);assert.equal((await h.command('GET')).state.product.extraction,null);}
+  const imported=await h.command('IMPORT_PRODUCT_RESULT',{...payload,imagesAttached:true});assert.equal(imported.ok,true,imported.error);assert.equal(imported.state.product.approval,null);assert.deepEqual(imported.state.product.extraction.processedImageKeys,['photo:1']);
+  assert.equal((await h.command('PRODUCT_APPROVE',{revision:imported.state.product.revision,fingerprint:imported.productFingerprint})).ok,true);assert.equal(h.fetches,0);
+});
+
+test('manual dialogue export refuses unread, inactive or ambiguous current conversations without API or chat mutations',async()=>{
+  for(const mode of ['unread-history','inactive','unknown-sender','unread-attachment','unapproved-product']){
+    const h=harness();await manualReady(h);const row=h.replies.get(1).conversations[0];
+    if(mode==='unread-history')Object.assign(row,{tailKnown:false,needsRead:true});
+    if(mode==='inactive')Object.assign(row,{active:false,needsRead:true,messages:[]});
+    if(mode==='unknown-sender')row.messages[0].direction='unknown';
+    if(mode==='unread-attachment')row.messages[0].attachments=[{type:'file',name:'unavailable.xlsx'}];
+    if(mode==='unapproved-product')await h.command('PRODUCT_SAVE',{product:{rules:'New requirements need review'}});
+    const response=await h.command('EXPORT_DRAFT_PROMPT',{key});assert.equal(response.ok,false,mode);assert.equal(response.promptExport,undefined);assert.equal(h.fetches,0);assert.equal(h.permissionRequests.length,0);assert.ok(h.calls.every(call=>call.type==='DIALOGS_SNAPSHOT'));
+  }
+});
+
+test('manual Claude answer is stored only as a draft tied to its exported context',async()=>{
+  const h=harness();await manualReady(h);const exported=await exportDialog(h),saved=await saveExternalDraft(h,exported.request);
+  assert.equal(saved.ok,true,saved.error);assert.equal(saved.state.conversations[key].draft.text,'We need 100 units. What is your MOQ?');assert.equal(saved.state.conversations[key].draft.status,'draft');assert.equal(h.fetches,0);assert.equal(h.permissionRequests.length,0);assert.ok(h.calls.every(call=>call.type==='DIALOGS_SNAPSHOT'));
+});
+
+test('manual answer from an older export cannot overwrite a conversation after product, rules or history change',async()=>{
+  for(const change of ['product','settings','history','conversation']){
+    const h=harness();await manualReady(h);const exported=await exportDialog(h);
+    if(change==='product')await h.command('PRODUCT_SAVE',{product:{characteristics:'Need 200 units now'}});
+    if(change==='settings')await h.command('SETTINGS',{settings:{brief:'Need 100 units',wechat:'different-contact',language:'Chinese'}});
+    if(change==='history'){h.replies.get(1).conversations[0].messages.push({id:'m2',direction:'inbound',text:'We no longer have that product.'});await h.command('SCAN');}
+    if(change==='conversation')exported.request.key=conversationKey('1688','different-supplier');
+    const response=await saveExternalDraft(h,exported.request);assert.equal(response.ok,false,change);assert.equal((await h.command('GET')).state.conversations[key].draft,null);assert.equal(h.fetches,0);
+  }
+});
+
+test('importing a manual answer re-reads the selected thread before accepting a previously exported history',async()=>{
+  const h=harness();await manualReady(h);const exported=await exportDialog(h);
+  h.replies.get(1).conversations[0].messages.push({id:'m2',direction:'inbound',text:'Please wait; the price changed.'});
+  const response=await saveExternalDraft(h,exported.request);assert.equal(response.ok,false);assert.equal((await h.command('GET')).state.conversations[key].draft,null);assert.equal(h.fetches,0);assert.ok(h.calls.every(call=>call.type==='DIALOGS_SNAPSHOT'));
+});
+
+test('marketplace pages cannot export prompts or import Claude answers',async()=>{
+  const h=harness();await manualReady(h);const exported=await exportProduct(h),before=h.reads,sender={id:'test',url:urls['1688'],tab:{id:1}};
+  for(const [type,payload] of [['EXPORT_PRODUCT_PROMPT',{}],['EXPORT_DRAFT_PROMPT',{key}],['IMPORT_PRODUCT_RESULT',{request:exported.request,text:JSON.stringify(extractedProduct)}]])assert.equal((await h.command(type,payload,sender)).ok,false,type);
+  assert.equal(h.reads,before);assert.equal(h.fetches,0);
 });

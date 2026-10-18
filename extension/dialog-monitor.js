@@ -3,7 +3,8 @@ import {
   setConversationControl, draftRequest, acceptDraft, setDialogSettings, addDialogEvent, buildDraftPrompt, conversationKey,
   attachmentSourceFingerprint,saveProduct,productExtractionRequest,buildProductExtractionPrompt,acceptProductExtraction,approveProduct,productFingerprint,
 } from './lib/dialogs.js';
-import {AI_ORIGIN, generateDialogDraft, extractProductKeyPoints, validateModel} from './lib/dialog-ai.js';
+import {generateDialogDraft, extractProductKeyPoints, validateModel, validateProvider, providerInfo, parseProductKeyPoints} from './lib/dialog-ai.js';
+import {buildManualProductPrompt, buildManualDialogPrompt} from './lib/manual-prompts.js';
 import {withTabOwnership} from './lib/tab-ownership.js';
 import {loadProductImage} from './lib/product-files.js';
 import {resolveChatAttachments,pruneChatAttachmentCache} from './lib/chat-attachments.js';
@@ -14,7 +15,7 @@ const ALARM = 'openlinks-dialogs';
 const PLATFORMS = ['1688','alibaba','mic'];
 const DOMAINS = {'1688':'1688.com',alibaba:'alibaba.com',mic:'made-in-china.com'};
 const READ_TIMEOUT_MS=120000,READ_BACKOFF_MS=5*60000;
-const KNOWN_COMMANDS = new Set(['GET','LIST_TABS','BIND_TAB','UNBIND_TAB','START','STOP','SCAN','SETTINGS','CONTROL','GENERATE_DRAFT','SAVE_DRAFT','DISCARD_DRAFT','PRODUCT_SAVE','PRODUCT_EXTRACT','PRODUCT_APPROVE','AUTODRAFT'].map(name=>'DIALOGS_'+name));
+const KNOWN_COMMANDS = new Set(['GET','LIST_TABS','BIND_TAB','UNBIND_TAB','START','STOP','SCAN','SETTINGS','CONTROL','GENERATE_DRAFT','SAVE_DRAFT','DISCARD_DRAFT','PRODUCT_SAVE','PRODUCT_EXTRACT','PRODUCT_APPROVE','AUTODRAFT','EXPORT_PRODUCT_PROMPT','EXPORT_DRAFT_PROMPT','IMPORT_PRODUCT_RESULT'].map(name=>'DIALOGS_'+name));
 
 export function dialogPlatform(url) {
   try {
@@ -52,9 +53,20 @@ export function createDialogMonitor({api=globalThis.chrome, fetchImpl=globalThis
   const save = state => api.storage.local.set({[DIALOGS_KEY]:state});
   const provider = async () => {
     const raw = (await api.storage.local.get(PROVIDER_KEY))[PROVIDER_KEY] || {};
-    return {model:typeof raw.model==='string'?raw.model:'',apiKey:typeof raw.apiKey==='string'?raw.apiKey:'',revision:Number(raw.revision)||0};
+    const selected=validateProvider(raw.provider ?? 'openai'), profiles={};
+    for(const name of ['openai','anthropic']) {
+      // Old installations stored only one OpenAI profile. Never move that key
+      // to another provider when the selection changes.
+      const value=raw.profiles?.[name] || (name==='openai' && !raw.profiles?raw:{});
+      profiles[name]={model:typeof value.model==='string'?value.model:'',apiKey:typeof value.apiKey==='string'?value.apiKey:''};
+    }
+    return {provider:selected,profiles,...profiles[selected],revision:Number.isSafeInteger(raw.revision)&&raw.revision>=0?raw.revision:0};
   };
-  const publicState = async state => { const config=await provider();return {ok:true,state,productFingerprint:productFingerprint(state),ai:{model:config.model,keyStored:!!config.apiKey,busy:!!providerTask}}; };
+  const publicState = async state => {
+    const config=await provider();
+    const profiles=Object.fromEntries(Object.entries(config.profiles).map(([name,value])=>[name,{model:value.model,keyStored:!!value.apiKey}]));
+    return {ok:true,state,productFingerprint:productFingerprint(state),ai:{provider:config.provider,model:config.model,keyStored:!!config.apiKey,providers:profiles,busy:!!providerTask}};
+  };
   const cancel = key => {
     if(key)keyEpochs.set(key,(keyEpochs.get(key) || 0)+1);else {cancelEpoch++;keyEpochs.clear();}
     for (const [id,task] of pending) if (!key || id===key) { task.controller.abort();pending.delete(id); }
@@ -328,8 +340,8 @@ export function createDialogMonitor({api=globalThis.chrome, fetchImpl=globalThis
         if(!approved(state))throw new Error('Сначала проверьте и утвердите тезисы товара.');
         if(automatic && (!state.running || !state.settings.autoDraft))return null;
         const config=await provider();
-        if(!config.apiKey || !config.model)throw new Error('Укажите API-ключ и модель OpenAI в настройках диалогов.');
-        if(!await api.permissions?.contains({origins:[AI_ORIGIN]}))throw new Error('Разрешите доступ к OpenAI кнопкой подготовки черновика.');
+        if(!config.apiKey || !config.model)throw new Error(`Укажите API-ключ и модель ${providerInfo(config.provider).label} в настройках диалогов.`);
+        if(!await api.permissions?.contains({origins:[providerInfo(config.provider).origin]}))throw new Error(`Разрешите доступ к ${providerInfo(config.provider).label} кнопкой подготовки черновика.`);
         const confirmed=await scan(state,conversation.platform);
         assertCurrent();
         if(state.traversal[conversation.platform].pending)throw new Error('Дождитесь завершения чтения выбранного диалога, затем подготовьте черновик.');
@@ -362,7 +374,7 @@ export function createDialogMonitor({api=globalThis.chrome, fetchImpl=globalThis
       assertCurrent();
       const images=[];for(const imageKey of prepared.imageKeys){if(prepared.task.controller.signal.aborted)throw new Error('Подготовка отменена.');images.push(await imageLoader(imageKey));}
       assertCurrent();
-      const result=await generateDialogDraft({apiKey:prepared.config.apiKey,model:prepared.config.model,prompt:prepared.prompt,images,signal:prepared.task.controller.signal,fetchImpl});
+      const result=await generateDialogDraft({provider:prepared.config.provider,apiKey:prepared.config.apiKey,model:prepared.config.model,prompt:prepared.prompt,images,signal:prepared.task.controller.signal,fetchImpl});
       return await exclusive(async()=>{
         if(pending.get(key)!==prepared.task)throw new Error('Подготовка отменена; полученный черновик отброшен.');
         const state=await load(), config=await provider();
@@ -383,7 +395,7 @@ export function createDialogMonitor({api=globalThis.chrome, fetchImpl=globalThis
     } catch(error) {
       const detail=error instanceof Error?error.message:'Не удалось подготовить черновик.';
       // Journal contains only fixed diagnostics, never provider errors or transcript text.
-      const reason=detail==='Укажите API-ключ и модель OpenAI в настройках диалогов.'?'Не заданы API-ключ или модель OpenAI.':detail==='Разрешите доступ к OpenAI кнопкой подготовки черновика.'?'Доступ к OpenAI не разрешён.':prepared?'Черновик не получен, отменён или устарел. Проверьте состояние диалога перед повторной попыткой.':'Не удалось начать подготовку черновика. Проверьте настройки и откройте актуальный диалог.';
+      const reason=detail.startsWith('Укажите API-ключ и модель ')?'Не заданы API-ключ или модель выбранного сервиса.':prepared?'Черновик не получен, отменён или устарел. Проверьте состояние диалога перед повторной попыткой.':'Не удалось начать подготовку черновика. Проверьте настройки ИИ и откройте актуальный диалог.';
       await exclusive(async()=>{
         const state=await load(),item=state.conversations[key];
         if(prepared && item?.autoDraft?.fingerprint===prepared.signature && item.autoDraft.status==='pending')item.autoDraft={...item.autoDraft,status:'error',at:now(),retryAt:now()+Math.min(1800000,300000*2**Math.max(0,item.autoDraft.attempts-1)),error:reason};
@@ -409,8 +421,8 @@ export function createDialogMonitor({api=globalThis.chrome, fetchImpl=globalThis
         if(providerTask)throw new Error('Уже выполняется один запрос к ИИ. Дождитесь его завершения.');
         const state=await load();checkProductVersion(state,message);
         const config=await provider();
-        if(!config.apiKey || !config.model)throw new Error('Укажите API-ключ и модель OpenAI в настройках диалогов.');
-        if(!await api.permissions?.contains({origins:[AI_ORIGIN]}))throw new Error('Разрешите доступ к OpenAI.');
+        if(!config.apiKey || !config.model)throw new Error(`Укажите API-ключ и модель ${providerInfo(config.provider).label} в настройках диалогов.`);
+        if(!await api.permissions?.contains({origins:[providerInfo(config.provider).origin]}))throw new Error(`Разрешите доступ к ${providerInfo(config.provider).label}.`);
         assertCurrent();
         const request=productExtractionRequest(state),prompt=buildProductExtractionPrompt(state,request);
         const imageKeys=[...new Set(state.product.files.filter(file=>!file.excluded).flatMap(file=>(file.images?.length?file.images.map(image=>image.imageKey):file.imageKey?[file.imageKey]:[])).filter(Boolean))];
@@ -422,7 +434,7 @@ export function createDialogMonitor({api=globalThis.chrome, fetchImpl=globalThis
       assertCurrent();
       const images=[];for(const imageKey of prepared.imageKeys){if(prepared.task.controller.signal.aborted)throw new Error('Разбор отменён.');images.push(await imageLoader(imageKey));}
       if(prepared.task.controller.signal.aborted)throw new Error('Разбор отменён.');
-      const result=await extractProductKeyPoints({apiKey:prepared.config.apiKey,model:prepared.config.model,prompt:prepared.prompt,images,signal:prepared.task.controller.signal,fetchImpl});
+      const result=await extractProductKeyPoints({provider:prepared.config.provider,apiKey:prepared.config.apiKey,model:prepared.config.model,prompt:prepared.prompt,images,signal:prepared.task.controller.signal,fetchImpl});
       return await exclusive(async()=>{
         if(pending.get(key)!==prepared.task)throw new Error('Разбор отменён; результат отброшен.');
         const state=await load(),config=await provider();
@@ -443,8 +455,8 @@ export function createDialogMonitor({api=globalThis.chrome, fetchImpl=globalThis
     if(enabled) {
       if(!approved(state))throw new Error('Сначала проверьте и утвердите тезисы товара.');
       const config=await provider();
-      if(!config.apiKey || !config.model)throw new Error('Укажите API-ключ и модель OpenAI.');
-      if(!await api.permissions?.contains({origins:[AI_ORIGIN]}))throw new Error('Разрешите доступ к OpenAI для авточерновиков.');
+      if(!config.apiKey || !config.model)throw new Error(`Укажите API-ключ и модель ${providerInfo(config.provider).label}.`);
+      if(!await api.permissions?.contains({origins:[providerInfo(config.provider).origin]}))throw new Error(`Разрешите доступ к ${providerInfo(config.provider).label} для авточерновиков.`);
     } else cancel();
     setDialogSettings(state,{...state.settings,autoDraft:enabled},now());
     log(state,'auto_drafts',enabled?'Авточерновики включены для новых входящих по утверждённому заданию. Отправка отключена.':'Авточерновики выключены.');
@@ -454,6 +466,34 @@ export function createDialogMonitor({api=globalThis.chrome, fetchImpl=globalThis
     const state=await load();
     switch(message.type) {
       case 'DIALOGS_GET': return publicState(state);
+      case 'DIALOGS_EXPORT_PRODUCT_PROMPT': {
+        checkProductVersion(state,message);
+        const promptExport=buildManualProductPrompt(state,productExtractionRequest(state),{now:now()});
+        log(state,'product_prompt_exported','Промпт товара подготовлен для ручной передачи в Claude. Запрос к API не выполнялся.');
+        await save(state);return {...await publicState(state),promptExport};
+      }
+      case 'DIALOGS_IMPORT_PRODUCT_RESULT': {
+        if(!message.request || typeof message.request.fingerprint!=='string' || !Number.isSafeInteger(message.request.revision))throw new Error('Сначала сформируйте промпт для текущей версии товара.');
+        const promptExport=buildManualProductPrompt(state,message.request,{now:now()});
+        if(promptExport.requiredImages.length && message.imagesAttached!==true)throw new Error('Подтвердите, что приложили все перечисленные изображения к запросу Claude.');
+        let result;
+        try {result=parseProductKeyPoints(message.text,'anthropic');}
+        catch {throw new Error('Вставьте полный JSON-ответ Claude с текстовыми полями keyPoints, questions и warnings. Поле keyPoints не должно быть пустым; ответ — не более 40000 символов.');}
+        cancel();
+        acceptProductExtraction(state,message.request,{...result,processedImageKeys:promptExport.requiredImages.map(image=>image.imageKey)},now());
+        state.settings.autoDraft=false;
+        log(state,'product_result_imported','Ответ Claude добавлен вручную. Проверьте факты и согласуйте новую версию товара.');
+        break;
+      }
+      case 'DIALOGS_EXPORT_DRAFT_PROMPT': {
+        const item=state.conversations[message.key];
+        if(!item)throw new Error('Диалог не найден.');
+        const observed=await scan(state,item.platform);
+        if(state.traversal[item.platform].pending || !observed.some(row=>row.platform===item.platform && row.id===item.id && row.active))throw new Error('Откройте выбранный диалог и дождитесь полного чтения переписки перед экспортом.');
+        const promptExport=buildManualDialogPrompt(state,draftRequest(state,message.key),{now:now()});
+        log(state,'draft_prompt_exported','Промпт ответа подготовлен для ручной передачи в Claude. Сообщение не отправлено.',{key:message.key,platform:item.platform});
+        await save(state);return {...await publicState(state),promptExport};
+      }
       case 'DIALOGS_PRODUCT_SAVE':checkProductVersion(state,message);cancel();saveProduct(state,message.product || {},now());state.settings.autoDraft=false;break;
       case 'DIALOGS_PRODUCT_APPROVE':checkProductVersion(state,message);cancel();approveProduct(state,message.fingerprint ?? productFingerprint(state),now());break;
       case 'DIALOGS_AUTODRAFT':await toggleAuto(state,message.enabled===true);break;
@@ -479,19 +519,22 @@ export function createDialogMonitor({api=globalThis.chrome, fetchImpl=globalThis
       case 'DIALOGS_STOP': cancel();state.running=false;for(const name of PLATFORMS)state.traversal[name].pending=null;log(state,'monitor_stopped','Мониторинг приостановлен.');await clearAlarm();break;
       case 'DIALOGS_SCAN': await scan(state,message.platform);return publicState(state);
       case 'DIALOGS_SETTINGS': {
-        const config=await provider();
-        const next={...config};
-        if(Object.hasOwn(message,'model'))next.model=validateModel(message.model);
+        const config=await provider(), selected=validateProvider(message.provider ?? config.provider);
+        const profile={...config.profiles[selected]};
+        if(Object.hasOwn(message,'model'))profile.model=validateModel(message.model,selected);
         if(Object.hasOwn(message,'apiKey')) {
           if(typeof message.apiKey!=='string' || message.apiKey.length>512 || /[\r\n\0]/.test(message.apiKey))throw new Error('Некорректный API-ключ.');
-          if(message.apiKey.trim())next.apiKey=message.apiKey.trim();
+          if(message.apiKey.trim() && message.clearApiKey===true)throw new Error('Для замены ключа снимите отметку удаления.');
+          if(message.apiKey.trim())profile.apiKey=message.apiKey.trim();
         }
-        if(message.clearApiKey===true)next.apiKey='';
-        next.revision=config.revision+Number(next.model!==config.model || next.apiKey!==config.apiKey);
+        if(message.clearApiKey===true)profile.apiKey='';
+        const changed=selected!==config.provider || profile.model!==config.model || profile.apiKey!==config.apiKey;
+        const next={provider:selected,profiles:{...config.profiles,[selected]:profile},revision:config.revision+Number(changed)};
+        if(changed)state.settings.autoDraft=false;
         if(message.settings) {
           const enable=message.settings.autoDraft===true;
           setDialogSettings(state,{...message.settings,autoDraft:false},now());
-          if(enable && approved(state) && next.apiKey && next.model && await api.permissions?.contains({origins:[AI_ORIGIN]}))setDialogSettings(state,{...state.settings,autoDraft:true},now());
+          if(enable && approved(state) && profile.apiKey && profile.model && await api.permissions?.contains({origins:[providerInfo(selected).origin]}))setDialogSettings(state,{...state.settings,autoDraft:true},now());
         }
         cancel();await api.storage.local.set({[PROVIDER_KEY]:next});break;
       }
@@ -500,7 +543,15 @@ export function createDialogMonitor({api=globalThis.chrome, fetchImpl=globalThis
         cancel(message.key);setConversationControl(state,message.key,patch,now());break;
       }
       case 'DIALOGS_SAVE_DRAFT': {
-        const request=draftRequest(state,message.key);
+        if(message.request) {
+          const item=state.conversations[message.key];
+          if(!item)throw new Error('Диалог не найден.');
+          const observed=await scan(state,item.platform);
+          if(state.traversal[item.platform].pending || !observed.some(row=>row.platform===item.platform && row.id===item.id && row.active))throw new Error('Откройте выбранный диалог и обновите историю перед сохранением ответа Claude.');
+        }
+        const request=message.request || draftRequest(state,message.key);
+        if(request.key!==message.key)throw new Error('Ответ относится к другому диалогу.');
+        buildDraftPrompt(state,request);
         if(message.revision!==request.revision || message.fingerprint!==request.fingerprint)throw new Error('Диалог изменился. Обновите страницу перед сохранением черновика.');
         if(typeof message.text!=='string' || !message.text.trim() || message.text.length>6000)throw new Error('Укажите текст черновика до 6000 символов.');
         cancel(message.key);acceptDraft(state,request,{text:message.text,reason:'Изменено вручную. Отправка не выполнялась.'},now());
@@ -519,7 +570,7 @@ export function createDialogMonitor({api=globalThis.chrome, fetchImpl=globalThis
     if(!isUI(sender))return {ok:false,error:'Команда доступна только в интерфейсе расширения.'};
     if(message.type==='DIALOGS_PRODUCT_EXTRACT')return extractProduct(message);
     if(message.type==='DIALOGS_GENERATE_DRAFT')return generate(message.key);
-    if(['DIALOGS_STOP','DIALOGS_SETTINGS','DIALOGS_PRODUCT_SAVE','DIALOGS_PRODUCT_APPROVE','DIALOGS_BIND_TAB','DIALOGS_UNBIND_TAB'].includes(message.type) || (message.type==='DIALOGS_AUTODRAFT' && message.enabled!==true))cancel();
+    if(['DIALOGS_STOP','DIALOGS_SETTINGS','DIALOGS_PRODUCT_SAVE','DIALOGS_PRODUCT_APPROVE','DIALOGS_IMPORT_PRODUCT_RESULT','DIALOGS_BIND_TAB','DIALOGS_UNBIND_TAB'].includes(message.type) || (message.type==='DIALOGS_AUTODRAFT' && message.enabled!==true))cancel();
     else if(['DIALOGS_CONTROL','DIALOGS_SAVE_DRAFT','DIALOGS_DISCARD_DRAFT'].includes(message.type))cancel(message.key);
     try { return await exclusive(()=>command(message)); }
     catch(error) { return {ok:false,error:error instanceof Error && /^[А-ЯЁ]/.test(error.message)?error.message:'Не удалось выполнить команду диалогов. Проверьте выбранную вкладку и настройки.'}; }
@@ -531,7 +582,7 @@ export function createDialogMonitor({api=globalThis.chrome, fetchImpl=globalThis
       let config=null;
       if(state.settings.autoDraft) {
         const value=await provider();
-        if(approved(state) && value.apiKey && value.model && await api.permissions?.contains({origins:[AI_ORIGIN]}))config=value;
+        if(approved(state) && value.apiKey && value.model && await api.permissions?.contains({origins:[providerInfo(value.provider).origin]}))config=value;
         else {state.settings.autoDraft=false;log(state,'auto_drafts_paused','Авточерновики остановлены: проверьте утверждение задания и доступ к ИИ.',{level:'warning'});}
       }
       const observed=await scan(state,undefined,{traverse:true,autoConfig:config});

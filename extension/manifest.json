@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
   "name": "OpenLinks — поставщики",
-  "version": "0.12.0",
-  "description": "Карточка товара и файлы, утверждение требований, мониторинг чатов и автоматические ИИ-черновики без отправки.",
+  "version": "0.13.0",
+  "description": "Мониторинг чатов поставщиков, Claude и OpenAI API, ручные промпты TXT и черновики без отправки.",
   "permissions": [
     "storage",
     "alarms",
@@ -48,7 +48,8 @@
     "extension_pages": "script-src 'self'; object-src 'none'"
   },
   "optional_host_permissions": [
-    "https://api.openai.com/*"
+    "https://api.openai.com/*",
+    "https://api.anthropic.com/*"
   ],
   "minimum_chrome_version": "120"
 }

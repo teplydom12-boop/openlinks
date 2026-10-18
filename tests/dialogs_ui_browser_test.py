@@ -28,11 +28,11 @@ class QuietHandler(http.server.SimpleHTTPRequestHandler):
 HARNESS = r"""
 (() => {
   const now=Date.UTC(2026,9,18,1,10),listeners=[];
-  let state=null,core=null,ai={keyStored:false,model:''};
+  let state=null,core=null,ai={provider:'openai',keyStored:false,model:'',providers:{openai:{keyStored:false,model:''},anthropic:{keyStored:false,model:''}}};
   const coreModule=()=>import('/extension/lib/dialogs.js');
   window.calls=[];window.permissionCalls=[];window.allowPermission=true;window.failGet=false;
   const tabs=[{id:11,platform:'1688',title:'1688 chat',url:'https://air.1688.com/chat/'},{id:22,platform:'alibaba',title:'Alibaba messages',url:'https://message.alibaba.com/'},{id:33,platform:'mic',title:'Made-in-China messages',url:'https://webim.made-in-china.com/'}];
-  const publicState=()=>({ok:true,state:structuredClone(state),ai:{...ai},productFingerprint:core.productFingerprint(state)});
+  const publicState=()=>({ok:true,state:structuredClone(state),ai:structuredClone(ai),productFingerprint:core.productFingerprint(state)});
   window.chrome={storage:{onChanged:{addListener:f=>listeners.push(f)}},permissions:{request:async data=>{permissionCalls.push(data);return allowPermission;}},runtime:{sendMessage:async message=>{
     calls.push(structuredClone(message));const t=message.type;core=await coreModule();state??=core.initialDialogs();
     try {
@@ -43,13 +43,16 @@ HARNESS = r"""
     else if(t==='DIALOGS_START'){state.running=true;state.readUnread=message.readUnread===true;}
     else if(t==='DIALOGS_STOP')state.running=false;
     else if(t==='DIALOGS_SCAN'){for(const [platform,binding] of Object.entries(state.bindings))if(binding.tabId!==null&&(!message.platform||message.platform===platform)){binding.status='ready';binding.checkedAt=now;binding.detail='Прочитан открытый чат';}}
-    else if(t==='DIALOGS_SETTINGS'){core.setDialogSettings(state,{...state.settings,...message.settings},now);ai.model=message.model;if(message.apiKey)ai.keyStored=true;if(message.clearApiKey)ai.keyStored=false;}
+    else if(t==='DIALOGS_SETTINGS'){core.setDialogSettings(state,{...state.settings,...message.settings},now);ai.provider=message.provider||'openai';const profile=ai.providers[ai.provider];profile.model=message.model;if(message.apiKey)profile.keyStored=true;if(message.clearApiKey)profile.keyStored=false;ai.model=profile.model;ai.keyStored=profile.keyStored;}
     else if(t==='DIALOGS_PRODUCT_SAVE'){if(message.revision!==state.product.revision||message.fingerprint!==core.productFingerprint(state))throw new Error('Версия товара изменилась');core.saveProduct(state,message.product,now);}
     else if(t==='DIALOGS_PRODUCT_EXTRACT'){if(message.revision!==state.product.revision||message.fingerprint!==core.productFingerprint(state))throw new Error('Версия товара изменилась');core.acceptProductExtraction(state,core.productExtractionRequest(state),{keyPoints:'Model A. Quantity: 10. Stainless steel.',questions:'What is the minimum order?\nWhat is the lead time?',warnings:'Price has not been confirmed.',processedImageKeys:state.product.files.filter(file=>!file.excluded).flatMap(file=>(file.images||[]).map(image=>image.imageKey))},now);}
+    else if(t==='DIALOGS_EXPORT_PRODUCT_PROMPT'){const request={revision:message.revision,fingerprint:message.fingerprint};return {...publicState(),promptExport:(await import('/extension/lib/manual-prompts.js')).buildManualProductPrompt(state,request,{now})};}
+    else if(t==='DIALOGS_EXPORT_DRAFT_PROMPT'){return {...publicState(),promptExport:(await import('/extension/lib/manual-prompts.js')).buildManualDialogPrompt(state,core.draftRequest(state,message.key),{now})};}
+    else if(t==='DIALOGS_IMPORT_PRODUCT_RESULT'){const manual=(await import('/extension/lib/manual-prompts.js')).buildManualProductPrompt(state,message.request,{now});if(manual.requiredImages.length&&!message.imagesAttached)throw new Error('Приложите изображения');const parsed=(await import('/extension/lib/dialog-ai.js')).parseProductKeyPoints(message.text,'anthropic');core.acceptProductExtraction(state,message.request,{...parsed,processedImageKeys:manual.requiredImages.map(image=>image.imageKey)},now);state.settings.autoDraft=false;}
     else if(t==='DIALOGS_PRODUCT_APPROVE'){if(message.revision!==state.product.revision)throw new Error('Версия товара изменилась');core.approveProduct(state,message.fingerprint,now);}
     else if(t==='DIALOGS_AUTODRAFT'){if(message.enabled&&(!state.product.approval||!ai.keyStored||!ai.model||!allowPermission))throw new Error('Сначала согласуйте товар и настройте OpenAI');core.setDialogSettings(state,{...state.settings,autoDraft:message.enabled===true},now);}
     else if(t==='DIALOGS_CONTROL')core.setConversationControl(state,message.key,message,now);
-    else if(t==='DIALOGS_SAVE_DRAFT'){const request=core.draftRequest(state,message.key);if(request.revision!==message.revision||request.fingerprint!==message.fingerprint)return {ok:false,error:'Переписка изменилась'};core.acceptDraft(state,request,{text:message.text},now);}
+    else if(t==='DIALOGS_SAVE_DRAFT'){const request=message.request||core.draftRequest(state,message.key);core.buildDraftPrompt(state,request);if(request.revision!==message.revision||request.fingerprint!==message.fingerprint)return {ok:false,error:'Переписка изменилась'};core.acceptDraft(state,request,{text:message.text},now);}
     else if(t==='DIALOGS_DISCARD_DRAFT')state.conversations[message.key].draft=null;
     else if(t==='DIALOGS_GENERATE_DRAFT')core.acceptDraft(state,core.draftRequest(state,message.key),{text:'Could you confirm the minimum order?',reason:'Нужно уточнить MOQ.'},now);
     else return {ok:false,error:'Unknown test action '+t};
@@ -61,6 +64,7 @@ HARNESS = r"""
   window.seedDialogs=()=>{state.conversations={'alibaba:alpha':thread('alpha','alibaba'), '1688:list':thread('list','1688',{title:'Only unread badge',unread:3,needsRead:true,messages:[],orderReliable:false,tailKnown:false,unanswered:false,preview:'A list preview'}), 'mic:uncertain':thread('uncertain','mic',{title:'Uncertain order',orderReliable:false,messages:[{key:'m3',direction:'unknown',text:'Ambiguous author',at:null}]})};state.events=[{at:now,type:'scan',platform:'1688',detail:'Проверка завершена'}];announce();};
   window.changeDialog=patch=>{Object.assign(state.conversations['alibaba:alpha'],patch);announce();};
   window.changeProduct=patch=>{core.saveProduct(state,patch,now);announce();};
+  window.dialogAI=()=>structuredClone(ai);
   window.dialogState=()=>structuredClone(state);
   window.announceDialogs=announce;
 })();
@@ -389,6 +393,150 @@ try:
         expect(ui.locator('#dialogs-supplier')).to_have_text('<img src=x onerror=alert(1)>')
         assert ui.locator('#dialogs-supplier img').count() == 0
         passed('supplier content is text-only and non-marketplace or script URLs cannot become links')
+
+
+        manual = context.new_page()
+        manual.on('pageerror', lambda error: errors.append(str(error)))
+        manual.goto(f'http://127.0.0.1:{server.server_port}/extension/dialogs.html')
+        expect(manual.locator('#dialogs-provider')).to_have_value('openai')
+        manual.evaluate('seedDialogs()')
+        manual.locator('[data-key="alibaba:alpha"]').click()
+        manual.locator('#dialogs-product-card').fill('Машина для упаковки. Нужно 20 штук.')
+        expect(manual.locator('#dialogs-product-extract')).to_be_disabled()
+        expect(manual.locator('#dialogs-product-export')).to_be_enabled()
+        manual.locator('#dialogs-product-export').click()
+        expect(manual.locator('#dialogs-prompt-panel')).to_be_visible()
+        expect(manual.locator('#dialogs-product-save')).to_be_disabled()
+        prompt_text = manual.locator('#dialogs-prompt-text').input_value()
+        assert 'Машина для упаковки' in prompt_text and 'keyPoints' in prompt_text
+        assert manual.evaluate('permissionCalls.length') == 0
+        assert manual.evaluate("calls.filter(c=>c.type==='DIALOGS_PRODUCT_SAVE').length") == 1
+        assert manual.evaluate("calls.every(c=>!['DIALOGS_PRODUCT_EXTRACT','DIALOGS_GENERATE_DRAFT'].includes(c.type))")
+        manual.evaluate("Object.defineProperty(navigator,'clipboard',{value:{writeText:async text=>{window.copiedPrompt=text;}}})")
+        manual.locator('#dialogs-prompt-copy').click()
+        assert manual.evaluate('window.copiedPrompt') == prompt_text
+        with manual.expect_download() as download_info:
+            manual.locator('#dialogs-prompt-download').click()
+        download = download_info.value
+        assert download.suggested_filename.endswith('.txt')
+        downloaded = Path(download.path()).read_bytes()
+        assert downloaded[:3] == b'\xef\xbb\xbf'.decode('unicode_escape').encode('latin1')
+        assert downloaded.decode('utf-8-sig') == prompt_text
+        passed('keyless product export saves edits and copies/downloads complete UTF-8 TXT locally without API permission')
+
+        manual.locator('#dialogs-prompt-response').fill('not JSON')
+        manual.locator('#dialogs-prompt-apply').click()
+        expect(manual.locator('#dialogs-feedback')).to_contain_text('некорректный')
+        expect(manual.locator('#dialogs-prompt-response')).to_have_value('not JSON')
+        manual.locator('#dialogs-prompt-response').fill('{"keyPoints":"20 упаковочных машин","questions":"Уточните цену и срок","warnings":"Цена неизвестна"}')
+        manual.evaluate("changeProduct({characteristics:'Требование изменено в другом окне'})")
+        expect(manual.locator('#dialogs-prompt-apply')).to_be_disabled()
+        expect(manual.locator('#dialogs-prompt-import-note')).to_contain_text('изменились')
+        manual.locator('#dialogs-product-export').click()
+        manual.locator('#dialogs-prompt-response').fill('{"keyPoints":"20 упаковочных машин","questions":"Уточните цену и срок","warnings":"Цена неизвестна"}')
+        manual.locator('#dialogs-prompt-apply').click()
+        expect(manual.locator('#dialogs-prompt-panel')).to_be_hidden()
+        expect(manual.locator('#dialogs-product-points')).to_have_value('20 упаковочных машин')
+        expect(manual.locator('#dialogs-product-status')).to_contain_text('Нужно согласование')
+        assert manual.evaluate('dialogState().product.approval') is None
+        manual.locator('#dialogs-product-approve').click()
+        expect(manual.locator('#dialogs-export-draft')).to_be_enabled()
+        expect(manual.locator('#dialogs-generate')).to_be_disabled()
+        passed('manual product import rejects malformed or stale responses and requires explicit approval after applying JSON')
+
+        manual.locator('#dialogs-export-draft').click()
+        expect(manual.locator('#dialogs-prompt-panel')).to_be_visible()
+        expect(manual.locator('#dialogs-prompt-heading')).to_contain_text('Alibaba · Supplier alpha')
+        manual.locator('[data-key="1688:list"]').click()
+        expect(manual.locator('#dialogs-prompt-panel')).to_be_hidden()
+        manual.locator('[data-key="alibaba:alpha"]').click()
+        manual.locator('#dialogs-export-draft').click()
+        expect(manual.locator('#dialogs-prompt-panel')).to_be_visible()
+        draft_prompt = manual.locator('#dialogs-prompt-text').input_value()
+        assert 'What quantity do you need?' in draft_prompt and '20 упаковочных машин' in draft_prompt
+        expect(manual.locator('#dialogs-prompt-import')).to_be_hidden()
+        manual.locator('#dialogs-draft-text').fill('We need 20 units. What is the lead time?')
+        manual.locator('#dialogs-save-draft').click()
+        expect(manual.locator('#dialogs-draft-status')).to_contain_text('Сохранён локально')
+        saved_manual = manual.evaluate("calls.filter(c=>c.type==='DIALOGS_SAVE_DRAFT').at(-1)")
+        assert saved_manual['request']['key'] == 'alibaba:alpha'
+        assert saved_manual['request']['productFingerprint']
+        assert saved_manual['request']['settingsFingerprint']
+        assert manual.evaluate('permissionCalls.length') == 0
+        manual.locator('#dialogs-export-draft').click()
+        manual.locator('#dialogs-draft-text').fill('An answer prepared for the old context')
+        manual.evaluate("changeProduct({rules:'New rule after export'})")
+        manual.locator('#dialogs-product-approve').click()
+        expect(manual.locator('#dialogs-save-draft')).to_be_disabled()
+        expect(manual.locator('#dialogs-draft-status')).to_contain_text('после создания промпта')
+        manual.locator('#dialogs-discard-draft').click()
+        passed('keyless reply export contains approved context, binds pasted drafts to export snapshot and rejects changed context')
+
+        manual.locator('#dialogs-product-files').set_input_files({'name':'machine.png','mimeType':'image/png','buffer':image_bytes})
+        expect(manual.locator('.dialogs-product-file')).to_have_count(1)
+        manual.locator('#dialogs-product-export').click()
+        expect(manual.locator('#dialogs-prompt-warnings')).to_contain_text('machine.png')
+        expect(manual.locator('#dialogs-prompt-images-label')).to_be_visible()
+        manual.locator('#dialogs-prompt-response').fill('{"keyPoints":"20 машин; изображение приложено","questions":"Срок изготовления?","warnings":"Цена неизвестна"}')
+        expect(manual.locator('#dialogs-prompt-apply')).to_be_disabled()
+        manual.locator('#dialogs-prompt-images').check()
+        expect(manual.locator('#dialogs-prompt-apply')).to_be_enabled()
+        manual.locator('#dialogs-prompt-apply').click()
+        expect(manual.locator('#dialogs-product-approve')).to_be_enabled()
+        assert manual.evaluate("calls.filter(c=>c.type==='DIALOGS_IMPORT_PRODUCT_RESULT').at(-1).imagesAttached") is True
+        manual.locator('#dialogs-product-approve').click()
+        passed('manual image analysis lists required files and requires explicit attachment confirmation before import')
+
+        manual.locator('#dialogs-provider').select_option('anthropic')
+        expect(manual.locator('#dialogs-model-label')).to_contain_text('Claude')
+        expect(manual.locator('#dialogs-api-key')).to_have_value('')
+        manual.locator('#dialogs-model').fill('claude-test-model')
+        manual.locator('#dialogs-api-key').fill('synthetic-claude-key')
+        manual.once('dialog',lambda dialog: dialog.dismiss())
+        manual.locator('#dialogs-provider').select_option('openai')
+        expect(manual.locator('#dialogs-provider')).to_have_value('anthropic')
+        expect(manual.locator('#dialogs-api-key')).to_have_value('synthetic-claude-key')
+        manual.locator('#dialogs-save-settings').click()
+        expect(manual.locator('#dialogs-key-status')).to_contain_text('Ключ сохранён')
+        claude_settings = manual.evaluate("calls.filter(c=>c.type==='DIALOGS_SETTINGS').at(-1)")
+        assert claude_settings['provider'] == 'anthropic'
+        assert claude_settings['apiKey'] == 'synthetic-claude-key'
+        assert manual.evaluate('dialogAI().providers.openai.keyStored') is False
+        expect(manual.locator('#dialogs-api-key')).to_have_value('')
+        manual.locator('#dialogs-provider').select_option('openai')
+        expect(manual.locator('#dialogs-model')).to_have_value('')
+        expect(manual.locator('#dialogs-key-status')).to_have_text('Ключ не сохранён.')
+        manual.locator('#dialogs-model').fill('openai-other-model')
+        manual.locator('#dialogs-api-key').fill('synthetic-openai-key')
+        manual.locator('#dialogs-save-settings').click()
+        expect(manual.locator('#dialogs-key-status')).to_contain_text('Ключ сохранён')
+        manual.locator('#dialogs-clear-key').check()
+        manual.locator('#dialogs-save-settings').click()
+        expect(manual.locator('#dialogs-key-status')).to_have_text('Ключ не сохранён.')
+        assert manual.evaluate('dialogAI().providers.anthropic.keyStored') is True
+        manual.locator('#dialogs-provider').select_option('anthropic')
+        expect(manual.locator('#dialogs-model')).to_have_value('claude-test-model')
+        expect(manual.locator('#dialogs-key-status')).to_contain_text('Ключ сохранён')
+        manual.locator('#dialogs-save-settings').click()
+        expect(manual.locator('#dialogs-generate')).to_be_enabled()
+        passed('Claude and OpenAI maintain separate credentials/models; switching confirms unsaved credentials and clear affects selected provider only')
+
+        manual.locator('#dialogs-product-extract').click()
+        expect(manual.locator('#dialogs-product-points')).to_have_value('Model A. Quantity: 10. Stainless steel.')
+        assert manual.evaluate('permissionCalls.at(-1).origins') == ['https://api.anthropic.com/*']
+        manual.locator('#dialogs-product-approve').click()
+        manual.locator('#dialogs-generate').click()
+        expect(manual.locator('#dialogs-draft-text')).to_have_value('Could you confirm the minimum order?')
+        assert manual.evaluate('permissionCalls.at(-1).origins') == ['https://api.anthropic.com/*']
+        manual.locator('#dialogs-auto-draft').click()
+        expect(manual.locator('#dialogs-auto-draft')).to_be_checked()
+        assert manual.evaluate('permissionCalls.at(-1).origins') == ['https://api.anthropic.com/*']
+        assert manual.evaluate("permissionCalls.every(call=>call.origins.length===1&&call.origins[0]==='https://api.anthropic.com/*')")
+        assert 'synthetic-claude-key' not in manual.locator('body').inner_text()
+        assert 'synthetic-openai-key' not in manual.locator('body').inner_text()
+        assert manual.evaluate("calls.every(c=>!/(SEND|FILL|CLICK)/.test(c.type))")
+        passed('Claude extraction, reply drafts and automatic drafting request only Anthropic permission and never send supplier messages')
+        manual.close()
 
         ui.set_viewport_size({'width':600,'height':850})
         assert ui.evaluate('document.documentElement.scrollWidth <= window.innerWidth')
