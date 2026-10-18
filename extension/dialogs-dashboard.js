@@ -5,15 +5,19 @@ import {canPrepareDraft, draftRequest} from './lib/dialogs.js';
 const $=selector=>document.querySelector(selector);
 const PLATFORMS={'1688':'1688',alibaba:'Alibaba',mic:'Made-in-China'};
 const STATUS={unbound:['Не выбрана',''],ready:['Чат доступен','good'],ok:['Чат доступен','good'],observing:['Мониторинг','good'],scanning:['Проверка…',''],loading:['Загрузка…',''],unsupported:['Страница не распознана','warn'],partial:['Прочитана часть данных','warn'],closed:['Вкладка закрыта','bad'],missing:['Вкладка не найдена','bad'],error:['Ошибка проверки','bad'],blocked:['Нужно вмешательство','warn'],login:['Нужен вход','warn'],captcha:['Проверка площадки','warn'],paused:['Мониторинг остановлен',''],stale:['Данные устарели','warn'],idle:['Ожидает проверки','']};
-const FOLDER_STATUS={disabled:['Выключено',''],idle:['Ожидание задания',''],ready:['Подключено','good'],connected:['Подключено','good'],waiting:['Обработчик не запущен','warn'],claude_missing:['Claude Code не найден','warn'],pending:['В очереди',''],preparing:['Подготовка задания',''],queued:['В очереди',''],running:['Claude обрабатывает',''],paused:['Приостановлено','warn'],offline:['Нет соединения с Claude','warn'],needslogin:['Нужен вход в Claude Code','warn'],needs_login:['Нужен вход в Claude Code','warn'],authentication_required:['Нужен вход в Claude Code','warn'],subscription_auth_required:['Нужен вход через подписку Claude','warn'],subscription_auth_unverified:['Не удалось проверить вход в Claude Code','warn'],usage_limit:['Достигнут лимит Claude','warn'],missing:['Локальный модуль не найден','warn'],unavailable:['Обработчик недоступен','warn'],error:['Ошибка','bad'],stale:['Контекст изменился','warn'],done:['Обработано','good'],accepted:['Результат принят','good'],cancelled:['Отменено',''],awaiting_limit:['Ответ готов · ожидание лимита площадки','warn'],sending:['Отправка поставщику','warn'],sent:['Кнопка отправки нажата','good'],send_unknown:['Отправка не подтверждена — проверьте чат','warn'],unknown:['Результат операции неизвестен','warn']};
+const FOLDER_STATUS={disabled:['Выключено',''],idle:['Ожидание задания',''],ready:['Подключено','good'],connected:['Подключено','good'],waiting:['Обработчик не запущен','warn'],claude_missing:['Claude Code не найден','warn'],pending:['В очереди',''],preparing:['Подготовка задания',''],queued:['В очереди',''],running:['Claude обрабатывает',''],paused:['Приостановлено','warn'],offline:['Нет соединения с Claude','warn'],needslogin:['Нужен вход в Claude Code','warn'],needs_login:['Нужен вход в Claude Code','warn'],authentication_required:['Нужен вход в Claude Code','warn'],subscription_auth_required:['Нужен вход через подписку Claude','warn'],subscription_auth_unverified:['Не удалось проверить вход в Claude Code','warn'],usage_limit:['Достигнут лимит Claude','warn'],missing:['Локальный модуль не найден','warn'],unavailable:['Обработчик недоступен','warn'],error:['Ошибка','bad'],stale:['Контекст изменился','warn'],done:['Обработано','good'],accepted:['Результат принят','good'],cancelled:['Отменено',''],awaiting_limit:['Ответ готов · ожидание лимита площадки','warn'],sending:['Отправка поставщику','warn'],sent:['Кнопка отправки нажата','good'],send_unknown:['Отправка не подтверждена — проверьте чат','warn'],unknown:['Результат операции неизвестен','warn'],previewed:['Тест завершён · без отправки','test'],test_completed:['Тест завершён · без отправки','test']};
 const FOLDER_PAUSE={offline:'Нет соединения с Claude. Подключите интернет и нажмите «Возобновить обработку».',authentication_required:'Войдите в Claude Code через вашу подписку, затем нажмите «Возобновить обработку».',subscription_auth_required:'Войдите в Claude Code через аккаунт с подпиской Claude, затем нажмите «Возобновить обработку».',subscription_auth_unverified:'Не удалось проверить вход в Claude Code. Проверьте его установку и авторизацию, затем нажмите «Возобновить обработку».',usage_limit:'Достигнут лимит подписки Claude. Возобновите обработку после восстановления лимита.',claude_update_required:'Обновите Claude Code, затем возобновите обработку.',claude_failed:'Claude завершил задание с ошибкой. Проверьте журнал обработчика перед возобновлением.',invalid_claude_output:'Ответ Claude не удалось прочитать. Проверьте журнал обработчика перед возобновлением.'};
-let folderState={enabled:false,auto:false,autoSend:false,model:'haiku',status:'disabled',jobs:[]},folderDirty=false,folderPausing=false,folderPausePromise=null,modeBusy=false,modeRequested=null;
+let folderState={enabled:false,auto:false,autoSend:false,model:'haiku',status:'disabled',jobs:[]},folderDirty=false,folderPausing=false,folderPausePromise=null,modeBusy=false,modeRequested=null,testRequested=null;
 let state=null, productFingerprint='', productUI, tabs=[], selectedKey=null, settingsDirty=false, readUnreadDirty=false, loading=false, historySignature='', reviewEpoch=0;
 const tabChoices=new Map(), edits=new Map(), busy=new Set(), sending=new Set(), draftEditingPending=new Map();
 
 function node(tag,text,className){const el=document.createElement(tag);if(text!==undefined)el.textContent=text;if(className)el.className=className;return el;}
 function feedback(text,error=false){const el=$('#dialogs-feedback');el.textContent=text;el.classList.toggle('error',error);el.hidden=!text;}
 function chosen(){return state?.conversations?.[selectedKey]||null;}
+function testState(){return folderState.test||{enabled:false,phase:'off',sessionId:'',cycleId:'',key:'',text:'',at:null,completed:[]};}
+function testInProgress(){return testState().enabled&&['ready','generating','preparing'].includes(testState().phase);}
+function testModeIntent(){const test=testState();return test.enabled?{testMode:true,testSessionId:test.sessionId,testCycleId:test.cycleId}:{testMode:false};}
+function sameTestIntent(intent){const current=testModeIntent();return intent.testMode===current.testMode&&(!intent.testMode||intent.testSessionId===current.testSessionId&&intent.testCycleId===current.testCycleId);}
 function date(at){return at==null?'Время не указано':displayTime(at);}
 function safeUrl(value){try{const u=new URL(value);return u.protocol==='https:'&&!u.username&&!u.password&&!u.port&&/(^|\.)(1688\.com|alibaba\.com|made-in-china\.com)$/.test(u.hostname)?u.href:null;}catch{return null;}}
 async function command(type,payload={}){const result=await chrome.runtime.sendMessage({type:'DIALOGS_'+type,...payload});if(!result?.ok)throw new Error(result?.error||'Расширение не ответило. Перезагрузите эту страницу.');return result;}
@@ -22,7 +26,7 @@ async function refresh(){if(loading)return;loading=true;try{adopt(await command(
 async function act(name,payload={},message=''){const result=await command(name,payload);if(result.state||result.folder)adopt(result);else await refresh();if(message)feedback(message);return result;}
 function action(selector,handler){$(selector).addEventListener('click',async()=>{if(busy.has(selector))return;busy.add(selector);$(selector).disabled=true;try{await handler();}catch(error){feedback(error.message,true);}finally{busy.delete(selector);$(selector).disabled=false;if(state)render();}});}
 function makeButton(label,handler,className='button secondary'){const button=node('button',label,className);button.type='button';button.addEventListener('click',async()=>{button.disabled=true;try{await handler();}catch(error){feedback(error.message,true);}finally{if(button.isConnected)button.disabled=false;}});return button;}
-function threadFlags(conversation){const result=[];if(conversation.takeover)result.push(['Под вашим управлением','']);if(conversation.paused)result.push(['На паузе','']);if(conversation.unanswered)result.push(['Требует ответа','warn']);if(conversation.unread===true||Number(conversation.unread)>0)result.push(['Непрочитано на площадке','warn']);if(conversation.needsRead)result.push([conversation.messages?.length||readerDetail(conversation)?'Нужна проверка истории':'Нужно открыть историю','']);if(conversation.autoDraft?.status==='pending')result.push(['ИИ готовит черновик','']);if(conversation.autoDraft?.status==='error')result.push(['Ошибка черновика','warn']);if(conversation.draft)result.push([conversation.draft.status==='stale'?'Черновик устарел':'Есть черновик',conversation.draft.status==='stale'?'warn':'good']);return result;}
+function threadFlags(conversation){const result=[];const test=testState();if(test.enabled&&((test.key===conversation.key&&test.phase==='completed')||(test.completed||[]).some(item=>item.key===conversation.key)))result.push(['Тест: без отправки','test']);if(conversation.takeover)result.push(['Под вашим управлением','']);if(conversation.paused)result.push(['На паузе','']);if(conversation.unanswered)result.push(['Требует ответа','warn']);if(conversation.unread===true||Number(conversation.unread)>0)result.push(['Непрочитано на площадке','warn']);if(conversation.needsRead)result.push([conversation.messages?.length||readerDetail(conversation)?'Нужна проверка истории':'Нужно открыть историю','']);if(conversation.autoDraft?.status==='pending')result.push(['ИИ готовит черновик','']);if(conversation.autoDraft?.status==='error')result.push(['Ошибка черновика','warn']);if(conversation.draft)result.push([conversation.draft.status==='stale'?'Черновик устарел':'Есть черновик',conversation.draft.status==='stale'?'warn':'good']);return result;}
 function canDraft(conversation){return !!conversation&&conversation.unanswered&&conversation.identityReliable&&conversation.orderReliable&&conversation.tailKnown&&conversation.contentReady!==false&&!conversation.needsRead&&!conversation.paused&&!conversation.takeover;}
 function readerDetail(conversation){return typeof conversation?.detail==='string'?conversation.detail.trim().slice(0,1200):'';}
 function draftBlockReason(conversation){
@@ -33,15 +37,19 @@ function draftBlockReason(conversation){
   if(conversation.contentReady===false)return readerDetail(conversation)||'Не все сообщения или вложения прочитаны. Причины показаны в истории переписки.';
   if(!conversation.orderReliable||!conversation.tailKnown||conversation.needsRead)return readerDetail(conversation)||'Нужна достоверная последняя часть переписки. Откройте её в выбранной вкладке и повторите проверку.';
   if(!conversation.unanswered)return 'В доступной истории нет подтверждённого сообщения продавца, требующего ответа.';
+  if(testState().enabled&&testState().phase==='completed')return 'Цикл выполнен — сообщение не отправлено. Для продолжения нажмите «Проверить следующий цикл» в шаге 3.';
+  if(testState().enabled&&['paused','blocked'].includes(testState().phase))return testState().phase==='blocked'?'Тест приостановлен. Проверьте причину в шаге 3.':'Запустите первый тестовый цикл в шаге 3.';
   if(!productUI?.isApproved())return 'Сохраните и согласуйте информацию о товаре в блоке выше. Она применяется ко всем наблюдаемым поставщикам.';
   if(settingsDirty)return 'Сначала сохраните контекст переговоров.';
+  if(testState().enabled)return 'Тестовый цикл читает переписку, получает ответ Claude и вводит текст в чат. Сообщение поставщику не отправляется.';
+  if(conversation.draft?.testSessionId)return 'Это ответ из тестового сеанса. Для настоящей отправки удалите тестовый черновик и подготовьте новый ответ.';
   if(conversation.draft)return conversation.draft.status==='stale'?'Черновик устарел. Сохраните нужные правки отдельно и удалите его перед подготовкой нового ответа.':'Ответ готов. Проверьте текст, при необходимости отредактируйте и нажмите «Отправить».';
   if(!folderState.enabled)return 'Подключите Claude в шаге 1.';
   if(folderDirty)return 'Сохраните выбранную модель Claude.';
   return folderState.autoSend?'Claude подготовит и отправит ответ при актуальной истории и доступном лимите площадки.':'Claude подготовит ответ. Проверьте текст и нажмите «Отправить», когда он вас устроит.';
 }
 
-function renderBindings(){const container=$('#dialogs-bindings');container.replaceChildren();for(const [platform,label] of Object.entries(PLATFORMS)){const binding=state?.bindings?.[platform]||{},card=node('section',undefined,'panel dialogs-platform'),heading=node('div',undefined,'panel-heading');card.dataset.platform=platform;const [status,tone]=STATUS[binding.status]||['Статус проверки: '+(binding.status||'ожидание'),'warn'];heading.append(node('h3',label),node('span',status,'dialogs-status '+tone));const select=node('select');select.id='dialogs-tab-'+platform;select.setAttribute('aria-label','Вкладка '+label);select.append(new Option('Выберите открытую вкладку',''));const options=tabs.filter(tab=>tab.platform===platform);if(binding.tabId!=null&&!options.some(tab=>tab.id===binding.tabId))options.unshift({id:binding.tabId,title:'Сохранённая вкладка',url:binding.url});for(const tab of options)select.append(new Option((tab.title||tab.url||'Вкладка')+' · '+(tab.url||''),String(tab.id)));const choice=tabChoices.get(platform);select.value=choice!=null&&options.some(tab=>String(tab.id)===choice)?choice:(binding.tabId==null?'':String(binding.tabId));select.addEventListener('change',()=>tabChoices.set(platform,select.value));const controls=node('div',undefined,'actions');const bind=makeButton('Выбрать',async()=>{reviewEpoch++;const value=select.value;if(!value)throw new Error('Сначала выберите открытую вкладку '+label+'.');await act('BIND_TAB',{platform,tabId:Number(value)},'Вкладка '+label+' выбрана.');});const scan=makeButton('Проверить',()=>act('SCAN',{platform},'Проверка '+label+' завершена.'));const remove=makeButton('Отвязать',async()=>{reviewEpoch++;tabChoices.delete(platform);await act('UNBIND_TAB',{platform},'Вкладка '+label+' отключена от мониторинга.');},'link-button');bind.disabled=!state;scan.disabled=!state||binding.tabId==null;remove.disabled=binding.tabId==null;controls.append(bind,scan,remove);card.append(heading,select,controls,node('p',binding.detail||(binding.tabId==null?'Выберите вкладку центра сообщений.':'Ожидание проверки выбранной вкладки.'),'hint'),node('p','Последняя проверка: '+(binding.checkedAt==null?'ещё не выполнялась':date(binding.checkedAt)),'hint'));container.append(card);}}
+function renderBindings(){const container=$('#dialogs-bindings');container.replaceChildren();for(const [platform,label] of Object.entries(PLATFORMS)){const binding=state?.bindings?.[platform]||{},card=node('section',undefined,'panel dialogs-platform'),heading=node('div',undefined,'panel-heading');card.dataset.platform=platform;const [status,tone]=STATUS[binding.status]||['Статус проверки: '+(binding.status||'ожидание'),'warn'];heading.append(node('h3',label),node('span',status,'dialogs-status '+tone));const select=node('select');select.id='dialogs-tab-'+platform;select.setAttribute('aria-label','Вкладка '+label);select.append(new Option('Выберите открытую вкладку',''));const options=tabs.filter(tab=>tab.platform===platform);if(binding.tabId!=null&&!options.some(tab=>tab.id===binding.tabId))options.unshift({id:binding.tabId,title:'Сохранённая вкладка',url:binding.url});for(const tab of options)select.append(new Option((tab.title||tab.url||'Вкладка')+' · '+(tab.url||''),String(tab.id)));const choice=tabChoices.get(platform);select.value=choice!=null&&options.some(tab=>String(tab.id)===choice)?choice:(binding.tabId==null?'':String(binding.tabId));select.addEventListener('change',()=>tabChoices.set(platform,select.value));const controls=node('div',undefined,'actions');const bind=makeButton('Выбрать',async()=>{reviewEpoch++;const value=select.value;if(!value)throw new Error('Сначала выберите открытую вкладку '+label+'.');await act('BIND_TAB',{platform,tabId:Number(value)},'Вкладка '+label+' выбрана.');});const scan=makeButton('Проверить',()=>act('SCAN',{platform},'Проверка '+label+' завершена.'));const remove=makeButton('Отвязать',async()=>{reviewEpoch++;tabChoices.delete(platform);await act('UNBIND_TAB',{platform},'Вкладка '+label+' отключена от мониторинга.');},'link-button');bind.disabled=!state;scan.disabled=!state||binding.tabId==null||testState().enabled;remove.disabled=binding.tabId==null;controls.append(bind,scan,remove);card.append(heading,select,controls,node('p',binding.detail||(binding.tabId==null?'Выберите вкладку центра сообщений.':'Ожидание проверки выбранной вкладки.'),'hint'),node('p','Последняя проверка: '+(binding.checkedAt==null?'ещё не выполнялась':date(binding.checkedAt)),'hint'));container.append(card);}}
 function filteredConversations(){const query=$('#dialogs-search').value.trim().toLocaleLowerCase(),filter=$('#dialogs-filter').value;return Object.values(state?.conversations||{}).filter(item=>{if(filter==='unanswered'&&!item.unanswered)return false;if(filter==='unread'&&!(item.unread===true||Number(item.unread)>0))return false;if(filter==='takeover'&&!item.takeover)return false;if(filter==='paused'&&!item.paused)return false;const haystack=[item.title,item.platform,PLATFORMS[item.platform],item.url,item.preview,...(item.messages||[]).map(m=>m.text)].filter(Boolean).join(' ').toLocaleLowerCase();return !query||haystack.includes(query);}).sort((a,b)=>Number(b.unanswered)-Number(a.unanswered)||(b.updatedAt||0)-(a.updatedAt||0)||a.key.localeCompare(b.key));}
 function renderList(){const conversations=filteredConversations(),all=Object.values(state?.conversations||{}),list=$('#dialogs-list');$('#dialogs-count').textContent=all.length+' · требуют ответа: '+all.filter(c=>c.unanswered).length;list.replaceChildren();for(const conversation of conversations){const button=node('button',undefined,'dialogs-thread'+(conversation.key===selectedKey?' selected':''));button.type='button';button.dataset.key=conversation.key;button.setAttribute('aria-pressed',String(conversation.key===selectedKey));button.append(node('strong',conversation.title||'Поставщик не определён'),node('p',(PLATFORMS[conversation.platform]||conversation.platform)+' · '+date(conversation.updatedAt),'hint'));const last=(conversation.messages||[]).at(-1);button.append(node('div',last?.text||conversation.preview||'История ещё не прочитана','dialogs-preview'));const flags=node('div',undefined,'dialogs-thread-flags');for(const [label,tone] of threadFlags(conversation))flags.append(node('span',label,'dialogs-status '+tone));button.append(flags);button.addEventListener('click',()=>{selectedKey=conversation.key;historySignature='';renderList();renderDetail();});list.append(button);}$('#dialogs-empty').hidden=conversations.length>0;$('#dialogs-empty').textContent=all.length?'Переписок с такими условиями нет.':'Выберите вкладки и запустите проверку. Здесь появятся прочитанные переписки и доступный список чатов.';}
 function renderHistory(conversation){
@@ -103,7 +111,10 @@ function renderDetail(){
   $('#dialogs-history-note').hidden=!!detail;
   $('#dialogs-history-note').textContent=conversation.orderReliable&&conversation.tailKnown&&!conversation.needsRead?'Показана доступная на странице история. Последнее сообщение определено.':'История неполная или порядок сообщений не подтверждён. По одному значку «непрочитано» ответ не создаётся.';
   renderHistory(conversation);
-  const edit=edits.get(conversation.key),draft=conversation.draft;
+  const test=testState(),testRecord=(test.completed||[]).find(entry=>entry.key===conversation.key),currentTest=test.key===conversation.key&&test.phase==='completed';
+  $('#dialogs-conversation-test-note').hidden=!test.enabled||(!currentTest&&!testRecord);
+  $('#dialogs-conversation-test-note').textContent=currentTest?'Цикл выполнен — сообщение не отправлено. Текст оставлен в поле чата для проверки.':testRecord?'Эта переписка уже участвовала в тесте: '+date(testRecord.at)+'. Ответ учтён только в тестовом режиме; сообщение не отправлялось.':'';
+  const edit=edits.get(conversation.key),draft=conversation.draft,testOriginBlocked=!test.enabled&&!!(edit?.testSessionId||draft?.testSessionId);
   const text=edit?edit.text:(draft?.text||'');
   if($('#dialogs-draft-text').value!==text)$('#dialogs-draft-text').value=text;
   $('#dialogs-draft-reason').hidden=!draft?.reason;
@@ -115,18 +126,18 @@ function renderDetail(){
   $('#dialogs-auto-status').hidden=!job;
   $('#dialogs-auto-status').textContent=job?[FOLDER_STATUS[job.status]?.[0]||job.status,job.detail].filter(Boolean).join(' · '):'';
   const stale=!!edit&&(edit.revision!==conversation.revision||edit.fingerprint!==conversation.fingerprint||edit.productFingerprint!==productFingerprint);
-  $('#dialogs-draft-status').textContent=stale?'Переписка или товар изменились после начала редактирования. Скопируйте нужные правки и подготовьте актуальный ответ.':edit?'Есть несохранённые изменения. «Отправить» сохранит и отправит именно этот текст.':draft?.status==='stale'?'Черновик устарел: изменились переписка или сведения о товаре.':draft?'Черновик сохранён: '+date(draft.createdAt):'Claude ещё не подготовил ответ.';
+  $('#dialogs-draft-status').textContent=stale?'Переписка или товар изменились после начала редактирования. Скопируйте нужные правки и подготовьте актуальный ответ.':edit?(test.enabled?'Есть несохранённые изменения. В тестовом режиме текст проверяется без отправки.':'Есть несохранённые изменения. «Отправить» сохранит и отправит именно этот текст.'):draft?.status==='stale'?'Черновик устарел: изменились переписка или сведения о товаре.':draft?'Черновик сохранён: '+date(draft.createdAt):'Claude ещё не подготовил ответ.';
   const ready=canDraft(conversation)&&!!productUI?.isApproved()&&canPrepareDraft(state,conversation.key);
   const isSending=sending.has(conversation.key);
   $('#dialogs-generate-hint').textContent=draftBlockReason(conversation);
-  $('#dialogs-folder-draft').disabled=!ready||!folderState.enabled||folderDirty||folderPausing||pending||isSending||!!edit||!!draft;
-  $('#dialogs-folder-draft').title=folderState.autoSend?'Ответ может быть отправлен автоматически после проверки контекста.':'Ответ будет сохранён для вашего одобрения.';
+  $('#dialogs-folder-draft').disabled=!ready||!folderState.enabled||folderDirty||folderPausing||pending||isSending||!!edit||!!draft||test.enabled&&test.phase!=='ready';
+  $('#dialogs-folder-draft').title=test.enabled?'Ответ будет введён в чат без отправки. Один тестовый цикл, затем пауза.':folderState.autoSend?'Ответ может быть отправлен автоматически после проверки контекста.':'Ответ будет сохранён для вашего одобрения.';
   $('#dialogs-save-draft').disabled=!ready||!edit?.text.trim()||stale||isSending;
   $('#dialogs-discard-draft').disabled=(!edit&&!draft)||isSending;
   $('#dialogs-draft-text').disabled=!canDraft(conversation)||isSending;
-  $('#dialogs-send-draft').disabled=!ready||!state.running||!text.trim()||stale||!edit&&draft?.status==='stale'||!!receipt||folderPausing||modeBusy||isSending;
-  $('#dialogs-send-draft').textContent=isSending?'Отправка…':'Отправить';
-  $('#dialogs-send-note').textContent=receipt?(receipt.status==='unknown'?'Исход предыдущей отправки неизвестен. Проверьте чат: повторная отправка заблокирована.':receipt.status==='sending'?'Отправка уже выполняется.':'Кнопка отправки уже нажата. Повторная отправка этого ответа заблокирована.'):!state.running?'Для отправки запустите мониторинг и откройте эту переписку в выбранной вкладке.':'Откройте эту переписку во вкладке площадки и нажмите «Проверить сейчас». «Отправить» одобряет показанный текст; адресат и новые сообщения проверяются повторно.';
+  $('#dialogs-send-draft').disabled=!ready||!state.running||!text.trim()||stale||!edit&&draft?.status==='stale'||!!receipt||folderPausing||modeBusy||isSending||testOriginBlocked||test.enabled&&test.phase!=='ready';
+  $('#dialogs-send-draft').textContent=isSending?(test.enabled?'Проверка…':'Отправка…'):test.enabled?'Проверить без отправки':'Отправить';
+  $('#dialogs-send-note').textContent=testOriginBlocked?'Тестовый ответ нельзя отправить настоящему поставщику. Удалите этот черновик и подготовьте новый ответ после выхода из тестового режима.':test.enabled?(test.phase==='completed'?'Проверка завершена. Переход к следующему циклу доступен в шаге 3.':test.phase==='blocked'?'Тест приостановлен. Проверьте причину в шаге 3.':test.phase==='paused'?'Сначала нажмите «Проверить первый цикл» в шаге 3.':'Кнопка проверит адресата и введёт этот текст в поле чата. Отправка не выполняется.') :receipt?(receipt.status==='unknown'?'Исход предыдущей отправки неизвестен. Проверьте чат: повторная отправка заблокирована.':receipt.status==='sending'?'Отправка уже выполняется.':'Кнопка отправки уже нажата. Повторная отправка этого ответа заблокирована.'):!state.running?'Для отправки запустите мониторинг и откройте эту переписку в выбранной вкладке.':'Откройте эту переписку во вкладке площадки и нажмите «Проверить сейчас». «Отправить» одобряет показанный текст; адресат и новые сообщения проверяются повторно.';
   for(const id of busy)if($(id))$(id).disabled=true;
 }
 function renderSettings(){
@@ -138,13 +149,16 @@ function renderEvents(){const events=state.events||[],list=$('#dialogs-events');
 function folderSettings(){return {model:$('#dialogs-folder-model').value};}
 function boundTabs(){return Object.values(state?.bindings||{}).some(binding=>binding.tabId!=null);}
 function renderFolder(){
+  const test=testState();
   const folder=folderState,enabled=folder.enabled===true,approved=productUI?.isApproved(),worker=folder.worker||{};
   if(!folderDirty){
     const model=folder.model||'haiku',select=$('#dialogs-folder-model');
     if(![...select.options].some(option=>option.value===model))select.add(new Option('Текущая модель · '+model,model));
     select.value=model;
   }
-  $('#dialogs-folder-send').checked=modeRequested??(folder.autoSend===true);
+  $('#dialogs-folder-send').checked=test.enabled?false:modeRequested??(folder.autoSend===true);
+  $('#dialogs-test-mode').checked=testRequested??test.enabled;
+  $('#dialogs-test-mode').disabled=modeBusy||folderPausing;
   const effectiveStatus=enabled&&worker.status==='paused'?(FOLDER_STATUS[worker.pauseReason]?worker.pauseReason:'paused'):folder.status;
   const [label,tone]=FOLDER_STATUS[effectiveStatus]||[effectiveStatus||'Выключено',''];
   $('#dialogs-folder-status').textContent=folderPausing?'Приостанавливаю ответы…':label;
@@ -157,11 +171,12 @@ function renderFolder(){
   $('#dialogs-folder-save').disabled=!folderDirty||folderPausing||modeBusy;
   $('#dialogs-folder-stop').disabled=!enabled||folderPausing||modeBusy;
   $('#dialogs-folder-poll').disabled=!enabled||folderPausing;
-  $('#dialogs-folder-send').disabled=modeBusy||folderPausing||(!folder.autoSend&&(!enabled||!approved||!boundTabs()||folderDirty||edits.size>0));
-  $('#dialogs-mode').classList.toggle('automatic',!!folder.autoSend);
-  $('#dialogs-mode-label').textContent=modeBusy?'Меняю режим…':folder.autoSend?'Автоматический режим':'С вашим одобрением';
-  $('#dialogs-folder-send-note').textContent=folder.autoSend?'Claude читает новые сообщения, готовит и отправляет ответы по согласованным правилам. Снимите галочку, чтобы проверять каждый ответ.':'Claude готовит черновики. Вы проверяете текст, при необходимости редактируете и нажимаете «Отправить».';
-  $('#dialogs-monitor-note').textContent=!boundTabs()?'Сначала выберите хотя бы одну вкладку чатов.':!enabled?'Подключите Claude в шаге 1. Пока доступно только чтение сообщений.':!approved?'Согласуйте товар в шаге 2. Пока доступно только чтение сообщений.':folderDirty?'Сохраните модель в шаге 1.':edits.size?'Есть несохранённые черновики. Сохраните или удалите их перед включением автоматической отправки.':state.running&&folder.auto?'Мониторинг включён. Новые сообщения обрабатываются автоматически.':state.running?'Чтение работает. Нажмите «Начать мониторинг», чтобы возобновить подготовку ответов.':'Начните мониторинг для подготовки черновиков. Галочка автоматической отправки также запускает мониторинг.';
+  $('#dialogs-folder-send').disabled=test.enabled||modeBusy||folderPausing||(!folder.autoSend&&(!enabled||!approved||!boundTabs()||folderDirty||edits.size>0));
+  $('#dialogs-mode').classList.toggle('automatic',!test.enabled&&!!folder.autoSend);
+  $('#dialogs-mode').classList.toggle('test-mode',!!test.enabled);
+  $('#dialogs-mode-label').textContent=modeBusy?'Меняю режим…':test.enabled?'Тестовый режим':folder.autoSend?'Автоматический режим':'С вашим одобрением';
+  $('#dialogs-folder-send-note').textContent=test.enabled?'Настоящие чаты и ответы Claude. Текст вводится в поле сообщения; отправка выключена на всех площадках.':folder.autoSend?'Claude читает новые сообщения, готовит и отправляет ответы по согласованным правилам. Снимите галочку, чтобы проверять каждый ответ.':'Claude готовит черновики. Вы проверяете текст, при необходимости редактируете и нажимаете «Отправить».';
+  $('#dialogs-monitor-note').textContent=test.enabled?'Один цикл проверяет один ответ поставщику. Следующий цикл запускается только вашей кнопкой.':!boundTabs()?'Сначала выберите хотя бы одну вкладку чатов.':!enabled?'Подключите Claude в шаге 1. Пока доступно только чтение сообщений.':!approved?'Согласуйте товар в шаге 2. Пока доступно только чтение сообщений.':folderDirty?'Сохраните модель в шаге 1.':edits.size?'Есть несохранённые черновики. Сохраните или удалите их перед включением автоматической отправки.':state.running&&folder.auto?'Мониторинг включён. Новые сообщения обрабатываются автоматически.':state.running?'Чтение работает. Нажмите «Начать мониторинг», чтобы возобновить подготовку ответов.':'Начните мониторинг для подготовки черновиков. Галочка автоматической отправки также запускает мониторинг.';
   $('#dialogs-folder-edits').hidden=!folderDirty;
   $('#dialogs-folder-edits').textContent=folderDirty?'Модель изменена. Сохраните выбор, чтобы применять его к новым заданиям.':'';
   const list=$('#dialogs-folder-jobs');list.replaceChildren();const jobs=Array.isArray(folder.jobs)?folder.jobs:[];
@@ -170,11 +185,32 @@ function renderFolder(){
     const conversation=state.conversations?.[job.key];heading.append(node('strong',job.kind==='product'?'Сведения о товаре':conversation?(PLATFORMS[conversation.platform]||conversation.platform)+' · '+(conversation.title||job.key):job.key||'Ответ поставщику'),node('span',status,'dialogs-status '+color));
     row.append(heading,node('p',date(job.at)+' · '+String(job.id||''),'hint'));if(job.detail)row.append(node('p',job.detail,'hint'));
     const controls=node('div',undefined,'actions');
-    if(['error','offline','needslogin','needs_login','unknown'].includes(job.status)){const retry=makeButton('Повторить',()=>act('FOLDER_RETRY',{id:job.id},'Повтор задания запрошен.'),'link-button');retry.disabled=!enabled||folderPausing||!!productUI?.isDirty();controls.append(retry);}
+    if(job.test&&['error','offline','needslogin','needs_login','unknown'].includes(job.status))row.append(node('p','Для повторной проверки начните новый сеанс через переключатель «Тестовый режим».','hint'));
+    if(!job.test&&['error','offline','needslogin','needs_login','unknown'].includes(job.status)){const retry=makeButton('Повторить',()=>act('FOLDER_RETRY',{id:job.id},'Повтор задания запрошен.'),'link-button');retry.disabled=!enabled||folderPausing||!!productUI?.isDirty();controls.append(retry);}
     if(['preparing','queued','pending','running','done','awaiting_limit','error','offline','needslogin','needs_login','unknown'].includes(job.status))controls.append(makeButton('Отменить',()=>act('FOLDER_CANCEL',{id:job.id},'Задание отменено.'),'link-button'));
     if(controls.childNodes.length)row.append(controls);list.append(row);
   }
   $('#dialogs-folder-empty').hidden=jobs.length>0;
+  renderTestMode();
+}
+function renderTestMode(){
+  const test=testState(),active=test.enabled===true;
+  $('#dialogs-test-panel').hidden=!active;
+  if(!active)return;
+  const labels={paused:'Готов к проверке',ready:'Ищу сообщение для одного цикла',generating:'Claude готовит тестовый ответ',preparing:'Ввожу текст в чат без отправки',completed:'Цикл выполнен — сообщение не отправлено',blocked:'Тест приостановлен'};
+  $('#dialogs-test-status').textContent=labels[test.phase]||'Тест приостановлен';
+  let issue=!folderState.enabled?'Подключите Claude в шаге 1.':!productUI?.isApproved()?'Сохраните и согласуйте товар в шаге 2.':!boundTabs()?'Выберите вкладки чатов.':folderDirty?'Сохраните модель Claude.':edits.size?'Сохраните или удалите несохранённые черновики.':'';
+  $('#dialogs-test-detail').textContent=[test.detail,issue,test.phase==='blocked'?'Проверьте чат. Если тестовый текст мешает сбросу, удалите его вручную; затем выключите и снова включите тестовый режим для нового цикла.':''].filter(Boolean).join(' ');
+  $('#dialogs-test-next').textContent=test.phase==='completed'?'Проверить следующий цикл':test.phase==='paused'?'Проверить первый цикл':test.phase==='blocked'?'Проверка приостановлена':'Цикл выполняется…';
+  $('#dialogs-test-next').disabled=!!issue||modeBusy||folderPausing||!['paused','completed'].includes(test.phase)||busy.has('#dialogs-test-next');
+  $('#dialogs-test-result').hidden=!test.text;
+  $('#dialogs-test-result-note').textContent=test.phase==='completed'?'Текст введён в чат для проверки. Записи об отправке в истории переписки нет.':'Сохранённый текст теста. Проверьте поле чата перед продолжением; сообщение не отправлялось.';
+  const conversation=state?.conversations?.[test.key];
+  $('#dialogs-test-recipient').textContent=[PLATFORMS[conversation?.platform]||'',conversation?.title||test.key||''].filter(Boolean).join(' · ');
+  $('#dialogs-test-time').textContent=test.at?'Проверено: '+date(test.at):'';
+  $('#dialogs-test-text').textContent=test.text||'';
+  const count=(test.completed||[]).length;
+  $('#dialogs-test-count').textContent=count?'Учтено только в тесте: '+count:'';
 }
 async function disableLegacyDrafts(){
   if(state?.settings?.autoDraft)adopt(await command('AUTODRAFT',{enabled:false}));
@@ -185,8 +221,8 @@ async function enableAutomaticDrafts(){
   await disableLegacyDrafts();
   if(!folderState.auto)adopt(await command('FOLDER_SETTINGS',{enabled:true,auto:true,autoSend:false}));
 }
-async function pauseFolderOnEdit(draftChanged=false){
-  if(!draftChanged&&!productUI?.isDirty())return folderPausePromise;
+async function pauseFolderOnEdit(draftChanged=false,force=false){
+  if(!draftChanged&&!force&&!productUI?.isDirty())return folderPausePromise;
   if(draftChanged&&!folderState.autoSend)return;
   folderPausing=true;renderFolder();
   const pending=(async()=>{
@@ -201,8 +237,10 @@ function render(){
   if(!state)return;
   productUI?.render(state,{},productFingerprint);
   const bound=boundTabs();
-  $('#dialogs-run-state').textContent=state.running?(folderState.enabled&&folderState.auto?folderState.autoSend?'Автоматические ответы':'Черновики на проверку':'Только чтение'):'Мониторинг остановлен';
+  $('#dialogs-run-state').textContent=testState().enabled?(testInProgress()?'Тест · один цикл':'Тест · ожидание'):state.running?(folderState.enabled&&folderState.auto?folderState.autoSend?'Автоматические ответы':'Черновики на проверку':'Только чтение'):'Мониторинг остановлен';
   $('#dialogs-run-state').classList.toggle('running',!!state.running);
+  $('#dialogs-start').hidden=testState().enabled;
+  $('#dialogs-scan').hidden=testState().enabled;
   $('#dialogs-start').disabled=!bound||!!state.running&&(!folderState.enabled||!productUI?.isApproved()||folderState.auto)||folderPausing||modeBusy;
   $('#dialogs-stop').disabled=!state.running;
   $('#dialogs-scan').disabled=!bound;
@@ -231,7 +269,7 @@ function reviewedDraft(item){
   const request=edit?.request||draftRequest(state,item.key);
   if(!productUI?.isApproved()||edit&&(edit.productFingerprint!==productFingerprint||edit.revision!==item.revision||edit.fingerprint!==item.fingerprint))throw new Error('Переписка или товар изменились. Проверьте актуальный контекст и подготовьте новый ответ.');
   if(!text.trim())throw new Error('Введите текст ответа.');
-  return {key:item.key,text,revision:request.revision,fingerprint:request.fingerprint,productFingerprint:request.productFingerprint,request};
+  return {key:item.key,text,revision:request.revision,fingerprint:request.fingerprint,productFingerprint:request.productFingerprint,...(edit?.testSessionId||item.draft?.testSessionId?{draftTestSessionId:edit?.testSessionId||item.draft.testSessionId}:{}),request};
 }
 async function saveEditedDraft(item){
   const edit=edits.get(item.key);if(!edit)return;
@@ -241,37 +279,39 @@ async function saveEditedDraft(item){
   if(edits.get(item.key)===edit)edits.delete(item.key);
   adopt(result);
 }
-action('#dialogs-save-draft',async()=>{await saveEditedDraft(chosen());feedback('Черновик сохранён. Отправка выполняется отдельной кнопкой.');});
+action('#dialogs-save-draft',async()=>{await saveEditedDraft(chosen());feedback(testState().enabled?'Черновик сохранён. Тестовый режим не отправляет сообщения.':'Черновик сохранён. Отправка выполняется отдельной кнопкой.');});
 action('#dialogs-send-draft',async()=>{
-  const item=chosen(),reviewed=reviewedDraft(item),intent=reviewEpoch;
+  const item=chosen();
+  if(!testState().enabled&&(edits.get(item?.key)?.testSessionId||item?.draft?.testSessionId))throw new Error('Удалите тестовый черновик и подготовьте новый ответ для настоящей отправки.');
+  const reviewed=reviewedDraft(item),intent=reviewEpoch,modeIntent=testModeIntent();
   if(sending.has(item.key))return;
   sending.add(item.key);renderDetail();
   try{
     if(folderPausePromise)await folderPausePromise;
     if(draftEditingPending.has(item.key))await draftEditingPending.get(item.key);
-    if(intent!==reviewEpoch||!productUI?.isApproved()||!state.running)throw new Error('Отправка отменена после изменения режима или задания. Проверьте текст и нажмите «Отправить» снова.');
+    if(intent!==reviewEpoch||!sameTestIntent(modeIntent)||!productUI?.isApproved()||!state.running)throw new Error('Отправка отменена после изменения режима или задания. Проверьте текст и нажмите «Отправить» снова.');
     await saveEditedDraft(item);
-    if(intent!==reviewEpoch||!productUI?.isApproved()||!state.running)throw new Error('Отправка отменена после изменения режима или задания. Проверьте текст и нажмите «Отправить» снова.');
+    if(intent!==reviewEpoch||!sameTestIntent(modeIntent)||!productUI?.isApproved()||!state.running)throw new Error('Отправка отменена после изменения режима или задания. Проверьте текст и нажмите «Отправить» снова.');
     // Keep the exact reviewed text and context even if storage refreshes during saving.
     const {request,...payload}=reviewed;
-    const result=await command('SEND_DRAFT',payload);adopt(result);
-    feedback(result.send?.detail||'Результат отправки записан в журнал.',result.send?.status!=='attempted');
+    const result=await command('SEND_DRAFT',{...payload,...modeIntent});adopt(result);
+    feedback(result.send?.detail||'Результат отправки записан в журнал.',!['attempted','previewed'].includes(result.send?.status));
   }finally{sending.delete(item.key);renderDetail();}
 });
 action('#dialogs-discard-draft',async()=>{reviewEpoch++;const item=chosen();await act('DISCARD_DRAFT',{key:item.key},'Черновик удалён.');edits.delete(item.key);});
 action('#dialogs-folder-draft',async()=>{
   const item=chosen();if(!item||!productUI?.isApproved()||!canDraft(item)||!folderState.enabled)throw new Error('Согласуйте товар, подключите Claude и прочитайте актуальную переписку.');
   if(edits.has(item.key))throw new Error('Сохраните или удалите несохранённый черновик.');
-  await act('FOLDER_DRAFT',{key:item.key},folderState.autoSend?'Claude готовит ответ. Включена автоматическая отправка.':'Claude готовит черновик для вашего одобрения.');
+  await act('FOLDER_DRAFT',{key:item.key},testState().enabled?'Claude готовит ответ для теста без отправки.':folderState.autoSend?'Claude готовит ответ. Включена автоматическая отправка.':'Claude готовит черновик для вашего одобрения.');
 });
-$('#dialogs-folder-model').addEventListener('change',()=>{reviewEpoch++;folderDirty=true;render();});
+$('#dialogs-folder-model').addEventListener('change',()=>{reviewEpoch++;folderDirty=true;render();if(testState().enabled)pauseFolderOnEdit(false,true);});
 action('#dialogs-folder-connect',async()=>{
   const permission=chrome.permissions.request({permissions:['nativeMessaging']});
   const settings=folderSettings();
   if(!await permission)throw new Error('Доступ к локальному модулю не разрешён. Claude не подключён.');
   if(folderPausePromise)await folderPausePromise;
   await disableLegacyDrafts();
-  const result=await command('FOLDER_SETTINGS',{...settings,resume:true,enabled:true,auto:!!productUI?.isApproved()&&!!state.running,autoSend:!!folderState.autoSend&&!!productUI?.isApproved()});
+  const result=await command('FOLDER_SETTINGS',{...settings,resume:true,enabled:true,auto:!!productUI?.isApproved()&&!!state.running,autoSend:!testState().enabled&&!!folderState.autoSend&&!!productUI?.isApproved()});
   folderDirty=false;adopt(result);adopt(await command('FOLDER_STATUS'));
   feedback(folderState.detail||'Состояние Claude обновлено.');
 });
@@ -286,12 +326,31 @@ $('#dialogs-folder-send').addEventListener('change',async()=>{
   reviewEpoch++;
   modeBusy=true;modeRequested=enabled;render();
   try{
+    if(enabled&&testState().enabled)throw new Error('Сначала выключите тестовый режим. Автоматическая отправка включается отдельно.');
     if(enabled&&(!productUI?.isApproved()||!folderState.enabled||!boundTabs()||folderDirty||edits.size))throw new Error('Подключите Claude, согласуйте товар, выберите вкладки и сохраните черновики.');
     if(enabled)await disableLegacyDrafts();
     adopt(await command('FOLDER_SETTINGS',enabled?{enabled:true,auto:true,autoSend:true}:{autoSend:false}));
     if(enabled&&!state.running){await act('START',{readUnread:$('#dialogs-read-unread').checked});readUnreadDirty=false;}
     feedback(enabled?'Автоматический режим включён. Claude будет готовить и отправлять ответы.':'Каждый ответ теперь требует вашего одобрения. Подготовка черновиков продолжается.');
   }catch(error){feedback(error.message,true);}finally{modeBusy=false;modeRequested=null;render();}
+});
+$('#dialogs-test-mode').addEventListener('change',async()=>{
+  const enabled=$('#dialogs-test-mode').checked;
+  reviewEpoch++;modeBusy=true;testRequested=enabled;render();
+  try{
+    const result=await command('FOLDER_SETTINGS',{testMode:enabled,autoSend:false});
+    adopt(result);
+    feedback(enabled?'Тестовый режим включён. Нажмите «Проверить первый цикл», чтобы проверить один ответ без отправки.':'Тестовый режим выключен. Автоматическая отправка остаётся выключенной.');
+  }catch(error){feedback(error.message,true);}finally{modeBusy=false;testRequested=null;render();}
+});
+action('#dialogs-test-next',async()=>{
+  const test=testState(),request={sessionId:test.sessionId,cycleId:test.cycleId},intent=reviewEpoch;
+  if(!test.enabled||!['paused','completed'].includes(test.phase))throw new Error('Тестовый цикл уже выполняется или требует проверки причины остановки.');
+  if(!folderState.enabled||!productUI?.isApproved()||!boundTabs()||folderDirty||edits.size)throw new Error('Подключите Claude, согласуйте товар, выберите вкладки и сохраните изменения.');
+  if(folderPausePromise)await folderPausePromise;
+  if(intent!==reviewEpoch||!testState().enabled||request.sessionId!==testState().sessionId||request.cycleId!==testState().cycleId||!productUI?.isApproved())throw new Error('Режим или задание изменились. Проверьте настройки перед запуском цикла.');
+  const result=await command('TEST_NEXT',request);readUnreadDirty=false;adopt(result);
+  feedback(testState().detail||'Запущен один тестовый цикл. Сообщение не будет отправлено.');
 });
 action('#dialogs-folder-stop',async()=>{reviewEpoch++;adopt(await command('FOLDER_SETTINGS',{enabled:false,auto:false,autoSend:false}));feedback('Claude отключён. Мониторинг может продолжать читать сообщения.');});
 action('#dialogs-folder-poll',()=>act('FOLDER_POLL',{},'Задания Claude обновлены.'));
@@ -302,7 +361,7 @@ $('#dialogs-draft-text').addEventListener('input',()=>{
   const pending=command('DRAFT_EDITING',{key:item.key}).then(result=>adopt(result)).catch(error=>{feedback('Не удалось приостановить обработку этого ответа: '+error.message,true);throw error;}).finally(()=>{if(draftEditingPending.get(item.key)===pending)draftEditingPending.delete(item.key);});
   draftEditingPending.set(item.key,pending);pending.catch(()=>{});
   let request=previous?.request;try{request||=draftRequest(state,item.key);}catch{}
-  edits.set(item.key,{text:$('#dialogs-draft-text').value,revision:previous?.revision??item.revision,fingerprint:previous?.fingerprint??item.fingerprint,productFingerprint:previous?.productFingerprint??productFingerprint,request});
+  edits.set(item.key,{text:$('#dialogs-draft-text').value,revision:previous?.revision??item.revision,fingerprint:previous?.fingerprint??item.fingerprint,productFingerprint:previous?.productFingerprint??productFingerprint,testSessionId:previous?.testSessionId||item.draft?.testSessionId||(testState().enabled?testState().sessionId:''),request});
   renderDetail();renderFolder();if(folderState.autoSend)pauseFolderOnEdit(true);
 });
 $('#dialogs-filter').addEventListener('change',renderList);$('#dialogs-search').addEventListener('input',renderList);

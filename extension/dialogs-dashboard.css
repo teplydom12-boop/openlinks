@@ -136,3 +136,20 @@ button:focus-visible, a:focus-visible, summary:focus-visible, select:focus-visib
   .dialogs-mode { padding: 14px; }
   .dialogs-folder-jobs .panel-heading { flex-direction: column; align-items: start; }
 }
+
+/* A test cycle uses the live chat editor, then waits without sending. */
+.dialogs-mode-options { display: grid; gap: 14px; }
+.dialogs-mode .dialogs-mode-options .dialogs-mode-check { margin: 0; }
+.dialogs-mode.test-mode { background: #f3f7fd; border-color: #b9cbe5; }
+.dialogs-status.test { color: #345e94; background: #e5edfa; }
+.dialogs-test-panel { border-top: 1px solid #ccd9eb; margin-top: 18px; padding-top: 17px; }
+.dialogs-test-panel > .panel-heading { align-items: center; margin-bottom: 8px; }
+.dialogs-test-panel .actions { margin-top: 15px; }
+.dialogs-test-result { margin-top: 14px; padding: 14px; background: #fff; border: 1px solid #d4dfee; border-radius: 8px; }
+.dialogs-test-result > p:first-child { margin: 0; color: #345477; font-weight: 600; overflow-wrap: anywhere; }
+.dialogs-test-result pre { font: inherit; font-size: 12px; line-height: 1.7; margin: 12px 0; max-height: 220px; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; color: #344e5c; }
+.dialogs-conversation-test-note { padding: 11px 13px; border: 1px solid #cfdaec; border-radius: 7px; background: #f2f6fc; color: #3f628b !important; line-height: 1.6; }
+@media (max-width: 1180px) {
+  .dialogs-mode-options { width: 100%; margin-top: 8px; }
+  .dialogs-test-panel > .panel-heading { flex-direction: row; flex-wrap: wrap; }
+}

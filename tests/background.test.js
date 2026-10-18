@@ -7,10 +7,11 @@ import {domReply} from './debugger-harness.js';
 const listener=()=>{const list=[];return {list,addListener(fn){list.push(fn);}};};
 let stored,clicks,contactClicks,commands,requests,beforeClick,probeKind,sendResult,frameUrl,tabCount,opened,missing,obstacle,prepareOk,lookupPages,fetches,probeRoute,updated,probeKey,listedTabs,frameList,tabReplies,frameProbes,deliveries;
 let scheduled,removed,canClose,nativeRequired,debuggerFailure,debuggerCalls,nativeFailure,chatReady;
+let afterPrepare,querySendGuard;
 let extraStorage={};
 const metadataFixture=readFileSync(new URL('./fixtures/1688-metadata.html',import.meta.url),'utf8');
 globalThis.fetch=async(url,options)=>{fetches.push({url,credentials:options.credentials});const html=lookupPages.get(url);if(html===undefined)throw new Error('No local metadata fixture');return new Response(html,{headers:{'content-type':'text/html'}});};
-const runtime={onMessage:listener(),onStartup:listener(),onInstalled:listener(),getURL:path=>'chrome-extension://test/'+path};
+const runtime={id:'test',onMessage:listener(),onStartup:listener(),onInstalled:listener(),getURL:path=>'chrome-extension://test/'+path};
 const alarms={onAlarm:listener(),create:async(name,options)=>{scheduled.push({name,...options});}};
 globalThis.chrome={runtime,alarms,storage:{local:{get:async keys=>{
  const all={...extraStorage,openlinksState:stored};
@@ -24,11 +25,11 @@ globalThis.chrome={runtime,alarms,storage:{local:{get:async keys=>{
   requests.push(structuredClone(data));
   if(data.type==='CHAT_READY')return {ok:chatReady,waiting:!chatReady,reason:'Loading chat'};
   if(data.type==='PROBE')return {engine:frameUrl.includes('1688.com')?undefined:'supplier-chat-v2',kind:probeKind,key:probeKey,chatRoute:probeRoute,obstacle:obstacle?.text,canDismiss:obstacle?.dismiss,dismissKey:obstacle?.key,reason:probeKind==='inquiry'?'Форма запроса, нужен чат':undefined,...frameProbes.get(options.frameId)};
-  if(data.type==='PREPARE')return {ok:prepareOk && !nativeRequired,needsNativeInput:nativeRequired,pageUrl:frameList?.find(frame=>frame.frameId===options.frameId)?.url || frameUrl,reason:prepareOk?undefined:'Редактор изменился'};
+  if(data.type==='PREPARE'){afterPrepare?.();return {ok:prepareOk && !nativeRequired,needsNativeInput:nativeRequired,pageUrl:frameList?.find(frame=>frame.frameId===options.frameId)?.url || frameUrl,reason:prepareOk?undefined:'Редактор изменился'};}
   if(data.type==='NATIVE_INPUT' && nativeFailure?.stage===data.stage)return {ok:false,reason:nativeFailure.reason};
   if(data.type==='NATIVE_INPUT' && data.stage==='done')nativeRequired=false;
   if(data.type==='CAN_CLOSE')return {ok:canClose};
-  if(data.type==='SEND'){clicks++;beforeClick=structuredClone(stored);if(sendResult==='disconnect')throw new Error('Disconnected');if(sendResult==='malformed')return {ok:false};return {clicked:sendResult!==false,accepted:sendResult===true,reason:'Кнопка изменилась'};}
+  if(data.type==='SEND'){if(querySendGuard){const guard=await message('OPENLINKS_TEST_SEND_GUARD',{}, {id:'test',tab:{id:tab},url:frameUrl});if(!guard?.canSend)return {clicked:false,reason:'Тестовый режим'};}clicks++;beforeClick=structuredClone(stored);if(sendResult==='disconnect')throw new Error('Disconnected');if(sendResult==='malformed')return {ok:false};return {clicked:sendResult!==false,accepted:sendResult===true,reason:'Кнопка изменилась'};}
   if(data.type==='CONTACT'){contactClicks++;return {ok:true,key:probeKey};}
   if(data.type==='DISMISS_CHALLENGE'){if(obstacle?.stuck)return {clicked:true,closed:false};obstacle=null;return {clicked:true,closed:true};}
   return {ok:true};
@@ -44,7 +45,7 @@ const message=(type,extra={},sender=ui)=>new Promise(resolve=>{
  for(const listen of runtime.onMessage.list)listen({type,...extra},sender,resolve);
 });
 async function tick(){alarms.onAlarm.list[0]({name:'openlinks-tick'});await message('GET');}
-function reset(){stored=initialState();extraStorage={};stored.settings.message='Hello';clicks=0;contactClicks=0;commands=[];requests=[];beforeClick=null;probeKind='chat';sendResult=true;frameUrl='https://a.en.alibaba.com/chat';tabCount=0;opened=[];missing=false;obstacle=null;prepareOk=true;lookupPages=new Map();fetches=[];probeRoute=null;updated=[];probeKey='#contact';listedTabs=[];frameList=null;tabReplies=new Map();frameProbes=new Map();deliveries=[];scheduled=[];removed=[];canClose=true;nativeRequired=false;debuggerFailure=null;debuggerCalls=[];nativeFailure=null;chatReady=true;}
+function reset(){afterPrepare=null;querySendGuard=false;stored=initialState();extraStorage={};stored.settings.message='Hello';clicks=0;contactClicks=0;commands=[];requests=[];beforeClick=null;probeKind='chat';sendResult=true;frameUrl='https://a.en.alibaba.com/chat';tabCount=0;opened=[];missing=false;obstacle=null;prepareOk=true;lookupPages=new Map();fetches=[];probeRoute=null;updated=[];probeKey='#contact';listedTabs=[];frameList=null;tabReplies=new Map();frameProbes=new Map();deliveries=[];scheduled=[];removed=[];canClose=true;nativeRequired=false;debuggerFailure=null;debuggerCalls=[];nativeFailure=null;chatReady=true;}
 async function review(url='https://a.en.alibaba.com/'){await message('IMPORT',{text:url});await message('START');await tick();await tick();}
 async function openingTimedOut(){stored.queue[0].chatOpening.at=Date.now()-21000;await tick();}
 
@@ -846,4 +847,33 @@ test('dialogue quota includes prior outreach sends and protects future reservati
  stored.slots=[{platform:'mic',kind:'send',at:Date.now()+100000,jobId:'future'}];
  assert.equal((await reserveDialogSendQuota({platform:'mic',jobId:crypto.randomUUID(),attemptId:crypto.randomUUID()})).ok,false);
  await assert.rejects(reserveDialogSendQuota({platform:'foreign',jobId:'invalid',attemptId:'invalid'}));assert.equal(clicks,0);
+});
+
+
+test('dialog test mode pauses outreach, rejects starts and approvals, and never reserves real quota',async()=>{
+ reset();await review();await message('APPROVE');
+ extraStorage.openlinksClaudeFolder={test:{enabled:true}};
+ const {pauseOutreachForTest,reserveDialogSendQuota}=await import('../extension/background.js');
+ await pauseOutreachForTest();assert.equal(stored.running,false);assert.equal(stored.queue[0].approved,false);
+ for(const type of ['START','APPROVE','RECHECK','RETRY_SEND','TEACH']){const result=await message(type,{field:'send'});assert.equal(result.ok,false,type);assert.match(result.error,/тестовый режим/);}
+ await tick();assert.equal(clicks,0);assert.equal(stored.slots.filter(s=>s.kind==='send').length,0);
+ const quota=await reserveDialogSendQuota({platform:'mic',jobId:crypto.randomUUID(),attemptId:crypto.randomUUID()});assert.equal(quota.ok,false);assert.match(quota.reason,/тестовый режим/);
+ extraStorage.openlinksClaudeFolder.test.enabled=false;await tick();assert.equal(stored.running,false);assert.equal(clicks,0);
+});
+test('entering dialog test mode during outreach preparation prevents click and send quota',async()=>{
+ reset();await review();await message('APPROVE');afterPrepare=()=>{extraStorage.openlinksClaudeFolder={test:{enabled:true}};};
+ await tick();assert.equal(clicks,0);assert.equal(stored.running,false);assert.equal(stored.slots.filter(s=>s.kind==='send').length,0);assert.equal(commands.includes('SEND'),false);
+});
+test('content send-mode guard is authenticated, read-only and independent of the outreach lock',async()=>{
+ reset();const source={id:'test',tab:{id:7},url:frameUrl};
+ assert.deepEqual(await message('OPENLINKS_TEST_SEND_GUARD',{},source),{ok:true,canSend:true});
+ for(const invalid of [{...source,id:'foreign'},{...source,url:'https://example.com/'},{id:'test',url:frameUrl}])assert.deepEqual(await message('OPENLINKS_TEST_SEND_GUARD',{},invalid),{ok:false,canSend:false});
+ extraStorage.openlinksClaudeFolder={test:{enabled:true}};assert.deepEqual(await message('OPENLINKS_TEST_SEND_GUARD',{},source),{ok:true,canSend:false});
+ extraStorage={};await review();await message('APPROVE');querySendGuard=true;
+ let timer;try{await Promise.race([tick(),new Promise((_,reject)=>{timer=setTimeout(()=>reject(new Error('Send guard deadlocked behind outreach command')),1000);})]);}finally{clearTimeout(timer);}
+ assert.equal(clicks,1);
+});
+test('content send-mode guard fails closed when trusted storage is unavailable',async t=>{
+ reset();t.mock.method(chrome.storage.local,'get',async()=>{throw new Error('Storage unavailable');});
+ assert.deepEqual(await message('OPENLINKS_TEST_SEND_GUARD',{}, {id:'test',tab:{id:7},url:frameUrl}),{ok:false,canSend:false});assert.equal(clicks,0);
 });

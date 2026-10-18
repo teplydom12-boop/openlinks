@@ -55,7 +55,15 @@
       <div class="panel-heading"><div><div class="eyebrow">ШАГ 3</div><h2 id="dialogs-tabs-heading">Мониторинг площадок</h2></div><button id="dialogs-refresh-tabs" class="link-button" type="button">Обновить список вкладок</button></div>
       <p class="hint">Откройте центры сообщений в своём аккаунте и выберите их вкладки. Во время мониторинга держите Chrome и локальный обработчик запущенными.</p>
       <div id="dialogs-bindings" class="dialogs-platforms"></div>
-      <div class="dialogs-mode" id="dialogs-mode"><div class="panel-heading"><div><h3 id="dialogs-mode-label">С вашим одобрением</h3><p id="dialogs-folder-send-note" class="hint" role="status">Claude готовит черновики. Вы проверяете текст и нажимаете «Отправить».</p></div><label class="check dialogs-mode-check"><input id="dialogs-folder-send" type="checkbox" disabled> Отправлять ответы автоматически</label></div><p id="dialogs-monitor-note" class="hint" role="status"></p></div>
+      <div class="dialogs-mode" id="dialogs-mode"><div class="panel-heading"><div><h3 id="dialogs-mode-label">С вашим одобрением</h3><p id="dialogs-folder-send-note" class="hint" role="status">Claude готовит черновики. Вы проверяете текст и нажимаете «Отправить».</p></div><div class="dialogs-mode-options"><label class="check dialogs-mode-check"><input id="dialogs-folder-send" type="checkbox" disabled> Отправлять ответы автоматически</label><label class="check dialogs-mode-check"><input id="dialogs-test-mode" type="checkbox" disabled> Тестовый режим — без отправки</label></div></div><p id="dialogs-monitor-note" class="hint" role="status"></p>
+        <div id="dialogs-test-panel" class="dialogs-test-panel" hidden>
+          <div class="panel-heading"><h3 id="dialogs-test-status" role="status">Готов к проверке</h3><span class="dialogs-status test">Без отправки</span></div>
+          <p id="dialogs-test-detail" class="hint"></p>
+          <div id="dialogs-test-result" class="dialogs-test-result" hidden><p id="dialogs-test-recipient"></p><p id="dialogs-test-time" class="hint"></p><pre id="dialogs-test-text"></pre><p id="dialogs-test-result-note" class="hint">Текст введён в чат для проверки. Записи об отправке в истории переписки нет.</p></div>
+          <div class="actions"><button id="dialogs-test-next" class="button primary" type="button" disabled>Проверить первый цикл</button><span id="dialogs-test-count" class="hint"></span></div>
+          <p class="hint">После одного ответа проверка останавливается на всех площадках. «Следующий цикл» учитывает предыдущий ответ только в тестовом режиме и переходит к следующему входящему сообщению.</p>
+        </div>
+      </div>
       <div class="actions"><button id="dialogs-start" class="button primary" type="button" disabled>Начать мониторинг</button><button id="dialogs-stop" class="button secondary" type="button" disabled>Остановить мониторинг</button><button id="dialogs-scan" class="button secondary" type="button" disabled>Проверить сейчас</button></div>
       <details class="dialogs-inline-details"><summary>Как читаются сообщения</summary><label class="check"><input id="dialogs-read-unread" type="checkbox" checked> Открывать диалоги с новыми сообщениями для чтения</label><p class="hint">Открытие переписки может снять отметку «непрочитано». При первом проходе также проверяются диалоги с доступным превью. Настройка применяется при запуске мониторинга. Если история или автор сообщения не распознаны, ответ приостанавливается до проверки.</p></details>
     </section>
@@ -70,6 +78,7 @@
           <div class="actions"><button id="dialogs-takeover" class="button secondary" type="button">Взять разговор на себя</button><button id="dialogs-mute" class="button secondary" type="button">Пауза переписки</button></div>
           <p id="dialogs-history-note" class="hint"></p><p id="dialogs-reader-detail" class="hint" role="status" hidden></p><p id="dialogs-coverage" class="hint" hidden></p>
           <div id="dialogs-history" class="dialogs-history" aria-label="История переписки"></div>
+          <p id="dialogs-conversation-test-note" class="dialogs-conversation-test-note" role="status" hidden></p>
           <div class="dialogs-draft">
             <div class="panel-heading"><h3>Ответ поставщику</h3><button id="dialogs-folder-draft" class="button secondary" type="button" disabled>Подготовить ответ</button></div>
             <p id="dialogs-generate-hint" class="hint"></p><p id="dialogs-draft-reason" class="hint" hidden></p><p id="dialogs-auto-status" class="hint" role="status" hidden></p>

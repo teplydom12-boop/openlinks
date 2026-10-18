@@ -30,10 +30,11 @@ HARNESS = r"""
   const now=Date.UTC(2026,9,18,1,10),listeners=[];
   let state=null,core=null;
   const ai={provider:'openai',keyStored:false,model:'',providers:{openai:{keyStored:false,model:''},anthropic:{keyStored:false,model:''}}};
-  let folder={enabled:false,auto:false,autoSend:false,model:'haiku',status:'disabled',detail:'',folder:'',worker:{running:false},claude:{available:true},jobs:[],sendReceipts:[]};
+  const emptyTest=()=>({enabled:false,sessionId:'',phase:'off',cycleId:'',key:'',detail:'',text:'',at:null,completed:[]});
+  let folder={enabled:false,auto:false,autoSend:false,model:'haiku',status:'disabled',detail:'',folder:'',worker:{running:false},claude:{available:true},jobs:[],sendReceipts:[],test:emptyTest()};
   const coreModule=()=>import('/extension/lib/dialogs.js');
   window.calls=[];window.permissionCalls=[];window.allowPermission=true;window.failGet=false;window.failFolder=false;
-  window.deferSend=false;window.deferDraftEditing=false;window.sendOutcome='attempted';window.sentTexts=[];
+  window.deferSend=false;window.deferDraftEditing=false;window.deferTestNext=false;window.sendOutcome='attempted';window.sentTexts=[];window.previewedTexts=[];
   const tabs=[{id:11,platform:'1688',title:'1688 chat',url:'https://air.1688.com/chat/'},{id:22,platform:'alibaba',title:'Alibaba messages',url:'https://message.alibaba.com/'},{id:33,platform:'mic',title:'Made-in-China messages',url:'https://webim.made-in-china.com/'}];
   const publicState=()=>({ok:true,state:structuredClone(state),ai:structuredClone(ai),folder:structuredClone(folder),productFingerprint:core.productFingerprint(state)});
   function announce(){for(const listener of listeners)listener({openlinksDialogs:{newValue:structuredClone(state)},openlinksClaudeFolder:{newValue:structuredClone(folder)}},'local');}
@@ -52,13 +53,20 @@ HARNESS = r"""
       else if(t==='DIALOGS_PRODUCT_SAVE'){if(message.revision!==state.product.revision||message.fingerprint!==core.productFingerprint(state))throw new Error('Версия товара изменилась');core.saveProduct(state,message.product,now);}
       else if(t==='DIALOGS_PRODUCT_APPROVE'){if(message.revision!==state.product.revision)throw new Error('Версия товара изменилась');core.approveProduct(state,message.fingerprint,now);}
       else if(t==='DIALOGS_CONTROL')core.setConversationControl(state,message.key,message,now);
-      else if(t==='DIALOGS_SAVE_DRAFT'){const request=core.draftRequest(state,message.key);core.buildDraftPrompt(state,request);if(request.revision!==message.revision||request.fingerprint!==message.fingerprint)throw new Error('Переписка изменилась');core.acceptDraft(state,request,{text:message.text},now);}
-      else if(t==='DIALOGS_CONTEXT_EDITING'){folder.auto=false;folder.autoSend=false;state.settings.autoDraft=false;for(const job of folder.jobs)if(['preparing','queued','running','done','awaiting_limit'].includes(job.status))job.status='cancelled';}
+      else if(t==='DIALOGS_SAVE_DRAFT'){const request=core.draftRequest(state,message.key);core.buildDraftPrompt(state,request);if(request.revision!==message.revision||request.fingerprint!==message.fingerprint)throw new Error('Переписка изменилась');const testSessionId=message.draftTestSessionId||state.conversations[message.key]?.draft?.testSessionId||(folder.test.enabled?folder.test.sessionId:'');core.acceptDraft(state,request,{text:message.text,testSessionId},now);}
+      else if(t==='DIALOGS_CONTEXT_EDITING'){folder.auto=false;folder.autoSend=false;state.settings.autoDraft=false;if(folder.test.enabled){if(folder.test.phase!=='completed')folder.test.phase='paused';folder.test.detail='Тест приостановлен: контекст изменён.';}for(const job of folder.jobs)if(['preparing','queued','running','done','awaiting_limit'].includes(job.status))job.status='cancelled';}
       else if(t==='DIALOGS_DRAFT_EDITING'){for(const job of folder.jobs)if(job.key===message.key&&['queued','running','done','awaiting_limit'].includes(job.status))job.status='cancelled';if(window.deferDraftEditing)await new Promise(resolve=>{window.resolveDraftEditing=resolve;});}
       else if(t==='DIALOGS_DISCARD_DRAFT')state.conversations[message.key].draft=null;
       else if(t==='DIALOGS_SEND_DRAFT'){
         const current=core.draftRequest(state,message.key),item=state.conversations[message.key];
         if(!item?.draft||message.text!==item.draft.text||message.revision!==current.revision||message.fingerprint!==current.fingerprint||message.productFingerprint!==current.productFingerprint||item.draft.productFingerprint!==current.productFingerprint)throw new Error('Черновик или контекст изменились');
+        if(message.testMode===true){
+          if(!folder.test.enabled||message.testSessionId!==folder.test.sessionId||message.testCycleId!==folder.test.cycleId)throw new Error('Тестовый режим или цикл изменились.');
+          item.draft.testSessionId=folder.test.sessionId;window.previewedTexts.push(message.text);Object.assign(folder.test,{phase:'completed',key:message.key,text:message.text,at:now,detail:'Текст вставлен для проверки. Сообщение не отправлено.'});
+          return {...publicState(),send:{status:'previewed',detail:'Текст вставлен для проверки. Сообщение не отправлено.'}};
+        }
+        if(folder.test.enabled)throw new Error('Реальная отправка заблокирована тестовым режимом.');
+        if(item.draft.testSessionId)throw new Error('Тестовый ответ нельзя отправить настоящему поставщику.');
         if(folder.jobs.some(job=>job.key===message.key&&['sent','send_unknown'].includes(job.status)))throw new Error('Попытка отправки уже зарегистрирована');
         if(window.deferSend)await new Promise(resolve=>{window.resolveSend=resolve;});
         const status=window.sendOutcome;
@@ -69,15 +77,29 @@ HARNESS = r"""
       else if(t==='DIALOGS_FOLDER_SETTINGS'){
         if(failFolder)throw new Error('Локальный модуль не найден. Установите обработчик Claude Code.');
         if((message.auto||message.autoSend)&&(!state.product.approval||state.product.approval.fingerprint!==core.productFingerprint(state)))throw new Error('Сначала сохраните и согласуйте сведения о товаре.');
+        if(message.autoSend===true&&folder.test.enabled&&message.testMode!==false)throw new Error('Сначала выключите тестовый режим.');
+        if(message.testMode===true&&!folder.test.enabled)folder.test={...emptyTest(),enabled:true,sessionId:crypto.randomUUID(),cycleId:crypto.randomUUID(),phase:'paused',detail:'Готов к первому тестовому циклу.'};
+        if(message.testMode===false)Object.assign(folder.test,{enabled:false,phase:'off'});
+        if(folder.test.enabled&&Object.hasOwn(message,'model')&&message.model!==folder.model)Object.assign(folder.test,{phase:folder.test.phase==='completed'?'completed':'paused',detail:'Тест приостановлен: выбрана другая модель.'});
         for(const key of ['enabled','auto','autoSend','model'])if(Object.hasOwn(message,key))folder[key]=message[key];
+        if(folder.test.enabled)folder.autoSend=false;
         if(!folder.enabled){folder.status='paused';folder.auto=false;folder.autoSend=false;for(const job of folder.jobs)if(['queued','running'].includes(job.status))job.status='cancelled';}
         else {folder.status='offline';folder.detail='Claude недоступен: задания ждут подключения к интернету.';folder.folder='C:\\Users\\Test\\Desktop\\OpenLinks Claude';folder.worker={running:true,heartbeat:now,status:'offline'};}
       }
       else if(t==='DIALOGS_FOLDER_PRODUCT'){if(!folder.enabled)throw new Error('Папка выключена');if(message.revision!==state.product.revision||message.fingerprint!==core.productFingerprint(state))throw new Error('Версия товара изменилась');folder.jobs.push({id:'job-product-'+folder.jobs.length,kind:'product',status:'queued',at:now,request:core.productExtractionRequest(state)});}
       else if(t==='DIALOGS_FOLDER_DRAFT'){if(!folder.enabled)throw new Error('Папка выключена');core.buildDraftPrompt(state,core.draftRequest(state,message.key));folder.jobs.push({id:'job-draft-'+folder.jobs.length,kind:'dialog',key:message.key,status:'queued',at:now});}
       else if(t==='DIALOGS_FOLDER_POLL')return publicState();
-      else if(t==='DIALOGS_FOLDER_RETRY')folder.jobs.find(job=>job.id===message.id).status='queued';
+      else if(t==='DIALOGS_FOLDER_RETRY'){const job=folder.jobs.find(job=>job.id===message.id);if(job.test)throw new Error('Начните новый тестовый сеанс.');job.status='queued';}
       else if(t==='DIALOGS_FOLDER_CANCEL')folder.jobs.find(job=>job.id===message.id).status='cancelled';
+      else if(t==='DIALOGS_TEST_NEXT'){
+        const test=folder.test;
+        if(!test.enabled||message.sessionId!==test.sessionId||message.cycleId!==test.cycleId||!['paused','completed'].includes(test.phase))throw new Error('Тестовый цикл изменился.');
+        if(window.deferTestNext)await new Promise(resolve=>{window.resolveTestNext=resolve;});
+        if(message.sessionId!==folder.test.sessionId||message.cycleId!==folder.test.cycleId||!folder.test.enabled)throw new Error('Тестовый цикл изменился.');
+        if(test.phase==='completed')test.completed.push({key:test.key,context:'synthetic-context',at:now});
+        Object.assign(test,{phase:'ready',cycleId:crypto.randomUUID(),key:'',text:'',at:null,detail:'Ожидаю один тестовый цикл.'});
+        folder.auto=true;folder.autoSend=false;state.running=true;state.readUnread=true;
+      }
       else return {ok:false,error:'Unknown test action '+t};
       return publicState();
     }catch(error){return {ok:false,error:error.message};}
@@ -88,8 +110,10 @@ HARNESS = r"""
   window.changeProduct=patch=>{core.saveProduct(state,patch,now);announce();};
   window.dialogAI=()=>structuredClone(ai);window.dialogState=()=>structuredClone(state);window.folderState=()=>structuredClone(folder);
   window.changeFolder=patch=>{Object.assign(folder,patch);announce();};
+  window.changeTest=patch=>{Object.assign(folder.test,patch);announce();};
+  window.completeTestCycle=(text='Synthetic preview: 10 units, 220 V.')=>{Object.assign(folder.test,{phase:'completed',key:'alibaba:alpha',text,at:now,detail:'Текст вставлен для проверки. Сообщение не отправлено.'});announce();};
   window.finishProductJob=()=>{const job=[...folder.jobs].reverse().find(job=>job.kind==='product'&&job.status==='queued');if(!job)throw new Error('No product job');core.acceptProductExtraction(state,job.request,{keyPoints:'Model A. Quantity: 10. Stainless steel.',questions:'What is the minimum order?\nWhat is the lead time?',warnings:'Price has not been confirmed.',processedImageKeys:state.product.files.filter(file=>!file.excluded).flatMap(file=>(file.images||[]).map(image=>image.imageKey))},now);job.status='accepted';announce();};
-  window.deliverDraft=(text='Could you confirm the minimum order?')=>{core.acceptDraft(state,core.draftRequest(state,'alibaba:alpha'),{text,reason:'Ответ Claude из папки'},now);const job=[...folder.jobs].reverse().find(job=>job.key==='alibaba:alpha'&&job.status==='queued');if(job)job.status='accepted';announce();};
+  window.deliverDraft=(text='Could you confirm the minimum order?')=>{core.acceptDraft(state,core.draftRequest(state,'alibaba:alpha'),{text,reason:'Ответ Claude из папки',testSessionId:folder.test.enabled?folder.test.sessionId:''},now);const job=[...folder.jobs].reverse().find(job=>job.key==='alibaba:alpha'&&job.status==='queued');if(job)job.status='accepted';announce();};
   window.announceDialogs=announce;
 })();
 """
@@ -401,7 +425,7 @@ try:
         send_ui.wait_for_function("calls.some(c=>c.type==='DIALOGS_SEND_DRAFT')")
         expect(send_ui.locator('#dialogs-send-draft')).to_be_disabled()
         sent = send_ui.evaluate("calls.filter(c=>c.type==='DIALOGS_SEND_DRAFT').at(-1)")
-        assert sent == {'type':'DIALOGS_SEND_DRAFT','key':'alibaba:alpha','text':'We need 10 units. Please confirm MOQ and lead time.','revision':1,'fingerprint':'fp1','productFingerprint':send_ui.evaluate('dialogState().product.approval.fingerprint')}
+        assert sent == {'type':'DIALOGS_SEND_DRAFT','key':'alibaba:alpha','text':'We need 10 units. Please confirm MOQ and lead time.','revision':1,'fingerprint':'fp1','productFingerprint':send_ui.evaluate('dialogState().product.approval.fingerprint'),'testMode':False}
         preceding = send_ui.evaluate("calls.slice(0,calls.findIndex(c=>c.type==='DIALOGS_SEND_DRAFT')).filter(c=>c.type==='DIALOGS_SAVE_DRAFT').at(-1)")
         assert preceding['text'] == sent['text']
         send_ui.evaluate('resolveSend()')
@@ -530,13 +554,201 @@ try:
         assert mode_ui.evaluate("calls.filter(c=>c.type==='DIALOGS_FOLDER_POLL').length") == 1
         passed('queue diagnostics escape supplier text and expose retry/cancel only for appropriate states')
 
+        test_ui = prepared_page()
+        original_history = test_ui.evaluate("JSON.stringify(dialogState().conversations['alibaba:alpha'].messages)")
+        test_ui.locator('#dialogs-folder-send').check()
+        test_ui.wait_for_function('folderState().autoSend===true')
+        test_ui.locator('#dialogs-test-mode').check()
+        test_ui.wait_for_function('folderState().test.enabled===true')
+        expect(test_ui.locator('#dialogs-folder-send')).not_to_be_checked()
+        expect(test_ui.locator('#dialogs-folder-send')).to_be_disabled()
+        expect(test_ui.locator('#dialogs-start')).to_be_hidden()
+        expect(test_ui.locator('#dialogs-scan')).to_be_hidden()
+        expect(test_ui.locator('#dialogs-test-next')).to_be_enabled()
+        assert test_ui.evaluate('folderState().autoSend') is False
+        assert test_ui.evaluate('folderState().test.phase') == 'paused'
+        assert not test_ui.evaluate("calls.some(c=>c.type==='DIALOGS_SEND_DRAFT'||c.type==='DIALOGS_TEST_NEXT')")
+        passed('test toggle disables real auto-send atomically and waits for an explicit first cycle without sending')
+
+        first_cycle = test_ui.evaluate('({sessionId:folderState().test.sessionId,cycleId:folderState().test.cycleId})')
+        test_ui.evaluate('deferTestNext=true')
+        test_ui.locator('#dialogs-test-next').click()
+        test_ui.wait_for_function('typeof resolveTestNext==="function"')
+        expect(test_ui.locator('#dialogs-test-next')).to_be_disabled()
+        assert test_ui.evaluate("calls.filter(c=>c.type==='DIALOGS_TEST_NEXT').at(-1)") == {'type':'DIALOGS_TEST_NEXT',**first_cycle}
+        test_ui.evaluate('resolveTestNext();deferTestNext=false')
+        test_ui.wait_for_function('folderState().test.phase==="ready"')
+        expect(test_ui.locator('#dialogs-test-next')).to_be_disabled()
+        test_ui.evaluate('announceDialogs()')
+        assert test_ui.evaluate("calls.filter(c=>c.type==='DIALOGS_TEST_NEXT').length") == 1
+        assert test_ui.evaluate('folderState().test.cycleId') != first_cycle['cycleId']
+        passed('cycle button submits the exact session/cycle once and stays disabled while the one-cycle run is pending')
+
+        preview_text = 'Preview <img src=x onerror=alert(1)>: 10 units, 220 V.'
+        test_ui.evaluate('(text)=>completeTestCycle(text)',preview_text)
+        expect(test_ui.locator('#dialogs-test-status')).to_contain_text('сообщение не отправлено')
+        expect(test_ui.locator('#dialogs-test-result')).to_be_visible()
+        expect(test_ui.locator('#dialogs-test-text')).to_have_text(preview_text)
+        expect(test_ui.locator('#dialogs-test-recipient')).to_contain_text('Alibaba · Supplier alpha')
+        expect(test_ui.locator('#dialogs-test-time')).to_contain_text('09:10:00')
+        expect(test_ui.locator('#dialogs-test-next')).to_be_enabled()
+        expect(test_ui.locator('#dialogs-conversation-test-note')).to_contain_text('не отправлено')
+        assert test_ui.locator('#dialogs-test-result img,#dialogs-history #dialogs-conversation-test-note').count() == 0
+        assert test_ui.evaluate("JSON.stringify(dialogState().conversations['alibaba:alpha'].messages)") == original_history
+        assert test_ui.evaluate('folderState().sendReceipts.length') == 0
+        assert test_ui.evaluate('sentTexts.length') == 0
+        test_ui.evaluate('announceDialogs()')
+        assert test_ui.evaluate("calls.filter(c=>c.type==='DIALOGS_TEST_NEXT').length") == 1
+        assert not test_ui.evaluate("calls.some(c=>c.type==='DIALOGS_SEND_DRAFT')")
+        if artifact_dir:
+            test_ui.screenshot(path=str(artifact_dir/'dialogs-testmode-desktop.png'),full_page=True)
+            test_ui.set_viewport_size({'width':600,'height':850})
+            assert test_ui.evaluate('document.documentElement.scrollWidth <= window.innerWidth')
+            test_ui.screenshot(path=str(artifact_dir/'dialogs-testmode-mobile.png'),full_page=True)
+            test_ui.set_viewport_size({'width':1500,'height':1100})
+        passed('completed preview is labelled unsent outside real history; render cannot advance it or create delivery records')
+
+        test_ui.locator('#dialogs-folder-model').select_option('sonnet')
+        expect(test_ui.locator('#dialogs-test-next')).to_be_disabled()
+        expect(test_ui.locator('#dialogs-test-text')).to_have_text(preview_text)
+        test_ui.locator('#dialogs-folder-save').click()
+        test_ui.wait_for_function('folderState().model==="sonnet"')
+        expect(test_ui.locator('#dialogs-test-result')).to_be_visible()
+        expect(test_ui.locator('#dialogs-test-text')).to_have_text(preview_text)
+        test_ui.locator('#dialogs-product-rules').fill('Changed procurement rule after an unsent test preview.')
+        expect(test_ui.locator('#dialogs-test-next')).to_be_disabled()
+        expect(test_ui.locator('#dialogs-test-result')).to_be_visible()
+        expect(test_ui.locator('#dialogs-test-text')).to_have_text(preview_text)
+        test_ui.locator('#dialogs-product-save').click()
+        expect(test_ui.locator('#dialogs-test-next')).to_be_disabled()
+        test_ui.locator('#dialogs-product-approve').click()
+        expect(test_ui.locator('#dialogs-test-next')).to_be_enabled()
+        assert test_ui.evaluate("calls.filter(c=>c.type==='DIALOGS_TEST_NEXT').length") == 1
+        assert test_ui.evaluate('folderState().autoSend') is False
+        passed('model/product edits preserve the unsent test result and require saved approved context before explicit continuation')
+
+        completed_cycle = test_ui.evaluate('({sessionId:folderState().test.sessionId,cycleId:folderState().test.cycleId})')
+        test_ui.locator('#dialogs-test-next').click()
+        test_ui.wait_for_function('folderState().test.phase==="ready"')
+        assert test_ui.evaluate("calls.filter(c=>c.type==='DIALOGS_TEST_NEXT').at(-1)") == {'type':'DIALOGS_TEST_NEXT',**completed_cycle}
+        assert test_ui.evaluate('folderState().test.completed.length') == 1
+        assert test_ui.evaluate("JSON.stringify(dialogState().conversations['alibaba:alpha'].messages)") == original_history
+        test_ui.evaluate("changeTest({phase:'blocked',detail:'Нельзя очистить изменённый пользователем текст.',key:'alibaba:alpha',text:'User-owned edited text'})")
+        expect(test_ui.locator('#dialogs-test-next')).to_be_disabled()
+        expect(test_ui.locator('#dialogs-test-detail')).to_contain_text('удалите его вручную')
+        expect(test_ui.locator('#dialogs-test-detail')).to_contain_text('выключите и снова включите')
+        expect(test_ui.locator('#dialogs-test-text')).to_have_text('User-owned edited text')
+        assert test_ui.evaluate("calls.filter(c=>c.type==='DIALOGS_TEST_NEXT').length") == 2
+        test_ui.locator('#dialogs-test-mode').uncheck()
+        test_ui.wait_for_function('folderState().test.enabled===false')
+        assert test_ui.evaluate('folderState().autoSend') is False
+        assert test_ui.evaluate('sentTexts.length') == 0
+        assert test_ui.evaluate('folderState().sendReceipts.length') == 0
+        passed('only explicit Next records shadow completion; blocked cleanup cannot advance and leaving test mode never restores auto-send')
+
+        test_ui.evaluate("changeFolder({jobs:[{id:'test-error',kind:'dialog',test:true,key:'alibaba:alpha',status:'error'},{id:'test-offline',kind:'dialog',test:true,key:'alibaba:alpha',status:'offline'},{id:'test-unknown',kind:'dialog',test:true,key:'alibaba:alpha',status:'unknown'},{id:'real-error',kind:'dialog',test:false,key:'alibaba:alpha',status:'error'},{id:'product-error',kind:'product',test:false,status:'error'}]})")
+        test_ui.get_by_text('Задания Claude',exact=True).click()
+        for job_id in ['test-error','test-offline','test-unknown']:
+            row = test_ui.locator(f'#dialogs-folder-jobs [data-job-id="{job_id}"]')
+            expect(row).to_contain_text('начните новый сеанс')
+            assert row.get_by_role('button',name='Повторить',exact=True).count() == 0
+        for job_id in ['real-error','product-error']:
+            row = test_ui.locator(f'#dialogs-folder-jobs [data-job-id="{job_id}"]')
+            expect(row.get_by_role('button',name='Повторить',exact=True)).to_be_enabled()
+            row.get_by_role('button',name='Повторить',exact=True).click()
+            expect(row).to_contain_text('В очереди')
+        assert test_ui.evaluate("calls.filter(c=>c.type==='DIALOGS_FOLDER_RETRY').map(c=>c.id)") == ['real-error','product-error']
+        assert not test_ui.evaluate("calls.some(c=>c.type==='DIALOGS_SEND_DRAFT')")
+        passed('test jobs cannot use generic Retry after leaving test mode; real conversation and product jobs remain retryable')
+
+        preview_ui = prepared_page()
+        preview_ui.locator('#dialogs-test-mode').check()
+        preview_ui.wait_for_function('folderState().test.enabled===true')
+        preview_ui.locator('#dialogs-test-next').click()
+        preview_ui.wait_for_function('folderState().test.phase==="ready"')
+        assert preview_ui.evaluate('dialogState().running&&folderState().auto') is True
+        assert not preview_ui.evaluate("calls.some(c=>c.type==='DIALOGS_START')")
+        preview_ui.evaluate("deliverDraft('An editable local preview.')")
+        expect(preview_ui.locator('#dialogs-send-draft')).to_have_text('Проверить без отправки')
+        preview_ui.locator('#dialogs-draft-text').fill('Edited preview: 10 units, please confirm lead time.')
+        preview_intent = preview_ui.evaluate('({sessionId:folderState().test.sessionId,cycleId:folderState().test.cycleId})')
+        preview_ui.locator('#dialogs-send-draft').click()
+        preview_ui.wait_for_function('previewedTexts.length===1')
+        expect(preview_ui.locator('#dialogs-send-draft')).to_be_disabled()
+        preview_call = preview_ui.evaluate("calls.filter(c=>c.type==='DIALOGS_SEND_DRAFT').at(-1)")
+        assert preview_call['testMode'] is True
+        assert preview_call['testSessionId'] == preview_intent['sessionId']
+        assert preview_call['testCycleId'] == preview_intent['cycleId']
+        assert preview_call['text'] == 'Edited preview: 10 units, please confirm lead time.'
+        assert preview_ui.evaluate('sentTexts.length') == 0
+        assert preview_ui.evaluate('folderState().sendReceipts.length') == 0
+        expect(preview_ui.locator('#dialogs-test-status')).to_contain_text('не отправлено')
+        preview_ui.locator('#dialogs-draft-text').fill('An unsaved edit after the completed preview.')
+        expect(preview_ui.locator('#dialogs-test-next')).to_be_disabled()
+        expect(preview_ui.locator('#dialogs-test-detail')).to_contain_text('несохранённые черновики')
+        passed('manual preview carries frozen test intent/session/cycle and current text; completion and dirty edits block further cycles')
+
+        preview_ui.locator('#dialogs-test-mode').uncheck()
+        preview_ui.wait_for_function('folderState().test.enabled===false')
+        expect(preview_ui.locator('#dialogs-send-draft')).to_have_text('Отправить')
+        expect(preview_ui.locator('#dialogs-send-draft')).to_be_disabled()
+        expect(preview_ui.locator('#dialogs-send-note')).to_contain_text('Тестовый ответ нельзя отправить настоящему поставщику')
+        expect(preview_ui.locator('#dialogs-save-draft')).to_be_enabled()
+        preview_ui.locator('#dialogs-save-draft').click()
+        preview_ui.wait_for_function("dialogState().conversations['alibaba:alpha'].draft.text==='An unsaved edit after the completed preview.'")
+        assert preview_ui.evaluate("dialogState().conversations['alibaba:alpha'].draft.testSessionId") == preview_intent['sessionId']
+        expect(preview_ui.locator('#dialogs-send-draft')).to_be_disabled()
+        preview_ui.locator('#dialogs-draft-text').fill('Another edit to a test-only draft.')
+        expect(preview_ui.locator('#dialogs-send-draft')).to_be_disabled()
+        preview_ui.locator('#dialogs-send-draft').dispatch_event('click')
+        expect(preview_ui.locator('#dialogs-feedback')).to_contain_text('Удалите тестовый черновик')
+        assert preview_ui.evaluate("calls.filter(c=>c.type==='DIALOGS_SEND_DRAFT').length") == 1
+        assert preview_ui.evaluate('sentTexts.length') == 0
+        assert preview_ui.evaluate('folderState().autoSend') is False
+        passed('test-origin draft and its saved or unsaved edits cannot become real replies after leaving test mode')
+
+        preview_race_ui = prepared_page()
+        preview_race_ui.locator('#dialogs-test-mode').check()
+        preview_race_ui.wait_for_function('folderState().test.enabled===true')
+        preview_race_ui.locator('#dialogs-test-next').click()
+        preview_race_ui.wait_for_function('folderState().test.phase==="ready"')
+        preview_race_ui.evaluate("deliverDraft('Preview only, never send.');deferDraftEditing=true")
+        preview_race_ui.locator('#dialogs-draft-text').fill('Still a preview only.')
+        preview_race_ui.locator('#dialogs-send-draft').click()
+        preview_race_ui.wait_for_function('typeof resolveDraftEditing==="function"')
+        preview_race_ui.evaluate("changeTest({enabled:false,phase:'off'})")
+        expect(preview_race_ui.locator('#dialogs-test-mode')).not_to_be_checked()
+        preview_race_ui.evaluate('resolveDraftEditing()')
+        expect(preview_race_ui.locator('#dialogs-feedback')).to_contain_text('Отправка отменена')
+        assert not preview_race_ui.evaluate("calls.some(c=>c.type==='DIALOGS_SEND_DRAFT')")
+        assert preview_race_ui.evaluate('sentTexts.length') == 0
+        expect(preview_race_ui.locator('#dialogs-draft-text')).to_have_value('Still a preview only.')
+        passed('test mode changed in another window cancels pending preview intent instead of falling through to real sending')
+
+        origin_session = preview_race_ui.evaluate("dialogState().conversations['alibaba:alpha'].draft.testSessionId")
+        assert origin_session
+        preview_race_ui.evaluate('changeDialog({draft:null})')
+        expect(preview_race_ui.locator('#dialogs-draft-text')).to_have_value('Still a preview only.')
+        expect(preview_race_ui.locator('#dialogs-send-draft')).to_be_disabled()
+        expect(preview_race_ui.locator('#dialogs-save-draft')).to_be_enabled()
+        preview_race_ui.locator('#dialogs-save-draft').click()
+        preview_race_ui.wait_for_function("dialogState().conversations['alibaba:alpha'].draft?.text==='Still a preview only.'")
+        assert preview_race_ui.evaluate("calls.filter(c=>c.type==='DIALOGS_SAVE_DRAFT').at(-1).draftTestSessionId") == origin_session
+        assert preview_race_ui.evaluate("dialogState().conversations['alibaba:alpha'].draft.testSessionId") == origin_session
+        expect(preview_race_ui.locator('#dialogs-send-draft')).to_be_disabled()
+        preview_race_ui.locator('#dialogs-send-draft').dispatch_event('click')
+        expect(preview_race_ui.locator('#dialogs-feedback')).to_contain_text('Удалите тестовый черновик')
+        assert not preview_race_ui.evaluate("calls.some(c=>c.type==='DIALOGS_SEND_DRAFT')")
+        assert preview_race_ui.evaluate('sentTexts.length') == 0
+        passed('retained local test edits preserve their origin when another window removes the stored draft and switches test mode off')
+
         mode_ui.set_viewport_size({'width':600,'height':850})
         assert mode_ui.evaluate('document.documentElement.scrollWidth <= window.innerWidth')
         if artifact_dir:
             mode_ui.screenshot(path=str(artifact_dir/'dialogs-mobile.png'),full_page=True)
         ui.evaluate('failGet=true;announceDialogs()')
         expect(ui.locator('#dialogs-feedback')).to_have_text('Временная ошибка чтения')
-        for page in [ui,send_ui,stale_ui,race_ui,mode_ui]:
+        for page in [ui,send_ui,stale_ui,race_ui,mode_ui,test_ui,preview_ui,preview_race_ui]:
             assert page.evaluate("permissionCalls.every(c=>c.permissions?.join(',')==='nativeMessaging'&&!c.origins)")
             assert page.evaluate("calls.every(c=>!['DIALOGS_PRODUCT_EXTRACT','DIALOGS_GENERATE_DRAFT','DIALOGS_EXPORT_PRODUCT_PROMPT','DIALOGS_EXPORT_DRAFT_PROMPT','DIALOGS_IMPORT_PRODUCT_RESULT'].includes(c.type))")
             assert page.evaluate("calls.every(c=>!/(FILL|CLICK)/.test(c.type))")

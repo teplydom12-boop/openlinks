@@ -16,6 +16,42 @@ test('durable reply receipts survive restart without exposing private text hashe
   assert.deepEqual(value.sendReceipts,[{key:'1688:shop',fingerprint:'current-message',status:'unknown',at:200}]);assert.equal(JSON.stringify(value).includes('PRIVATE'),false);assert.equal(JSON.stringify(value).includes(receipt.textHash),false);
   assert.equal(normalizeFolder({sendReceipts:Array.from({length:FOLDER_LIMITS.sendReceipts+1},()=>receipt)}).sendReceipts.length,FOLDER_LIMITS.sendReceipts);
 });
+test('test mode stays opt-in and never restores automatic sending or an interrupted editor operation',()=>{
+  const empty=normalizeFolder();assert.equal(empty.test.enabled,false);assert.equal(empty.test.phase,'off');
+  assert.equal(empty.test.sessionId,'');assert.equal(empty.test.cycleId,'');assert.deepEqual(empty.test.completed,[]);
+  const sessionId='2fb5a305-cdea-4364-93fb-86f5108664c2',cycleId=id;
+  const source={tabId:4,frameId:2,documentToken:'same-document',sourceUrl:'https://air.1688.com/chat',replyFingerprint:'incoming-1'};
+  const cleanupToken={operation:cycleId,platform:'1688',id:'shop',documentToken:source.documentToken,sourceUrl:source.sourceUrl,text:'A preview, never sent'};
+  const raw={enabled:true,auto:true,autoSend:true,test:{enabled:true,sessionId,cycleId,phase:'preparing',key:'1688:shop',text:cleanupToken.text,cleanupToken,source}};
+  const restarted=normalizeFolder(JSON.parse(JSON.stringify(raw)));
+  assert.equal(restarted.test.enabled,true);assert.equal(restarted.autoSend,false);assert.equal(restarted.test.phase,'blocked');
+  assert.equal(restarted.test.sessionId,sessionId);assert.equal(restarted.test.cycleId,cycleId);assert.equal(restarted.test.text,raw.test.text);
+  assert.deepEqual(restarted.test.cleanupToken,raw.test.cleanupToken);assert.deepEqual(restarted.test.source,raw.test.source);
+  const secondRestart=normalizeFolder(JSON.parse(JSON.stringify(restarted)));
+  assert.equal(secondRestart.test.phase,'blocked');assert.equal(secondRestart.autoSend,false);assert.deepEqual(secondRestart.test.cleanupToken,raw.test.cleanupToken);
+});
+test('completed test cycle survives restart and exposes review data without granting editor cleanup authority to the UI',()=>{
+  const context='d'.repeat(64),completed={key:'1688:shop',context,fingerprint:'incoming-1',at:120};
+  const raw={autoSend:true,test:{enabled:true,sessionId:id,cycleId:'2fb5a305-cdea-4364-93fb-86f5108664c2',phase:'completed',key:'1688:shop',text:'Please confirm the voltage.',at:110,detail:'Cycle complete without sending',completed:[completed],source:{tabId:4,documentToken:'PRIVATE-DOCUMENT'},cleanupToken:{operation:id,text:'PRIVATE-CLEANUP'},history:[{...completed,text:'PRIVATE-HISTORY'}]}};
+  const restored=normalizeFolder(JSON.parse(JSON.stringify(raw))),value=publicFolder(restored);
+  assert.equal(restored.test.phase,'completed');assert.equal(value.autoSend,false);assert.equal(value.test.text,raw.test.text);
+  assert.equal(value.test.sessionId,id);assert.equal(value.test.cycleId,raw.test.cycleId);assert.deepEqual(value.test.completed,[completed]);
+  assert.equal('source' in value.test,false);assert.equal('cleanupToken' in value.test,false);assert.equal('history' in value.test,false);
+  assert.doesNotMatch(JSON.stringify(value),/PRIVATE-(?:DOCUMENT|CLEANUP|HISTORY)/);
+  assert.deepEqual(restored.sendReceipts,[]);assert.deepEqual(restored.completed,[]);
+});
+test('test job completion and cancellation do not suppress real work or create send receipts',()=>{
+  for(const status of ['accepted','cancelled']) {
+    const state=normalizeFolder({test:{enabled:true,sessionId:id,cycleId:'2fb5a305-cdea-4364-93fb-86f5108664c2',phase:'generating'}});
+    const preview={...job(),testSessionId:id,testCycleId:state.test.cycleId};reserveFolderJob(state,preview);
+    finishFolderJob(state,preview,status,'Test only',200);
+    const restored=normalizeFolder(JSON.parse(JSON.stringify(state)));
+    assert.equal(restored.jobs[0].status,status);assert.equal(restored.jobs[0].testSessionId,id);assert.equal(restored.jobs[0].testCycleId,state.test.cycleId);
+    assert.deepEqual(restored.completed,[]);assert.deepEqual(restored.sendReceipts,[]);
+    finishFolderJob(restored,{...job(),signature:'b'.repeat(64)},'accepted','Real draft accepted',210);
+    assert.deepEqual(restored.completed,['b'.repeat(64)]);
+  }
+});
 test('native transport is permission gated, fixed-host, bounded and uses action envelope',async()=>{
   let calls=0,allowed=false,last;
   const api={permissions:{contains:async value=>{assert.deepEqual(value,{permissions:['nativeMessaging']});return allowed;}},runtime:{sendNativeMessage:async(host,message)=>{calls++;assert.equal(host,FOLDER_HOST);last=message;return {ok:true};}}};

@@ -404,7 +404,7 @@ function assertCurrentRequest(state,request) {
 export function acceptDraft(state,request,value,now=Date.now()) {
   const item=assertCurrentRequest(state,request),text=clean(value?.text,6000).trim();
   if(!text || typeof value?.text!=='string' || value.text.length>6000)throw new Error('Текст черновика должен содержать от 1 до 6000 символов');
-  item.draft={text,reason:clean(value.reason,1000),createdAt:time(now)??Date.now(),revision:item.revision,fingerprint:item.fingerprint,productFingerprint:request.productFingerprint,status:'draft'};
+  item.draft={text,reason:clean(value.reason,1000),createdAt:time(now)??Date.now(),revision:item.revision,fingerprint:item.fingerprint,productFingerprint:request.productFingerprint,status:'draft',testSessionId:typeof value.testSessionId==='string'?clean(value.testSessionId,200):''};
   addDialogEvent(state,'draft','Черновик подготовлен и сохранён. Сообщение не отправлено.',{key:item.key,platform:item.platform},now);
   return item.draft;
 }
@@ -451,7 +451,7 @@ export function normalizeDialogs(saved) {
     refreshContentStatus(item);item.revision=integer(source.revision)??0;item.fingerprint=fingerprint(item);item.unanswered=unanswered(item);
     const draft=object(source.draft);
     if(item.unanswered && readableContext(item) && state.product.approval && draft.productFingerprint===state.product.fingerprint && !item.paused && !item.takeover && draft.revision===item.revision && draft.fingerprint===item.fingerprint && typeof draft.text==='string' && draft.text.trim() && draft.text.length<=6000) {
-      item.draft={text:clean(draft.text,6000),reason:clean(draft.reason,1000),createdAt:time(draft.createdAt),revision:item.revision,fingerprint:item.fingerprint,productFingerprint:state.product.fingerprint,status:'draft'};
+      item.draft={text:clean(draft.text,6000),reason:clean(draft.reason,1000),createdAt:time(draft.createdAt),revision:item.revision,fingerprint:item.fingerprint,productFingerprint:state.product.fingerprint,status:'draft',testSessionId:clean(draft.testSessionId,200)};
     }
     state.conversations[item.key]=item;
   }

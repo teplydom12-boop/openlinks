@@ -7,7 +7,8 @@ ROOT = Path(__file__).resolve().parent.parent
 FIXTURE = (ROOT / 'tests/fixtures/dialogs-synthetic.html').read_text().replace('Untouched buyer draft', '')
 TRANSPORT = """
 window.testListeners=[];
-window.chrome={runtime:{id:'reply-test',onMessage:{addListener(fn){testListeners.push(fn)}},sendMessage:async()=>({ok:true})}};
+window.testSendAllowed=true;
+window.chrome={runtime:{id:'reply-test',onMessage:{addListener(fn){testListeners.push(fn)}},sendMessage:async message=>message.type==='OPENLINKS_TEST_SEND_GUARD'?{ok:true,canSend:testSendAllowed}:{ok:true}}};
 window.command=(type,extra={})=>new Promise(resolve=>{
   const message={type,profile:{},message:'We need 100 units.',jobId:'reply-operation',...extra};
   for(const listener of testListeners)listener(message,{id:'reply-test'},resolve);
@@ -42,6 +43,11 @@ with sync_playwright() as p:
         return page.evaluate("command('PREPARE',{dialogGuard:guard})")
     def send():
         return page.evaluate("command('SEND',{dialogGuard:guard,expectedUrl:location.href,attemptId:guard.operation})")
+    def preview():
+        page.evaluate("window.cleanupToken={operation:guard.operation,platform:guard.platform,id:guard.id,documentToken:guard.documentToken,sourceUrl:guard.sourceUrl,text:'We need 100 units.'}")
+        return page.evaluate("command('PREPARE',{dialogGuard:guard,dialogPreview:true})")
+    def clear_preview():
+        return page.evaluate("command('DIALOGS_CLEAR_PREVIEW',{token:cleanupToken})")
 
     load()
     assert page.evaluate('OpenLinksDialogsReader.guardReply(guard).ok')
@@ -148,6 +154,131 @@ with sync_playwright() as p:
     result=send()
     assert result['clicked'] and result['accepted'] and page.evaluate('syntheticClicks') == 1, result
     passed('1688 Space/Backspace activation preserves guarded editor ownership through sending')
+
+    for platform in ['alibaba','mic']:
+        load(platform)
+        result=preview();assert result['ok'] and result['preview'],result
+        assert page.locator('textarea').input_value()=='We need 100 units.'
+        assert send()['clicked'] is False
+        assert page.evaluate("command('SEND',{jobId:'different-operation',attemptId:'different-operation',expectedUrl:location.href})")['clicked'] is False
+        assert page.evaluate("command('PREPARE',{jobId:'different-operation'})")['ok'] is False
+        assert page.evaluate('syntheticClicks')==0
+        assert clear_preview()['cleared']
+        assert page.locator('textarea').input_value()==''
+        assert clear_preview()['cleared']
+        assert send()['clicked'] is False
+    passed('test previews fill real synthetic composers, permanently forbid SEND and clean only owned text on both platforms')
+
+    load();assert preview()['ok']
+    page.evaluate("document.querySelector('[data-message-history]').insertAdjacentHTML('beforeend','<div class=message-item data-direction=inbound data-message-id=new><span data-message-text>New supplier reply</span></div>')")
+    assert clear_preview()['cleared'] and page.locator('textarea').input_value()==''
+    assert page.evaluate('syntheticClicks')==0
+    passed('new inbound history does not prevent safe cleanup of the same owned preview')
+
+    for change in ['different text','same text restored','space']:
+        load();assert preview()['ok']
+        page.locator('textarea').fill('My manual draft' if change!='space' else 'We need 100 units. ')
+        if change=='same text restored':page.locator('textarea').fill('We need 100 units.')
+        expected=page.locator('textarea').input_value()
+        assert clear_preview()['cleared'] is False
+        assert page.locator('textarea').input_value()==expected
+        assert page.evaluate('syntheticClicks')==0
+        page.locator('textarea').fill('')
+        assert clear_preview()['cleared']
+    passed('manual edits, even restored text, are never erased; manually emptying the field allows recovery')
+
+    for change in ['recipient','document','editor','attachment']:
+        load();assert preview()['ok']
+        if change=='recipient':page.evaluate("document.querySelector('[data-chat-root]').dataset.threadId='another-supplier'")
+        elif change=='document':page.evaluate("cleanupToken.documentToken='old-document'")
+        elif change=='editor':page.evaluate("const old=document.querySelector('textarea'),replacement=old.cloneNode(true);replacement.value=old.value;old.replaceWith(replacement)")
+        else:page.evaluate("document.querySelector('[data-chat-root]').insertAdjacentHTML('beforeend','<div class=attachment-preview>Manual file</div>')")
+        assert clear_preview()['cleared'] is False,change
+        assert page.locator('textarea').input_value()=='We need 100 units.'
+    passed('changed recipient, document, composer or added attachment blocks preview cleanup')
+
+    load();assert preview()['ok']
+    page.evaluate('window.testListeners=[];window.__openlinksInstalled=false')
+    page.add_script_tag(path=str(ROOT/'extension/content.js'))
+    assert clear_preview()['cleared'] is False
+    assert page.locator('textarea').input_value()=='We need 100 units.'
+    page.locator('textarea').fill('')
+    assert clear_preview()['cleared']
+    passed('lost content-script ownership cannot erase text; manual empty-field recovery remains available')
+
+    for platform in ['alibaba','mic','1688']:
+        load(platform)
+        old_guard=page.evaluate('guard')
+        load(platform)
+        page.evaluate('(old)=>window.cleanupToken={...old,text:"We need 100 units."}',old_guard)
+        assert page.evaluate('guard.documentToken!==cleanupToken.documentToken')
+        assert clear_preview()['cleared'] is False
+        page.evaluate("()=>{window.recoveryEvents=[];for(const type of ['input','change','focus','keydown','click'])document.addEventListener(type,()=>recoveryEvents.push(type),true);window.beforeFocus=document.activeElement}")
+        result=page.evaluate("command('DIALOGS_CHECK_PREVIEW_EMPTY',{guard})")
+        assert result['empty'],result
+        assert page.evaluate('document.activeElement===beforeFocus && recoveryEvents.length===0 && syntheticClicks===0')
+        assert page.evaluate("command('DIALOGS_CHECK_PREVIEW_EMPTY',{guard:cleanupToken})")['empty'] is False
+        assert page.evaluate("command('DIALOGS_CHECK_PREVIEW_EMPTY',{guard:{...guard,id:'different-recipient'}})")['empty'] is False
+    passed('reloaded empty composers recover only through a fresh exact-recipient guard without focus, keys, input or clicks')
+
+    for platform in ['alibaba','mic','1688']:
+        for draft in ['My restored manual draft','We need 100 units.','   ']:
+            load(platform)
+            page.evaluate("value=>{const editor=document.querySelector('textarea,pre.edit');if('value' in editor)editor.value=value;else editor.textContent=value}",draft)
+            assert page.evaluate("command('DIALOGS_CHECK_PREVIEW_EMPTY',{guard})")['empty'] is False
+            assert page.evaluate("()=>{const editor=document.querySelector('textarea,pre.edit');return 'value' in editor?editor.value:editor.textContent}")==draft
+            assert page.evaluate('syntheticClicks')==0
+    passed('read-only recovery preserves every nonempty restored draft, including exact preview text and whitespace')
+
+    for attachment in ['file','preview','media']:
+        load('1688' if attachment=='media' else 'alibaba')
+        if attachment=='file':
+            page.evaluate("document.querySelector('[data-chat-root]').insertAdjacentHTML('beforeend','<input type=file hidden id=recovery-file>')")
+            page.locator('#recovery-file').set_input_files({'name':'manual.txt','mimeType':'text/plain','buffer':b'Manual attachment'})
+        elif attachment=='preview':
+            page.evaluate("document.querySelector('[data-chat-root]').insertAdjacentHTML('beforeend','<div class=attachment-preview>Manual file</div>')")
+        else:
+            page.evaluate("document.querySelector('pre.edit').innerHTML='<img data-attachment src=data:,>'")
+        assert page.evaluate("command('DIALOGS_CHECK_PREVIEW_EMPTY',{guard})")['empty'] is False
+        assert page.evaluate('syntheticClicks')==0
+    passed('empty text cannot conceal queued files, visible uploads or rich-editor attachments during recovery')
+
+    load();page.evaluate("document.querySelector('#send').disabled=true")
+    result=preview();assert result['ok'] is False
+    assert page.locator('textarea').input_value()=='We need 100 units.'
+    assert clear_preview()['cleared']
+    passed('a preview that filled text but failed Send readiness still retains safe cleanup ownership')
+
+    load();assert prepare()['ok'];page.evaluate('testSendAllowed=false')
+    assert send()['clicked'] is False and page.evaluate('syntheticClicks')==0
+    load();assert prepare()['ok'];page.evaluate("()=>{chrome.runtime.sendMessage=async()=>{throw Error('worker unavailable')}}")
+    assert send()['clicked'] is False and page.evaluate('syntheticClicks')==0
+    passed('global test mode and unavailable mode guard fail closed for legacy and guarded SEND')
+
+    load();assert prepare()['ok']
+    page.evaluate("()=>{chrome.runtime.sendMessage=()=>new Promise(resolve=>window.releaseGuard=resolve);window.pendingSend=command('SEND',{dialogGuard:guard,expectedUrl:location.href,attemptId:guard.operation})}")
+    page.wait_for_function('typeof releaseGuard==="function"')
+    page.evaluate("document.querySelector('[data-message-text]').textContent='History changed while guard awaited';releaseGuard({ok:true,canSend:true})")
+    assert page.evaluate('pendingSend')['clicked'] is False and page.evaluate('syntheticClicks')==0
+    passed('final recipient/history checks run after the asynchronous global test guard')
+
+    load('1688')
+    page.evaluate("()=>{window.testClock=Date.now();Date.now=()=>testClock;window.enterEvents=0;document.addEventListener('keydown',event=>{if(event.key==='Enter')enterEvents++},true)}")
+    assert page.evaluate("command('CHAT_READY')")['waiting'];page.evaluate('testClock+=6000')
+    assert preview()['needsNativeInput']
+    for stage in ['locate','focus']:
+        assert page.evaluate("stage=>command('NATIVE_INPUT',{dialogGuard:guard,dialogPreview:true,expectedUrl:location.href,token:'native-preview',stage})",stage)['ok']
+    page.keyboard.press('Space')
+    assert page.evaluate("command('NATIVE_INPUT',{dialogGuard:guard,dialogPreview:true,expectedUrl:location.href,token:'native-preview',stage:'space'})")['ok']
+    page.keyboard.press('Backspace')
+    for stage in ['done','release']:
+        assert page.evaluate("stage=>command('NATIVE_INPUT',{dialogGuard:guard,dialogPreview:true,expectedUrl:location.href,token:'native-preview',stage})",stage)['ok']
+    assert preview()['ok']
+    assert send()['clicked'] is False
+    assert clear_preview()['cleared']
+    assert page.locator('pre.edit').inner_text()==''
+    assert page.evaluate('syntheticClicks')==0 and page.evaluate('enterEvents')==0
+    passed('1688 preview permits only Space/Backspace activation, never sends and safely clears owned rich-editor text')
 
     assert not errors, errors
     browser.close()

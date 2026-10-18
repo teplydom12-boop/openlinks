@@ -69,6 +69,28 @@ test('stable polls are idempotent and preserve the generated draft',()=>{
   assert.equal(next.changed,false);assert.equal(next.addedMessages,0);assert.equal(state.conversations[key].revision,revision);
   assert.deepEqual(state.conversations[key].draft,draft);assert.equal(state.events.length,count);assert.equal(state.conversations[key].lastObservedAt,12);
 });
+test('test-origin drafts retain their origin through storage and reviewed edits without inventing outgoing history',()=>{
+  const state=initialDialogs(),sessionId='e237362b-0f41-4d51-a301-d1b2cc4e7e01';observe(state,[msg('1','Please specify your voltage.')],{},10);
+  const history=structuredClone(state.conversations[key].messages);
+  acceptDraft(state,draftRequest(state,key),{text:'We need 220 V.',testSessionId:sessionId},11);
+  let restored=normalizeDialogs(JSON.parse(JSON.stringify(state)));
+  assert.equal(restored.conversations[key].draft.testSessionId,sessionId);assert.equal(restored.conversations[key].draft.text,'We need 220 V.');
+  assert.equal(restored.conversations[key].unanswered,true);assert.deepEqual(restored.conversations[key].messages,history);
+  acceptDraft(restored,draftRequest(restored,key),{text:'We need 220 V and 50 Hz.',testSessionId:restored.conversations[key].draft.testSessionId},12);
+  restored=normalizeDialogs(JSON.parse(JSON.stringify(restored)));
+  assert.equal(restored.conversations[key].draft.testSessionId,sessionId);assert.equal(restored.conversations[key].draft.text,'We need 220 V and 50 Hz.');
+  assert.deepEqual(restored.conversations[key].messages,history);assert.equal(restored.conversations[key].unanswered,true);
+  observe(restored,[msg('1','Please specify your voltage.'),msg('2','Which quantity?')],{},13);
+  assert.equal(restored.conversations[key].draft,null);
+});
+test('ordinary drafts remain ordinary and do not inherit a discarded test session',()=>{
+  const state=initialDialogs();observe(state,[msg('1')]);
+  acceptDraft(state,draftRequest(state,key),{text:'Test draft',testSessionId:'e237362b-0f41-4d51-a301-d1b2cc4e7e01'});
+  state.conversations[key].draft=null;
+  acceptDraft(state,draftRequest(state,key),{text:'A fresh real draft'});
+  const restored=normalizeDialogs(JSON.parse(JSON.stringify(state)));
+  assert.equal(restored.conversations[key].draft.testSessionId,'');assert.equal(restored.conversations[key].draft.text,'A fresh real draft');
+});
 test('new inbound, changed text, outgoing, and control changes invalidate drafts in flight',()=>{
   for(const change of [s=>observe(s,[msg('1'),msg('2')]),s=>observe(s,[msg('1','Edited text')]),s=>observe(s,[msg('1'),msg('2','Buyer','outbound')]),s=>setConversationControl(s,key,{takeover:true}),s=>setConversationControl(s,key,{paused:true})]){
     const state=initialDialogs();observe(state,[msg('1')]);const request=draftRequest(state,key);acceptDraft(state,request,{text:'Draft'});change(state);

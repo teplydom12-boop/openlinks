@@ -184,7 +184,7 @@ try:
           let listener;
           window.lessonMessages=[];
           window.adapterMessages=[];
-          window.chrome={runtime:{id:'adapter-test',onMessage:{addListener(fn){listener=fn}},sendMessage:async message=>{adapterMessages.push(message);if(message.type==='LEARN_PICK')lessonMessages.push(message);return {ok:true};}}};
+          window.chrome={runtime:{id:'adapter-test',onMessage:{addListener(fn){listener=fn}},sendMessage:async message=>{adapterMessages.push(message);if(message.type==='OPENLINKS_TEST_SEND_GUARD')return {ok:true,canSend:true};if(message.type==='LEARN_PICK')lessonMessages.push(message);return {ok:true};}}};
           window.adapter=(type,extra={})=>new Promise(resolve=>listener({type,jobId:'test-job',profile:{},message:'Hello, WeChat: demo',...extra},{id:'adapter-test'},resolve));
         """
         supplier.add_init_script(adapter_transport)

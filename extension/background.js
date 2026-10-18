@@ -22,11 +22,27 @@ const exclusive = task => {
 };
 async function load() { return migrateState((await chrome.storage.local.get(KEY))[KEY]); }
 async function save(state) { await chrome.storage.local.set({[KEY]:state}); }
+const TEST_MODE_MESSAGE='Включён тестовый режим диалогов. Настоящая отправка и основная очередь приостановлены.';
+async function dialogTestEnabled() {
+  return (await chrome.storage.local.get('openlinksClaudeFolder')).openlinksClaudeFolder?.test?.enabled===true;
+}
+async function pauseForDialogTest(state) {
+  const job=state.queue.find(item=>item.id===state.activeId);
+  const changed=state.running || state.waiting || state.learning || job?.approved;
+  await stopLearning(state,job);
+  state.running=false;state.waiting=null;
+  if(job)job.approved=false;
+  if(changed){event(state,'test_mode_pause',job,TEST_MODE_MESSAGE,'decision');await save(state);}
+}
+export function pauseOutreachForTest() {
+  return exclusive(async()=>{await pauseForDialogTest(await load());return {ok:true};});
+}
 // Both outreach and dialogue replies reserve the same rolling quota inside
 // the outreach serializer. A replayed reservation never authorizes another click.
 export function reserveDialogSendQuota({platform,jobId,attemptId}={}) {
   return exclusive(async()=>{
     if(!Object.hasOwn(PLATFORMS,platform) || !/^[a-f0-9-]{36}$/i.test(jobId || '') || !/^[a-f0-9-]{36}$/i.test(attemptId || ''))throw new Error('Некорректная попытка ответа поставщику.');
+    if(await dialogTestEnabled())return {ok:false,reason:TEST_MODE_MESSAGE};
     const state=await load(),at=Date.now();
     if(state.slots.some(slot=>slot.dialogAttemptId===attemptId))return {ok:false,unknown:true,reason:'Попытка уже зарегистрирована. Повторное нажатие запрещено.'};
     const allowed=eligibility(state,platform,'send',at);
@@ -76,7 +92,13 @@ async function call(job, frameId, type, extra = {}) {
   // Observation, stopping an existing opener, and releasing an input marker are
   // safe on a reserved inbox. All queue commands that change it are blocked.
   if(!['PROBE','CHAT_READY','STOP_OPEN_CHAT','PICK_STOP','CAN_CLOSE'].includes(type) &&
-    !(type==='NATIVE_INPUT' && extra.stage==='release'))await assertOutreachTab(job.tabId);
+    !(type==='NATIVE_INPUT' && extra.stage==='release')) {
+    if(await dialogTestEnabled()) {
+      if(type==='SEND')return {clicked:false,reason:TEST_MODE_MESSAGE};
+      throw new Error(TEST_MODE_MESSAGE);
+    }
+    await assertOutreachTab(job.tabId);
+  }
   return chrome.tabs.sendMessage(job.tabId, {
     type, jobId:job.id, message:job.message, profile:job.profile, ...extra,
   }, {frameId});
@@ -360,6 +382,7 @@ async function performSend(state, job) {
     await save(state); return;
   }
   // Persist BEFORE the side effect. Never retry a send after a disconnect/restart.
+  if(await dialogTestEnabled()){await pauseForDialogTest(state);return;}
   job.status = 'sending';
   job.attemptId = crypto.randomUUID();
   job.sendAt = Date.now();
@@ -384,6 +407,7 @@ async function performSend(state, job) {
 }
 async function tick() {
   const state = await load();
+  if(await dialogTestEnabled()){await pauseForDialogTest(state);return;}
   let job = state.queue.find(j => j.id === state.activeId);
   if(supplierChat.supports(job?.platform) && watchingSupplierChat(state,job)) {
     const results=await probe(job).catch(()=>[]);
@@ -667,6 +691,7 @@ async function dispatch(message, sender) {
     return {ok:true};
   }
   if (!sender.url?.startsWith(chrome.runtime.getURL(''))) throw new Error('Команда доступна только из окна расширения');
+  if(['START','APPROVE','RECHECK','RETRY_SEND','TEACH'].includes(message.type) && await dialogTestEnabled())throw new Error(TEST_MODE_MESSAGE);
   const state = await load();
   const job = state.queue.find(j => j.id === state.activeId);
   switch (message.type) {
@@ -783,6 +808,15 @@ async function dispatch(message, sender) {
   }
 }
 chrome.runtime.onMessage.addListener((message,sender,respond) => {
+  if(message?.type==='OPENLINKS_TEST_SEND_GUARD') {
+    // Content scripts cannot read TRUSTED_CONTEXTS storage. Answer outside the
+    // outreach serializer: that queue may be awaiting this very content SEND.
+    let valid=false;
+    try {valid=sender.id===chrome.runtime.id && Number.isInteger(sender.tab?.id) && !!classify(sender.url).platform;}catch{}
+    if(!valid){respond({ok:false,canSend:false});return;}
+    dialogTestEnabled().then(enabled=>respond({ok:true,canSend:!enabled}),()=>respond({ok:false,canSend:false}));
+    return true;
+  }
   if(typeof message?.type==='string' && message.type.startsWith('DIALOGS_'))return;
   exclusive(()=>dispatch(message,sender)).then(respond,error=>respond({ok:false,error:error.message}));
   return true;
@@ -948,4 +982,4 @@ chrome.action.onClicked.addListener(async()=>{
   if(tabs[0]) { await chrome.tabs.update(tabs[0].id,{active:true}); await chrome.windows.update(tabs[0].windowId,{focused:true}); }
   else await chrome.windows.create({url,type:'popup',width:1240,height:900});
 });
-installDialogMonitor(chrome,{reserveDialogSendQuota});
+installDialogMonitor(chrome,{reserveDialogSendQuota,pauseOutreachForTest});

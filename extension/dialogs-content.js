@@ -432,6 +432,15 @@
     if((row.historyOrderReliable??row.orderReliable)!==true || (row.historyTailKnown??row.tailKnown)!==true || row.messages.some(message=>message.direction==='unknown') || row.messages.filter(message=>message.direction!=='system').at(-1)?.direction!=='inbound')return invalid('Последнее входящее сообщение и порядок истории не подтверждены.');
     return {ok:true,busy:current.busy};
   }
+  function guardPreviewCleanup(expected) {
+    const invalid=reason=>({ok:false,reason});
+    if(!expected||expected.documentToken!==DOCUMENT_TOKEN||expected.platform!==platform()||expected.sourceUrl!==location.href||typeof expected.id!=='string')return invalid('Документ тестового черновика изменился.');
+    const current=snapshot(),active=current.conversations.filter(row=>row.active);
+    // Cleanup does not send or answer the new message. A new inbound or changed
+    // history must not strand our own unchanged preview in the same composer.
+    if(current.status!=='ready'||active.length!==1||active[0].id!==expected.id||active[0].identityReliable!==true)return invalid('Получатель тестового черновика изменился или не подтверждён.');
+    return {ok:true};
+  }
   function openConversation(request) {
     if(request?.documentToken!==DOCUMENT_TOKEN||typeof request.selectionToken!=='string'||typeof request.conversationId!=='string')return {ok:false,detail:'Документ или разрешение выбора устарели.'};
     const current=snapshot();
@@ -464,7 +473,7 @@
     return {ok:true,revealedId:request.conversationId};
   }
   for(const type of ['keydown','pointerdown','input','wheel','touchstart'])document.addEventListener(type,event=>{if(event.isTrusted){lastTrustedInput=Date.now();pendingReveal=null;}},{capture:true,passive:true});
-  globalThis.OpenLinksDialogsReader=Object.freeze({snapshot,openConversation,revealLatest,applyModelEvidence,guardReply});
+  globalThis.OpenLinksDialogsReader=Object.freeze({snapshot,openConversation,revealLatest,applyModelEvidence,guardReply,guardPreviewCleanup});
   globalThis.chrome?.runtime?.onMessage?.addListener((message,sender,respond)=>{
     if(!['DIALOGS_SNAPSHOT','DIALOGS_OPEN_CONVERSATION','DIALOGS_REVEAL_LATEST','DIALOGS_APPLY_MODEL_EVIDENCE'].includes(message?.type))return;
     if(sender?.id!==chrome.runtime.id){respond({status:'error',detail:'Источник запроса не подтверждён.'});return;}

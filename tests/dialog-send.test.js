@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import {sendDialogReply} from '../extension/dialog-send.js';
+import {sendDialogReply,clearDialogTestDraft,recoverDialogTestDraftEmpty} from '../extension/dialog-send.js';
 import {initialDialogs,saveProduct,approveProduct,productFingerprint,mergeDialogSnapshot,bindDialogTab,conversationKey,draftRequest} from '../extension/lib/dialogs.js';
 import {withTabOwnership} from '../extension/lib/tab-ownership.js';
 
@@ -83,4 +83,126 @@ test('quota callback can acquire the same tab without inverting the outreach loc
   const h=harness();let quotaInsideTab=false;
   const result=await h.send({reserve:value=>withTabOwnership(4,async()=>{quotaInsideTab=true;assert.deepEqual(h.calls,[]);return h.options.reserve(value);})});
   assert.equal(result.status,'attempted');assert.equal(quotaInsideTab,true);
+});
+
+test('dry-run persists its cleanup token before filling and never reserves quota or sends',async()=>{
+  for(const platform of ['alibaba','mic','1688']) {
+    const h=harness(platform),base=h.action,saved=[];
+    h.action=async message=>({...await base(message),...(message.type==='PREPARE'?{preview:true}:{})});
+    const result=await h.send({dryRun:true,previewOperation:'test-cycle-1',reserve:async()=>assert.fail('dry run used quota'),reservePreview:async value=>{saved.push(value);h.events.push('PERSIST_PREVIEW');return {ok:true};}});
+    assert.equal(result.status,'previewed',platform);assert.equal(result.clicked,false);assert.equal(result.reserved,false);
+    assert.equal(h.events[0],'PERSIST_PREVIEW');assert.equal(saved.length,1);assert.deepEqual(result.cleanupToken,saved[0].cleanupToken);
+    assert.equal(result.cleanupToken.operation,'test-cycle-1');assert.equal(result.cleanupToken.text,h.options.text);
+    assert.ok(h.calls.filter(call=>call.type!=='DIALOGS_SNAPSHOT').every(call=>call.dialogPreview===true));
+    assert.ok(!h.calls.some(call=>call.type==='SEND'));assert.equal(h.reservations.length,0);
+  }
+});
+test('dry-run without durable preview intent, or failed persistence, never touches the editor',async()=>{
+  for(const extra of [{},{reservePreview:async()=>({ok:false})},{reservePreview:async()=>{throw Error('disk failed');}}]) {
+    const h=harness(),result=await h.send({dryRun:true,previewOperation:'test-cycle',...extra});assert.equal(result.status,'blocked');assert.deepEqual(h.calls,[]);assert.deepEqual(h.reservations,[]);
+  }
+});
+test('dry-run retains cleanup evidence after failed preparation or a new inbound message',async()=>{
+  for(const failure of ['disabled-send','changed-history','transport']) {
+    const h=harness(),base=h.action;let stored;
+    h.action=async message=>{
+      if(message.type==='PREPARE') {
+        if(failure==='transport')throw Error('lost preparation acknowledgement');
+        if(failure==='disabled-send')return {ok:false,preview:true,reason:'Кнопка недоступна'};
+        h.snapshot.conversations[0].replyFingerprint='new-inbound';return {ok:true,preview:true,pageUrl:h.source.sourceUrl};
+      }
+      return base(message);
+    };
+    const result=await h.send({dryRun:true,previewOperation:'test-cycle',reservePreview:async value=>{stored=value.cleanupToken;return {ok:true};}});
+    assert.equal(result.status,'blocked');assert.deepEqual(result.cleanupToken,stored);assert.equal(result.clicked,false);assert.ok(!h.calls.some(call=>call.type==='SEND'));assert.deepEqual(h.reservations,[]);
+  }
+});
+test('1688 dry-run keeps native activation guarded but never falls through to SEND',async()=>{
+  const h=harness('1688'),base=h.action;let preparations=0;
+  h.action=message=>message.type==='PREPARE'?++preparations===1?{ok:false,preview:true,needsNativeInput:true,pageUrl:h.source.sourceUrl}:{ok:true,preview:true,pageUrl:h.source.sourceUrl}:base(message);
+  const result=await h.send({dryRun:true,previewOperation:'test-1688',reservePreview:async()=>({ok:true}),activate:async(job,call)=>{for(const stage of ['locate','focus','space','done','release'])await call(job,job.frameId,'NATIVE_INPUT',{stage});}});
+  assert.equal(result.status,'previewed');assert.equal(h.calls.filter(call=>call.type==='NATIVE_INPUT').length,5);assert.ok(h.calls.filter(call=>call.type==='NATIVE_INPUT').every(call=>call.dialogPreview===true&&call.dialogGuard.operation==='test-1688'));assert.ok(!h.calls.some(call=>call.type==='SEND'));
+});
+test('dry-run stop while intent is persisted prevents preparation',async()=>{
+  const h=harness();let continued=true;
+  const result=await h.send({dryRun:true,previewOperation:'test-cycle',shouldContinue:()=>continued,reservePreview:async()=>{continued=false;return {ok:true};}});
+  assert.equal(result.status,'blocked');assert.ok(result.cleanupToken);assert.deepEqual(h.calls,[]);assert.deepEqual(h.reservations,[]);
+});
+function cleanupFixture() {
+  const h=harness(),token={operation:'test-cycle',platform:'alibaba',id:h.snapshot.conversations[0].id,documentToken:h.source.documentToken,sourceUrl:h.source.sourceUrl,text:h.options.text};
+  return {h,token,clear:extra=>clearDialogTestDraft({api:h.api,source:h.source,token,...extra})};
+}
+test('cleanup sends only its owned-token command and does not require unchanged history',async()=>{
+  const {h,token,clear}=cleanupFixture();h.snapshot.conversations[0].replyFingerprint='new-history';h.action=async message=>{assert.equal(message.type,'DIALOGS_CLEAR_PREVIEW');assert.deepEqual(message.token,token);return {cleared:true};};
+  assert.equal((await clear()).status,'cleared');assert.equal(h.calls.length,1);assert.deepEqual(h.reservations,[]);
+});
+test('cleanup refuses invalid document/source/cancellation and preserves uncertain outcomes',async()=>{
+  for(const extra of [{shouldContinue:()=>false},{token:{...cleanupFixture().token,documentToken:'changed'}},{token:{...cleanupFixture().token,sourceUrl:'https://evil.test/'}}]) {
+    const {h,clear}=cleanupFixture();assert.equal((await clear(extra)).status,'blocked');assert.deepEqual(h.calls,[]);
+  }
+  for(const response of ['edited','lost','malformed']) {
+    const {h,clear}=cleanupFixture();h.action=async()=>{if(response==='lost')throw Error('lost');return response==='edited'?{cleared:false,reason:'Изменён вручную'}:{};};
+    assert.equal((await clear()).status,response==='edited'?'blocked':'unknown');assert.deepEqual(h.calls.map(call=>call.type),['DIALOGS_CLEAR_PREVIEW','DIALOGS_SNAPSHOT']);
+  }
+});
+test('cleanup recovers a reloaded same-recipient document by proving it empty without deleting',async()=>{
+  for(const original of ['stale-document','lost-response']) {
+    const {h,clear}=cleanupFixture();h.snapshot.documentToken='new-document';
+    const base=h.action;
+    h.action=async message=>{
+      if(message.type==='DIALOGS_CLEAR_PREVIEW'){if(original==='lost-response')throw Error('lost');return {cleared:false,reason:'Документ изменился'};}
+      if(message.type==='DIALOGS_CHECK_PREVIEW_EMPTY'){assert.deepEqual(message.guard,{platform:'alibaba',id:h.snapshot.conversations[0].id,sourceUrl:h.source.sourceUrl,documentToken:'new-document'});return {empty:true};}
+      return base(message);
+    };
+    const result=await clear();assert.equal(result.status,'cleared');assert.equal(result.recovered,true);
+    assert.deepEqual(h.calls.map(call=>call.type),['DIALOGS_CLEAR_PREVIEW','DIALOGS_SNAPSHOT','DIALOGS_CHECK_PREVIEW_EMPTY']);assert.deepEqual(h.reservations,[]);
+  }
+});
+test('empty recovery never grants deletion authority for nonempty or changed documents',async()=>{
+  for(const reason of ['Ручной текст','Вложение','Получатель изменился','Документ изменился']) {
+    const {h,clear}=cleanupFixture(),base=h.action;h.snapshot.documentToken='new-document';
+    h.action=message=>message.type==='DIALOGS_CLEAR_PREVIEW'?{cleared:false}:message.type==='DIALOGS_CHECK_PREVIEW_EMPTY'?{empty:false,reason}:base(message);
+    const result=await clear();assert.equal(result.status,'blocked');assert.equal(result.cleared,false);assert.equal(result.reason,reason);
+    assert.equal(h.calls.filter(call=>call.type==='DIALOGS_CLEAR_PREVIEW').length,1);assert.ok(!h.calls.some(call=>['PREPARE','SEND'].includes(call.type)));
+  }
+});
+test('empty recovery requires one reliable active recipient on the exact original URL and platform',async()=>{
+  const changes=[snapshot=>snapshot.platform='mic',snapshot=>snapshot.url+='?different-account',snapshot=>snapshot.documentToken='',snapshot=>snapshot.status='unsupported',snapshot=>snapshot.conversations[0].id='another-supplier',snapshot=>snapshot.conversations[0].identityReliable=false,snapshot=>snapshot.conversations.push({...snapshot.conversations[0]}),snapshot=>snapshot.conversations=[]];
+  for(const change of changes) {
+    const {h,token}=cleanupFixture();change(h.snapshot);
+    const result=await recoverDialogTestDraftEmpty({api:h.api,source:h.source,token});
+    assert.equal(result.status,'blocked');assert.deepEqual(h.calls.map(call=>call.type),['DIALOGS_SNAPSHOT']);
+  }
+});
+test('read-only recovery supports a rebound tab and frame without ever issuing cleanup',async()=>{
+  const {h,token}=cleanupFixture(),calls=[];
+  h.snapshot.documentToken='new-document';
+  const api={tabs:{get:async tabId=>{assert.equal(tabId,40);return {id:40,url:h.source.sourceUrl,status:'complete'};},sendMessage:async(tabId,message,{frameId})=>{assert.equal(tabId,40);assert.equal(frameId,20);calls.push(message.type);if(message.type==='DIALOGS_SNAPSHOT')return h.snapshot;assert.equal(message.type,'DIALOGS_CHECK_PREVIEW_EMPTY');return {empty:true};}}};
+  const result=await recoverDialogTestDraftEmpty({api,source:{...h.source,tabId:40,frameId:20,documentToken:'new-document'},token});
+  assert.equal(result.status,'cleared');assert.equal(result.recovered,true);assert.deepEqual(calls,['DIALOGS_SNAPSHOT','DIALOGS_CHECK_PREVIEW_EMPTY']);
+});
+test('read-only recovery observes cancellation after a snapshot and after the final check',async()=>{
+  for(const stopAt of ['DIALOGS_SNAPSHOT','DIALOGS_CHECK_PREVIEW_EMPTY']) {
+    const {h,token}=cleanupFixture(),base=h.action;let continued=true;
+    h.action=message=>{if(message.type===stopAt)continued=false;return message.type==='DIALOGS_CHECK_PREVIEW_EMPTY'?{empty:true}:base(message);};
+    const result=await recoverDialogTestDraftEmpty({api:h.api,source:h.source,token,shouldContinue:()=>continued});
+    assert.equal(result.status,'blocked');assert.equal(result.cleared,false);assert.deepEqual(h.calls.map(call=>call.type),stopAt==='DIALOGS_SNAPSHOT'?['DIALOGS_SNAPSHOT']:['DIALOGS_SNAPSHOT','DIALOGS_CHECK_PREVIEW_EMPTY']);
+  }
+});
+test('closed-tab recovery requires a successful full query proving the original tab absent',async()=>{
+  const outcomes=[{tabs:[],cleared:true},{tabs:[{id:8}],cleared:true},{tabs:[{id:4}],cleared:false},{tabs:[{}],cleared:false},{tabs:null,cleared:false},{error:true,cleared:false}];
+  for(const outcome of outcomes) {
+    const {h,clear}=cleanupFixture();let queries=0;
+    h.api.tabs.get=async()=>{throw Error('tab unavailable');};
+    h.api.tabs.query=async query=>{queries++;assert.deepEqual(query,{});if(outcome.error)throw Error('worker unavailable');return outcome.tabs;};
+    const result=await clear();assert.equal(result.cleared,outcome.cleared);assert.equal(queries,1);assert.deepEqual(h.calls,[]);
+    if(outcome.cleared){assert.equal(result.closed,true);assert.equal(result.recovered,true);}else assert.equal(result.status,'unknown');
+  }
+});
+test('closed-tab recovery does not accept closure after cancellation or from a rebound read-only source',async()=>{
+  const {h,token,clear}=cleanupFixture();let continued=true;
+  h.api.tabs.get=async()=>{throw Error('tab unavailable');};h.api.tabs.query=async()=>{continued=false;return [];};
+  assert.equal((await clear({shouldContinue:()=>continued})).status,'blocked');
+  h.api.tabs.query=async()=>{throw Error('must not query closure for a rebound source');};
+  assert.equal((await recoverDialogTestDraftEmpty({api:h.api,source:{...h.source,tabId:40},token})).status,'unknown');assert.deepEqual(h.calls,[]);
 });

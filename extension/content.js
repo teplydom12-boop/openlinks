@@ -17,6 +17,7 @@
   const supplierChat=globalThis.OpenLinksSupplierChat?.create(site,{all,visible,isInquiry,labels,selectorFor,obstacle,profileFor:effectiveProfile});
   const sentOps = new Set();
   const preparedEditors = new WeakMap();
+  const previewOperations=new Map(),previewEditors=new WeakMap();
   let nativeInput=null, pendingClose=null, chatReadiness=null;
   let picker=null;
   let challenge=null;
@@ -147,6 +148,57 @@
   function textOf(node) { return draftText('value' in node ? node.value : node.innerText); }
   function exactReplyText(value) {const text=String(value ?? '').replace(/\r\n/g,'\n');return site==='1688'?editorSpaces(text):text;}
   function exactEditorText(node) {return exactReplyText('value' in node?node.value:node.innerText);}
+  document.addEventListener('input',event=>{
+    if(!event.isTrusted)return;
+    const editor=event.target?.closest?.(EDITORS),preview=editor&&previewEditors.get(editor);
+    if(preview&&!preview.cleared&&!preview.cleaning&&nativeInput?.editor!==editor)preview.manualChanged=true;
+  },true);
+  function previewMatches(preview,token) {
+    return preview&&['operation','platform','id','documentToken','sourceUrl','text'].every(key=>preview.token[key]===token[key]);
+  }
+  function previewCleanupEditor(token) {
+    const identity=globalThis.OpenLinksDialogsReader?.guardPreviewCleanup(token);
+    if(!identity?.ok)return {reason:identity?.reason||'Не подтверждён получатель тестового черновика.'};
+    const found=inspect({});
+    if(found.kind!=='chat')return {reason:'Редактор тестового черновика не подтверждён.'};
+    let composer=found.editor.parentElement;while(composer&&!composer.contains(found.send))composer=composer.parentElement;
+    if(!composer||[...composer.querySelectorAll('input[type="file"]')].some(input=>input.files?.length)||found.editor.querySelector('img,video,audio,iframe,object,[data-attachment]')||[...composer.querySelectorAll('[data-pending-attachment],[data-uploading="true"],.attachment-preview,.upload-preview,.file-preview,.image-preview,.upload-list,.file-list')].some(visible))return {reason:'В редакторе появилось вложение. Оно сохранено.'};
+    return {found};
+  }
+  function checkPreviewEmpty(request) {
+    // A fresh identity guard is useful only for observation, never deletion.
+    // Do not focus, dispatch an input event or acquire ownership of this editor.
+    const {found,reason}=previewCleanupEditor(request.guard);
+    if(!found)return {empty:false,reason};
+    return exactEditorText(found.editor)===''?{empty:true}:{empty:false,reason:'В поле есть текст. Он сохранён; очистите его вручную.'};
+  }
+  function clearPreview(request) {
+    const token=request.token,preview=token&&previewOperations.get(token.operation),deny=reason=>({cleared:false,reason});
+    const {found,reason}=previewCleanupEditor(token);
+    if(!found)return deny(reason);
+    // A user may clear the draft manually, or preparation may fail before fill.
+    // Confirming an already empty, exact recipient/document performs no deletion.
+    if(exactEditorText(found.editor)==='') {if(previewMatches(preview,token))preview.cleared=true;return {cleared:true};}
+    if(!previewMatches(preview,token)||!preview.editor||!preview.editor.isConnected||previewEditors.get(preview.editor)!==preview)return deny('Владение тестовым черновиком потеряно. Очистите поле вручную.');
+    if(found.editor!==preview.editor||found.send!==preview.send||preview.manualChanged||preview.cleared)return deny('Редактор или тестовый черновик изменены пользователем. Текст сохранён.');
+    const prepared=preparedEditors.get(found.editor);
+    if(prepared?.dialogOperation!==token.operation||prepared.previewOperation!==token.operation||exactEditorText(found.editor)!==exactReplyText(token.text))return deny('Текст тестового черновика изменился. Он сохранён.');
+    preview.cleaning=true;
+    try {
+      // Delete only this owned text. No key, Enter, button click or new text.
+      if(found.editor instanceof HTMLTextAreaElement||found.editor instanceof HTMLInputElement) {
+        const proto=found.editor instanceof HTMLTextAreaElement?HTMLTextAreaElement.prototype:HTMLInputElement.prototype;
+        Object.getOwnPropertyDescriptor(proto,'value').set.call(found.editor,'');
+      }else {
+        const selection=getSelection(),range=document.createRange();found.editor.focus();range.selectNodeContents(found.editor);selection.removeAllRanges();selection.addRange(range);
+        document.execCommand('delete',false);found.editor.replaceChildren();
+      }
+      found.editor.dispatchEvent(new InputEvent('input',{bubbles:true,composed:true,inputType:'deleteContentBackward',data:null}));
+      found.editor.dispatchEvent(new Event('change',{bubbles:true,composed:true}));
+      if(exactEditorText(found.editor)!=='')return deny('Сайт не подтвердил очистку тестового черновика. Проверьте поле вручную.');
+      preview.cleared=true;preparedEditors.delete(found.editor);return {cleared:true};
+    }finally{preview.cleaning=false;}
+  }
   function guardedReply(request,found,{initial=false}={}) {
     if(!request.dialogGuard)return {ok:true};
     const guard=request.dialogGuard;
@@ -264,20 +316,33 @@
   }
   async function prepare(request) {
     const context=guardedReply(request);if(!context.ok)return context;
+    const operation=request.dialogGuard?.operation;
+    if(previewOperations.has(operation)&&request.dialogPreview!==true)return {ok:false,reason:'Тестовую операцию нельзя преобразовать в отправку.'};
+    if(request.dialogPreview===true&&(!request.dialogGuard||!operation||sentOps.has(operation)))return {ok:false,reason:'Не подтверждена отдельная тестовая операция.'};
     const ready=chatReady(request.profile);if(!ready.ok)return ready;
     const found=inspect(request.profile);
     if(found.kind!=='chat') return {ok:false,reason:found.obstacle || found.reason || 'Не найден однозначный редактор внутри чата. Форма запроса не используется.'};
+    const ownedPreview=previewEditors.get(found.editor);
+    if(ownedPreview&&!ownedPreview.cleared&&(request.dialogPreview!==true||ownedPreview.token.operation!==operation))return {ok:false,reason:'В поле находится тестовый черновик. Сначала завершите или очистите тест.'};
     const guard=guardedReply(request,found,{initial:true});if(!guard.ok)return guard;
+    let preview;
+    if(request.dialogPreview===true) {
+      const token={operation,platform:request.dialogGuard.platform,id:request.dialogGuard.id,documentToken:request.dialogGuard.documentToken,sourceUrl:request.dialogGuard.sourceUrl,text:request.message};
+      preview=previewOperations.get(operation);
+      if(preview&&(!previewMatches(preview,token)||preview.cleared||preview.manualChanged||preview.editor!==found.editor||preview.send!==found.send))return {ok:false,reason:'Тестовый черновик или его редактор изменился.'};
+      if(!preview){preview={token,editor:found.editor,send:found.send,cleared:false,manualChanged:false};previewOperations.set(operation,preview);}
+    }
     const current=textOf(found.editor);
     if(request.dialogGuard && preparedEditors.get(found.editor)?.dialogOperation===request.dialogGuard.operation && current!==draftText(request.message))return {ok:false,reason:'Подготовленный ответ изменён вручную. Текст сохранён без изменений.'};
     const mustFill=!current || current!==draftText(request.message) || preparedEditors.get(found.editor)?.text!==draftText(request.message) || (site!=='1688' && request.reactivate);
-    const draftReplaced=!!current && !!mustFill,reply=result=>({draftReplaced,...result});
+    const draftReplaced=!!current && !!mustFill,reply=result=>({draftReplaced,...result,...(preview?{preview:true}:{})});
     if(site==='1688' && request.reactivate && preparedEditors.has(found.editor))preparedEditors.get(found.editor).native=false;
     let inputMethod=preparedEditors.get(found.editor)?.method || 'existing-draft';
     // The user requested replacing existing drafts in the selected chat editor.
     if(mustFill) {
       inputMethod=fill(found.editor,request.message);
       if(request.dialogGuard)Object.assign(preparedEditors.get(found.editor),{dialogOperation:request.dialogGuard.operation,dialogSend:found.send});
+      if(preview){preparedEditors.get(found.editor).previewOperation=operation;previewEditors.set(found.editor,preview);}
       await new Promise(resolve=>setTimeout(resolve,350));
     }
     const fresh=inspect(request.profile);
@@ -426,12 +491,20 @@
       found.contact.click(); return {ok:true,key:found.key};
     }
     if(request.type==='PREPARE') return prepare(request);
+    if(request.type==='DIALOGS_CLEAR_PREVIEW')return clearPreview(request);
+    if(request.type==='DIALOGS_CHECK_PREVIEW_EMPTY')return checkPreviewEmpty(request);
     if(request.type==='SEND') return (async()=>{
       const operation=request.attemptId || request.jobId;
+      if(request.dialogPreview===true||[operation,request.jobId,request.dialogGuard?.operation].some(id=>previewOperations.has(id)))return {clicked:false,reason:'Тестовая операция не имеет права отправлять сообщения.'};
+      // Content scripts cannot read TRUSTED_CONTEXTS storage. Ask the worker via
+      // its read-only guard outside the command queue, then recheck the DOM.
+      try {const allowed=await chrome.runtime.sendMessage({type:'OPENLINKS_TEST_SEND_GUARD'});if(allowed?.ok!==true||allowed.canSend!==true)return {clicked:false,reason:'Отправка запрещена: включён тестовый режим или его состояние не подтверждено.'};}
+      catch{return {clicked:false,reason:'Не удалось проверить тестовый режим. Отправка заблокирована.'};}
       if(sentOps.has(operation)) return {clicked:false,reason:'Эта попытка уже выполнялась. Повтор запрещён.'};
       if(location.href!==request.expectedUrl) return {clicked:false,reason:'Адрес страницы изменился. Проверьте получателя.'};
       const found=inspect(profile);
       if(found.kind!=='chat') return {clicked:false,reason:found.reason || found.obstacle || 'Чат больше не доступен; форма запроса не используется'};
+      if(previewEditors.get(found.editor)&&!previewEditors.get(found.editor).cleared)return {clicked:false,reason:'Тестовый черновик нельзя отправлять.'};
       const guard=guardedReply(request,found);if(!guard.ok)return {clicked:false,reason:guard.reason};
       if(request.dialogGuard && exactEditorText(found.editor)!==exactReplyText(request.message))return {clicked:false,reason:'Текст ответа изменился, включая пробелы. Отправка остановлена.'};
       if(textOf(found.editor)!==draftText(request.message)) return {clicked:false,reason:'Текст изменился. Отправка остановлена.'};
@@ -453,7 +526,7 @@
     return {ok:false,reason:'Неизвестная команда'};
   }
   chrome.runtime.onMessage.addListener((request,sender,respond)=>{
-    if(sender.id!==chrome.runtime.id || !['PROBE','CONTACT','PREPARE','SEND','PICK_START','PICK_STOP','DISMISS_CHALLENGE','OPEN_CHAT','STOP_OPEN_CHAT','NATIVE_INPUT','ARM_CLOSE','CAN_CLOSE','CHAT_READY'].includes(request.type)) return;
+    if(sender.id!==chrome.runtime.id || !['PROBE','CONTACT','PREPARE','SEND','DIALOGS_CLEAR_PREVIEW','DIALOGS_CHECK_PREVIEW_EMPTY','PICK_START','PICK_STOP','DISMISS_CHALLENGE','OPEN_CHAT','STOP_OPEN_CHAT','NATIVE_INPUT','ARM_CLOSE','CAN_CLOSE','CHAT_READY'].includes(request.type)) return;
     Promise.resolve().then(()=>handle(request)).then(respond,error=>respond({ok:false,kind:'ambiguous',reason:'Ошибка селектора или формы: '+error.message}));
     return true;
   });
