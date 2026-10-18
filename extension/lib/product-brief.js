@@ -1,5 +1,6 @@
 // Product context is an explicit, versioned buyer decision. No network or file
 // access occurs here; a URL or a file name alone is never treated as read content.
+import {sameJsonValue} from './json-values.js';
 export const PRODUCT_LIMITS=Object.freeze({files:8,images:8,fileText:50000,totalFileText:150000,cardText:30000,characteristics:12000,keyPoints:16000,questions:8000,rules:8000,warnings:4000});
 const own=(value,key)=>Object.prototype.hasOwnProperty.call(value||{},key);
 const obj=value=>value && typeof value==='object' && !Array.isArray(value)?value:{};
@@ -43,7 +44,7 @@ export function normalizeProduct(value,settings={}){
   product.files=fileRecords(input.files);product.fingerprint=productStateFingerprint(product,settings);
   const extraction=obj(input.extraction);if(stamp(extraction.createdAt)!==null&&typeof extraction.sourceFingerprint==='string')product.extraction={createdAt:stamp(extraction.createdAt),sourceFingerprint:clean(extraction.sourceFingerprint,100),filesFingerprint:clean(extraction.filesFingerprint,100),processedImageKeys:(Array.isArray(extraction.processedImageKeys)?extraction.processedImageKeys:[]).slice(0,PRODUCT_LIMITS.images).map(key=>clean(key,300)).filter(Boolean)};
   const approval=obj(input.approval),context=approvedContext(product,settings);
-  if(approval.revision===product.revision&&approval.fingerprint===product.fingerprint&&stamp(approval.approvedAt)!==null&&product.keyPoints.trim()&&!blockedFiles(product).length&&!pendingImages(product)&&JSON.stringify(approval.context)===JSON.stringify(context))product.approval={revision:product.revision,fingerprint:product.fingerprint,approvedAt:stamp(approval.approvedAt),context};
+  if(approval.revision===product.revision&&approval.fingerprint===product.fingerprint&&stamp(approval.approvedAt)!==null&&product.keyPoints.trim()&&!blockedFiles(product).length&&!pendingImages(product)&&sameJsonValue(approval.context,context))product.approval={revision:product.revision,fingerprint:product.fingerprint,approvedAt:stamp(approval.approvedAt),context};
   return product;
 }
 function filesFingerprint(product){return hash(JSON.stringify(product.files.filter(file=>!file.excluded)));}

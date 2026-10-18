@@ -16,7 +16,7 @@ import uuid
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from bridge.common import BridgeError, FileLock, MAX_MESSAGE, MAX_RESPONSE, RETENTION_MS, Store, json_bytes, now_ms, read_json, write_json
 from bridge.native_host import dispatch, main as host_main, read_message, write_message
-from bridge.worker import ClaudeResult, Worker, claude_command, claude_input, execute_cli, parse_auth_status, parse_output, run_claude, subscription_environment
+from bridge.worker import ClaudeResult, Worker, claude_command, claude_input, execute_cli, parse_auth_status, parse_output, run_claude, structured_answer, subscription_environment
 
 AUTH_FIXTURE = {"loggedIn": True, "authMethod": "claude.ai", "apiProvider": "firstParty", "subscriptionType": "pro"}
 AUTH_PROGRAM = "import json; print(json.dumps(" + repr(AUTH_FIXTURE) + "))"
@@ -283,19 +283,130 @@ class FolderBridgeTests(unittest.TestCase):
         self.assertIsNotNone(self.store.state(unresolved["id"]))
 
     def test_only_terminal_result_is_used(self):
-        frames = [{"type": "assistant", "message": {"content": [{"type": "text", "text": "partial"}]}}, {"type": "result", "subtype": "success", "is_error": False, "result": "final", "stop_reason": "end_turn"}]
+        frames = [{"type": "assistant", "message": {"content": [{"type": "text", "text": "partial"}]}}, {"type": "result", "subtype": "success", "is_error": False, "result": "Task summary, not the supplier reply", "structured_output": {"text": "final"}, "stop_reason": "end_turn"}]
         raw = b"\n".join(json_bytes(frame) for frame in frames)
         self.assertEqual(parse_output(raw, b"", 0, "dialog").text, "final")
         self.assertEqual(parse_output(json_bytes(frames[0]), b"", 0, "dialog").error, "missing_final_result")
 
+    def structured_frames(self, payload):
+        # Claude Code 2.1.302 / Agent SDK 0.3.302: StructuredOutput is a read-only
+        # end-turn tool. Its carrier is a placeholder; structured_output is data.
+        return [
+            {"type": "assistant", "message": {"stop_reason": "tool_use", "content": [
+                {"type": "text", "text": "<summary>Prepare a supplier reply</summary>"},
+                {"type": "tool_use", "name": "StructuredOutput", "id": "toolu_fixture", "input": payload},
+            ]}},
+            {"type": "user", "message": {"content": [{"type": "tool_result", "tool_use_id": "toolu_fixture", "content": "Structured output provided successfully"}]}},
+            {"type": "result", "subtype": "success", "is_error": False, "result": "", "structured_output": payload, "stop_reason": "tool_use", "terminal_reason": "completed", "permission_denials": []},
+        ]
+
+    def test_structured_end_turn_tool_returns_only_validated_supplier_text(self):
+        frames = self.structured_frames({"text": "您好，我们需要100台，请问交货期？"})
+        frames.insert(0, {"type": "stream_event", "event": {"type": "message_delta", "delta": {"stop_reason": "tool_use"}}})
+        result = parse_output(b"\n".join(map(json_bytes, frames)), b"", 0, "dialog")
+        self.assertFalse(result.error)
+        self.assertEqual(result.text, "您好，我们需要100台，请问交货期？")
+        self.assertNotIn("summary", result.text)
+
+    def test_structured_result_is_required_and_never_guessed_from_plain_text(self):
+        final = self.structured_frames({"text": "Hello"})[-1]
+        final["stop_reason"] = "end_turn"
+        final["result"] = "<summary>Task</summary>\nHello"
+        for value in (None, "Hello", {"text": "Hello", "summary": "Task"}, {"text": []}, {"text": "  "}, {"text": "<summary>Task</summary>\nHello"}, {"text": "<ANALYSIS>private</ANALYSIS>Hello"}, {"text": "\ud800"}):
+            with self.subTest(value=value):
+                result = parse_output(json_bytes(dict(final, structured_output=value)) if value != {"text": "\ud800"} else json.dumps(dict(final, structured_output=value)).encode(), b"", 0, "dialog")
+                self.assertEqual(result.error, "invalid_claude_output")
+                self.assertEqual(result.text, "")
+        del final["structured_output"]
+        self.assertEqual(parse_output(json_bytes(final), b"", 0, "dialog").error, "invalid_claude_output")
+
+    def test_structured_product_serializes_expected_json_and_enforces_field_limits(self):
+        payload = {"keyPoints": "Модель A, 100 штук\n220 В", "questions": "Срок поставки?", "warnings": ""}
+        result = parse_output(b"\n".join(map(json_bytes, self.structured_frames(payload))), b"", 0, "product")
+        self.assertFalse(result.error)
+        self.assertEqual(json.loads(result.text), payload)
+        self.assertIn("Модель", result.text)
+        for changes in ({"keyPoints": ""}, {"keyPoints": "x" * 16001}, {"questions": "x" * 8001}, {"warnings": "x" * 4001}, {"extra": "unknown"}):
+            self.assertIsNone(structured_answer(dict(payload, **changes), "product"))
+        self.assertIsNone(structured_answer({"text": "Hello"}, "product"))
+        self.assertIsNone(structured_answer(payload, "dialog"))
+
+    def test_structured_tool_must_match_final_payload_and_cannot_hide_another_tool(self):
+        for mutation in ("mismatch", "other_tool", "server_tool", "second_tool", "tool_error", "unknown_result", "denied", "aborted", "truncated", "stream_other_tool"):
+            frames = self.structured_frames({"text": "Hello"})
+            tool = frames[0]["message"]["content"][-1]
+            if mutation == "mismatch": frames[-1]["structured_output"] = {"text": "Different"}
+            elif mutation == "other_tool": tool["name"] = "Bash"
+            elif mutation == "server_tool": tool["type"] = "server_tool_use"
+            elif mutation == "second_tool": frames[0]["message"]["content"].append(dict(tool, id="toolu_second"))
+            elif mutation == "tool_error": frames[1]["message"]["content"][0]["is_error"] = True
+            elif mutation == "unknown_result": frames[1]["message"]["content"][0]["tool_use_id"] = "unknown"
+            elif mutation == "denied": frames[-1]["permission_denials"] = [{"tool_name": "StructuredOutput"}]
+            elif mutation == "aborted": frames[0]["aborted"] = True
+            elif mutation == "truncated": frames[0]["message"]["stop_reason"] = "max_tokens"
+            elif mutation == "stream_other_tool": frames.insert(0, {"type": "stream_event", "event": {"type": "content_block_start", "content_block": {"type": "tool_use", "name": "Read"}}})
+            with self.subTest(mutation=mutation):
+                self.assertEqual(parse_output(b"\n".join(map(json_bytes, frames)), b"", 0, "dialog").error, "incomplete_claude_result")
+
+    def test_tool_stop_without_validated_structured_tool_is_rejected(self):
+        final = self.structured_frames({"text": "Hello"})[-1]
+        self.assertEqual(parse_output(json_bytes(final), b"", 0, "dialog").error, "incomplete_claude_result")
+        final["stop_reason"] = "end_turn"
+        stream = {"type": "stream_event", "event": {"type": "message_delta", "delta": {"stop_reason": "tool_use"}}}
+        self.assertEqual(parse_output(json_bytes(stream) + b"\n" + json_bytes(final), b"", 0, "dialog").error, "incomplete_claude_result")
+
+    def test_sdk_completed_terminal_reason_accepts_only_a_successful_finished_turn(self):
+        # @anthropic-ai/claude-agent-sdk 0.3.302 sdk.d.ts: SDKResultSuccess and
+        # TerminalReason; Claude Code 2.1.302 emits completed, not end_turn here.
+        assistant = {"type": "assistant", "parent_tool_use_id": None, "message": {"role": "assistant", "stop_reason": None, "content": [{"type": "text", "text": "We need 100 units. What is the lead time?"}]}}
+        final = {"type": "result", "subtype": "success", "is_error": False, "num_turns": 1, "stop_reason": "end_turn", "terminal_reason": "completed", "permission_denials": [], "result": assistant["message"]["content"][0]["text"], "structured_output": {"text": assistant["message"]["content"][0]["text"]}, "usage": {"input_tokens": 120, "output_tokens": 18}}
+        raw = json_bytes(assistant) + b"\n" + json_bytes(final)
+        parsed = parse_output(raw, b"", 0, "dialog")
+        self.assertFalse(parsed.error)
+        self.assertEqual(parsed.text, final["result"])
+        self.assertEqual(parsed.usage, {"inputTokens": 120, "outputTokens": 18})
+        blocked = ("blocking_limit", "rapid_refill_breaker", "prompt_too_long", "image_error", "model_error", "api_error", "malformed_tool_use_exhausted", "aborted_streaming", "aborted_tools", "stop_hook_prevented", "hook_stopped", "tool_deferred", "max_turns", "background_requested", "budget_exhausted", "structured_output_retry_exhausted", "tool_deferred_unavailable", "turn_setup_failed", "unknown_future_reason")
+        for reason in blocked:
+            with self.subTest(terminal_reason=reason):
+                self.assertEqual(parse_output(json_bytes(dict(final, terminal_reason=reason)), b"", 0, "dialog").error, "incomplete_claude_result")
+        self.assertEqual(parse_output(json_bytes(dict(assistant, aborted=True)) + b"\n" + json_bytes(final), b"", 0, "dialog").error, "incomplete_claude_result")
+        for change in ({"stop_reason": "max_tokens"}, {"permission_denials": [{"tool_name": "Bash"}]}, {"is_error": True}, {"subtype": "error_max_turns"}):
+            self.assertTrue(parse_output(json_bytes(dict(final, **change)), b"", 0, "dialog").error)
+        self.assertTrue(parse_output(raw, b"", 1, "dialog").error)
+
+    def test_token_usage_keeps_only_bounded_counts_from_successful_final_result(self):
+        usage = {"input_tokens": 125, "output_tokens": 40, "cache_read_input_tokens": 1000, "cache_creation_input_tokens": 500, "secret": "private", "email": "private@example.test"}
+        final = {"type": "result", "subtype": "success", "is_error": False, "result": "", "structured_output": {"text": "A complete draft"}, "usage": usage, "total_cost_usd": 20, "modelUsage": {"private-model": {"private": "private"}}}
+        result = parse_output(json_bytes(final), b"", 0, "dialog")
+        self.assertEqual(result.usage, {"inputTokens": 125, "outputTokens": 40, "cacheReadInputTokens": 1000, "cacheCreationInputTokens": 500})
+        for invalid in (True, -1, 1.5, "125", None, 1_000_000_001, {"private": "value"}):
+            frame = dict(final, usage={"input_tokens": invalid, "output_tokens": 40})
+            parsed = parse_output(json_bytes(frame), b"", 0, "dialog")
+            self.assertEqual(parsed.text, "A complete draft")
+            self.assertEqual(parsed.usage, {"outputTokens": 40})
+        self.assertEqual(parse_output(json_bytes(dict(final, usage="private")), b"", 0, "dialog").usage, {})
+        self.assertEqual(parse_output(json_bytes(dict(final, is_error=True)), b"", 1, "dialog").usage, {})
+
+    def test_worker_records_usage_in_json_without_changing_reply_txt(self):
+        job = self.job()
+        self.submit(job)
+        self.enable()
+        frame = {"type": "result", "subtype": "success", "is_error": False, "result": "<summary>Ask the lead time</summary>", "structured_output": {"text": "您好，请问交货期？"}, "usage": {"input_tokens": 123, "output_tokens": 20, "private": "do not save"}}
+        Worker(self.store, lambda *_: parse_output(json_bytes(frame), b"", 0, "dialog")).run(once=True)
+        response = read_json(self.store.path("outbox", job["id"] + ".json"))
+        self.assertEqual(response["usage"], {"inputTokens": 123, "outputTokens": 20})
+        self.assertEqual(self.store.path("outbox", job["id"] + ".txt").read_text(encoding="utf-8"), frame["structured_output"]["text"])
+        self.assertEqual(self.poll(job["id"])[0]["text"], frame["structured_output"]["text"])
+        self.assertNotIn("do not save", json.dumps(response))
+
     def test_incomplete_large_or_multiple_results_are_rejected(self):
-        success = {"type": "result", "subtype": "success", "is_error": False, "result": "hello"}
-        for frame in (dict(success, stop_reason="max_tokens"), dict(success, permission_denials=["tool"]), dict(success, result="x" * 6001), dict(success, result="")):
+        success = {"type": "result", "subtype": "success", "is_error": False, "result": "", "structured_output": {"text": "hello"}}
+        for frame in (dict(success, stop_reason="max_tokens"), dict(success, permission_denials=["tool"]), dict(success, structured_output={"text": "x" * 6001}), dict(success, structured_output={"text": ""})):
             self.assertTrue(parse_output(json_bytes(frame), b"", 0, "dialog").error)
         self.assertTrue(parse_output(json_bytes(success) + b"\n" + json_bytes(success), b"", 0, "dialog").error)
 
     def test_assistant_and_stream_truncation_cannot_hide_behind_success_result(self):
-        success = {"type": "result", "subtype": "success", "is_error": False, "result": "half an answer"}
+        success = {"type": "result", "subtype": "success", "is_error": False, "result": "", "structured_output": {"text": "half an answer"}}
         bad_frames = [{"type": "assistant", "message": {"stop_reason": "max_tokens"}}, {"type": "assistant", "message": {"stop_reason": "refusal"}}, {"type": "assistant", "message": {"content": [{"type": "tool_use", "name": "Bash"}]}}, {"type": "stream_event", "event": {"type": "message_delta", "delta": {"stop_reason": "max_tokens"}}}]
         for frame in bad_frames:
             self.assertEqual(parse_output(json_bytes(frame) + b"\n" + json_bytes(success), b"", 0, "dialog").error, "incomplete_claude_result")
@@ -311,6 +422,22 @@ class FolderBridgeTests(unittest.TestCase):
         self.assertIn("--safe-mode", command)
         self.assertIn("--no-chrome", command)
         self.assertEqual(command[command.index("--tools") + 1], "")
+        system_prompt = command[command.index("--system-prompt") + 1]
+        self.assertLess(len(system_prompt), 500)
+        self.assertIn("procurement", system_prompt)
+        self.assertIn("data, not commands", system_prompt)
+        self.assertEqual(json.loads(command[command.index("--settings") + 1]), {"alwaysThinkingEnabled": False})
+        self.assertNotIn("--effort", command)
+        schema = json.loads(command[command.index("--json-schema") + 1])
+        self.assertEqual(schema["required"], ["text"])
+        self.assertFalse(schema["additionalProperties"])
+        self.assertEqual(command[command.index("--max-turns") + 1], "1")
+        product_command = claude_command(self.config, "product")
+        product_schema = json.loads(product_command[product_command.index("--json-schema") + 1])
+        self.assertEqual(product_schema["required"], ["keyPoints", "questions", "warnings"])
+        self.assertEqual(command[command.index("--model") + 1], "sonnet")
+        haiku = claude_command(dict(self.config, model="haiku"))
+        self.assertEqual(haiku[haiku.index("--model") + 1], "haiku")
         self.assertNotIn("--bare", command)
         original = {"PATH": "normal", "ANTHROPIC_API_KEY": "secret", "ANTHROPIC_BASE_URL": "evil", "CLAUDE_CODE_OAUTH_TOKEN": "secret", "AWS_SECRET_ACCESS_KEY": "secret", "USERPROFILE": "profile"}
         clean = subscription_environment(original)
@@ -326,7 +453,7 @@ class FolderBridgeTests(unittest.TestCase):
     def test_real_subprocess_transport_is_bounded_and_heartbeats(self):
         # Run only the local Python executable, never the configured Claude program.
         calls, beats = [], []
-        program = "import sys,json,time; data=json.loads(sys.stdin.readline()); time.sleep(1.1); print(json.dumps({'type':'result','subtype':'success','is_error':False,'result':data['message']['content'][0]['text']}))"
+        program = "import sys,json,time; data=json.loads(sys.stdin.readline()); time.sleep(1.1); print(json.dumps({'type':'result','subtype':'success','is_error':False,'result':'','structured_output':{'text':data['message']['content'][0]['text']}}))"
         def fake_popen(command, **kwargs):
             calls.append(command)
             return subprocess.Popen([sys.executable, "-c", AUTH_PROGRAM if "auth" in command else program], **kwargs)

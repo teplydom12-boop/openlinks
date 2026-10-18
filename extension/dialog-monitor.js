@@ -10,6 +10,7 @@ import {sendDialogReply} from './dialog-send.js';
 import {withTabOwnership} from './lib/tab-ownership.js';
 import {loadProductImage} from './lib/product-files.js';
 import {resolveChatAttachments,pruneChatAttachmentCache} from './lib/chat-attachments.js';
+import {sameJsonValue} from './lib/json-values.js';
 
 export const DIALOGS_KEY = 'openlinksDialogs';
 const PROVIDER_KEY = 'openlinksDialogsProvider';
@@ -466,7 +467,7 @@ export function createDialogMonitor({api=globalThis.chrome, fetchImpl=globalThis
   }
 
   const folderDraftGuard=item=>folderDigest(item?.draft || null);
-  const sameRequest=(left,right)=>JSON.stringify(left)===JSON.stringify(right);
+  const sameRequest=sameJsonValue;
   const folderCurrentRequest=(request,job)=>({...request,imageKeys:job.request.imageKeys || []});
   async function folderSignature(state,request,folder) {
     return folderDigest(request.key?{kind:'dialog',context:await attemptFingerprint(state,request,{revision:0}),model:folder.model}:{kind:'product',request,model:folder.model});

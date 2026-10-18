@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "OpenLinks — поставщики",
-  "version": "0.14.0",
+  "version": "0.14.1",
   "description": "Чаты поставщиков, Claude через папку и подписку, API, TXT, черновики и включаемые автоматические ответы.",
   "permissions": [
     "storage",

@@ -7,16 +7,17 @@ import {conversationKey,resolveConversationAttachments} from '../extension/lib/d
 const urls={1688:'https://air.1688.com/app/chat/index.html',alibaba:'https://message.alibaba.com/message/default.htm',mic:'https://webim.made-in-china.com/super-tm/'};
 const ui={id:'test',url:'chrome-extension://test/dialogs.html'};
 const key=conversationKey('1688','supplier-1');
+const sortedJSON=value=>Array.isArray(value)?value.map(sortedJSON):value&&typeof value==='object'?Object.fromEntries(Object.keys(value).sort().map(key=>[key,sortedJSON(value[key])])):value;
 function snapshot(platform='1688',extra={}) {
   return {platform,status:'ready',url:urls[platform],documentToken:'doc-1',frames:[],conversations:[{id:'supplier-1',title:'Supplier',identityReliable:true,active:true,unread:true,orderReliable:true,tailKnown:true,messages:[{id:'m1',direction:'inbound',text:'What quantity do you need?'}]}],...extra};
 }
-function harness({attachmentResolver,folderSender,reserveDialogSendQuota}={}) {
+function harness({attachmentResolver,folderSender,reserveDialogSendQuota,reorderStorage=false}={}) {
   const storage={},calls=[],alarms=[],permissionRequests=[],tabs=new Map([[1,{id:1,url:urls['1688'],status:'complete'}],[2,{id:2,url:urls.alibaba}],[3,{id:3,url:urls.mic}]]);
   const replies=new Map([[1,snapshot()],[2,snapshot('alibaba')],[3,snapshot('mic')]]);
   const frameLists=new Map(),images=new Map();let reads=0,fetches=0,allowed=true,time=1000000,openAction=async message=>({ok:true,openedId:message.conversationId}),revealAction=async message=>({ok:true,revealedId:message.conversationId}),fetchAction=async()=>new Response(JSON.stringify({choices:[{message:{content:'We need 100 units. Could you share your WeChat?'}}]}));
   const listeners=()=>({list:[],addListener(fn){this.list.push(fn);}});
   const api={runtime:{id:'test',getURL:path=>'chrome-extension://test/'+path,onMessage:listeners(),onStartup:listeners(),onInstalled:listeners()},
-    storage:{local:{get:async name=>{reads++;return {[name]:structuredClone(storage[name])};},set:async data=>Object.assign(storage,structuredClone(data)),setAccessLevel:async value=>calls.push({access:value})}},
+    storage:{local:{get:async name=>{reads++;return {[name]:structuredClone(storage[name])};},set:async data=>Object.assign(storage,reorderStorage?sortedJSON(structuredClone(data)):structuredClone(data)),setAccessLevel:async value=>calls.push({access:value})}},
     tabs:{get:async id=>{if(!tabs.has(id))throw new Error('No tab');return structuredClone(tabs.get(id));},query:async()=>[...tabs.values()],
       sendMessage:async(id,message,options)=>{calls.push({id,...structuredClone(message),frameId:options.frameId});if(message.type==='DIALOGS_OPEN_CONVERSATION')return openAction(message,id);if(message.type==='DIALOGS_REVEAL_LATEST')return revealAction(message,id);const value=replies.get(`${id}:${options.frameId}`) || replies.get(id);return typeof value==='function'?value(message):structuredClone(value);},onUpdated:listeners(),onRemoved:listeners()},
     webNavigation:{getAllFrames:async({tabId})=>frameLists.get(tabId) || [{frameId:0,parentFrameId:-1,url:tabs.get(tabId).url}]},
@@ -587,13 +588,13 @@ test('marketplace pages cannot export prompts or import Claude answers',async()=
   assert.equal(h.reads,before);assert.equal(h.fetches,0);
 });
 
-function fakeFolder(h) {
+function fakeFolder(h,{reorderRequests=false}={}) {
   const jobs=new Map(),calls=[];let loseSubmit=false;
   h.api.runtime.sendNativeMessage=async(host,message)=>{
     assert.equal(host,'com.openlinks.claude_folder');calls.push(structuredClone(message));
     if(message.action==='status')return {ok:true,protocol:1,folder:'C:\\Users\\Buyer\\Desktop\\OpenLinks Claude',worker:{running:false,status:'offline'},claude:{available:true}};
     if(message.action==='configure')return {ok:true};
-    if(message.action==='submit') {if(!jobs.has(message.job.id))jobs.set(message.job.id,{...structuredClone(message.job),status:'queued'});if(loseSubmit){loseSubmit=false;throw new Error('lost after durable write');}return {ok:true,jobId:message.job.id,status:jobs.get(message.job.id).status};}
+    if(message.action==='submit') {if(!jobs.has(message.job.id))jobs.set(message.job.id,{...(reorderRequests?sortedJSON(structuredClone(message.job)):structuredClone(message.job)),status:'queued'});if(loseSubmit){loseSubmit=false;throw new Error('lost after durable write');}return {ok:true,jobId:message.job.id,status:jobs.get(message.job.id).status};}
     if(message.action==='poll')return {ok:true,results:message.ids.flatMap(id=>jobs.has(id)?[{id,status:jobs.get(id).status,request:jobs.get(id).request,imageKeys:(jobs.get(id).images||[]).map(image=>image.imageKey),text:jobs.get(id).text}]:[])};
     if(message.action==='cancel') {if(jobs.has(message.id))jobs.get(message.id).status='cancelled';return {ok:true};}
     if(message.action==='ack')return {ok:true};
@@ -612,6 +613,51 @@ test('folder job round trip requires explicit enable, native permission and curr
   host.done();const accepted=await h.command('FOLDER_POLL');assert.equal(accepted.ok,true);assert.equal(accepted.state.conversations[key].draft.text,'Could you quote 100 units?');assert.equal(accepted.folder.jobs[0].status,'accepted');
   assert.equal(h.fetches,0);assert.ok(h.calls.every(call=>call.type==='DIALOGS_SNAPSHOT'));assert.ok(host.calls.some(call=>call.action==='ack'&&call.outcome==='accepted'));
   await h.command('DISCARD_DRAFT',{key});assert.equal((await h.command('FOLDER_DRAFT',{key})).ok,false);
+});
+test('folder dialog and product round trips survive object-key reordering in Chrome storage or native transport',async()=>{
+  for(const kind of ['dialog','product'])for(const reorderStorage of [false,true]) {
+    const h=harness({reorderStorage});await ready(h);
+    // Exercise each ordering mismatch independently: native output sorted while
+    // storage keeps insertion order, and Chrome storage sorted while host does not.
+    const host=fakeFolder(h,{reorderRequests:!reorderStorage});
+    await h.command('FOLDER_SETTINGS',{enabled:true});
+    const before=await h.command('GET');
+    const queued=kind==='dialog'?await h.command('FOLDER_DRAFT',{key}):await h.command('FOLDER_PRODUCT',{revision:before.state.product.revision,fingerprint:before.productFingerprint});
+    assert.equal(queued.ok,true,queued.error);
+    assert.notDeepEqual(Object.keys(host.first.request),Object.keys(h.storage.openlinksClaudeFolder.jobs[0].request));
+    const answer=kind==='dialog'?'We need 100 units. What is the lead time?':JSON.stringify({keyPoints:'Buyer needs 100 units.',questions:'Lead time?',warnings:''});
+    host.done(answer);const response=await h.command('FOLDER_POLL');
+    assert.equal(response.ok,true,response.error);assert.equal(response.folder.jobs[0].status,'accepted',kind);
+    if(kind==='dialog')assert.equal(response.state.conversations[key].draft.text,answer);
+    else {assert.equal(response.state.product.keyPoints,'Buyer needs 100 units.');assert.equal(response.state.product.approval,null);}
+    assert.ok(host.calls.some(call=>call.action==='ack'&&call.outcome==='accepted'));
+    await h.command('FOLDER_POLL');assert.equal(host.calls.filter(call=>call.action==='submit').length,1);assert.equal(h.fetches,0);
+    assert.ok(h.calls.every(call=>call.type==='DIALOGS_SNAPSHOT'));
+  }
+});
+test('folder semantic matching still rejects changed values, types, missing fields and extra fields',async()=>{
+  const mutations={value:request=>{request.fingerprint='different';},type:request=>{request.revision=String(request.revision);},missing:request=>{delete request.fingerprint;},extra:request=>{request.extra='unexpected';},null:request=>{request.fingerprint=null;},arrayType:request=>{request.imageKeys={};}};
+  for(const kind of ['dialog','product'])for(const [label,mutate] of Object.entries(mutations)) {
+    const h=harness({reorderStorage:true}),host=await folderReady(h),before=await h.command('GET');
+    const queued=kind==='dialog'?await h.command('FOLDER_DRAFT',{key}):await h.command('FOLDER_PRODUCT',{revision:before.state.product.revision,fingerprint:before.productFingerprint});
+    assert.equal(queued.ok,true,queued.error);mutate(host.first.request);
+    host.done(kind==='dialog'?'Must be rejected':JSON.stringify({keyPoints:'Must be rejected',questions:'',warnings:''}));
+    const response=await h.command('FOLDER_POLL');assert.equal(response.folder.jobs[0].status,'stale',kind+':'+label);
+    assert.equal(response.state.conversations[key].draft,null);assert.notEqual(response.state.product.keyPoints,'Must be rejected');
+    assert.ok(host.calls.some(call=>call.action==='ack'&&call.outcome==='stale'));assert.equal(h.fetches,0);
+  }
+});
+test('folder semantic matching preserves image array order in both echoed request and result',async()=>{
+  for(const change of ['request','result']) {
+    const h=harness({reorderStorage:true}),host=await folderReady(h);
+    const files=['first','second'].map(name=>({id:name,name:name+'.png',kind:'image',mime:'image/png',status:'ready',text:'',images:[{imageKey:'img:'+name,mime:'image/png'}]}));
+    for(const file of files)h.images.set(file.images[0].imageKey,'data:image/png;base64,aGVsbG8=');
+    await h.command('PRODUCT_SAVE',{product:{cardText:'Two drawings',files}});
+    const before=await h.command('GET'),queued=await h.command('FOLDER_PRODUCT',{revision:before.state.product.revision,fingerprint:before.productFingerprint});assert.equal(queued.ok,true,queued.error);
+    if(change==='request')host.first.request.imageKeys.reverse();else host.first.images.reverse();
+    host.done(JSON.stringify({keyPoints:'Must be rejected',questions:'',warnings:''}));
+    const response=await h.command('FOLDER_POLL');assert.equal(response.folder.jobs[0].status,'stale',change);assert.notEqual(response.state.product.keyPoints,'Must be rejected');
+  }
 });
 test('folder output for changed history, document, recipient or edited draft cannot overwrite current context',async()=>{
   for(const change of ['history','document','recipient','draft','product']) {
