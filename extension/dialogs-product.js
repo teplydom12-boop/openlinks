@@ -1,7 +1,6 @@
 import {displayTime} from './lib/time.js';
 import {PRODUCT_FILE_LIMITS, readProductFiles, readProductOriginal, deleteProductFile} from './lib/product-files.js';
 import {productApprovalError} from './lib/dialogs.js';
-import {providerInfo} from './lib/dialog-ai.js';
 
 const $=selector=>document.querySelector(selector);
 const FIELDS={sourceUrl:'url',cardText:'card',characteristics:'characteristics',keyPoints:'points',questions:'questions',rules:'rules',warnings:'warnings'};
@@ -10,13 +9,12 @@ const clone=value=>structuredClone(value);
 const element=(tag,text,className)=>{const el=document.createElement(tag);if(text!==undefined)el.textContent=text;if(className)el.className=className;return el;};
 const emptyProduct=()=>({revision:0,files:[],sourceUrl:'',cardText:'',characteristics:'',keyPoints:'',questions:'',rules:'',warnings:'',approval:null,extraction:null});
 
-export function setupProductUI({command,adopt,feedback,exportPrompt,getFolderState=()=>({enabled:false}),onDirty=()=>{}}){
-  let state=null,ai={},fingerprint='',baseFingerprint='',baseRevision=0,files=[],dirty=false,settingsDirty=false;
-  let operation='',autoBusy=false,pendingFiles=[],retryId=null,disablePromise=null;
+export function setupProductUI({command,adopt,feedback,getFolderState=()=>({enabled:false}),onDirty=()=>{},onApproved=async()=>{}}){
+  let state=null,fingerprint='',baseFingerprint='',baseRevision=0,files=[],dirty=false,settingsDirty=false;
+  let operation='',pendingFiles=[],retryId=null,disablePromise=null;
   const originals=new Map(),removed=new Set(),expanded=new Set();
   const product=()=>state?.product||emptyProduct();
   const isApproved=()=>!dirty&&!settingsDirty&&!!product().approval&&product().approval.revision===product().revision&&product().approval.fingerprint===fingerprint;
-  const configurationReady=()=>!!ai.keyStored&&!!ai.model?.trim();
   const sourceReady=()=>$('#dialogs-product-card').value.trim()||$('#dialogs-product-characteristics').value.trim()||files.some(file=>!file.excluded&&['ready','partial'].includes(file.status)&&(file.text?.trim()||file.images?.length||file.imageKey));
   function patch(){const result={files:clone(files)};for(const [key,suffix] of Object.entries(FIELDS))result[key]=$('#dialogs-product-'+suffix).value;return result;}
   function hydrate(){const saved=product();for(const [key,suffix] of Object.entries(FIELDS))$('#dialogs-product-'+suffix).value=saved[key]||'';files=clone(saved.files||[]);baseRevision=saved.revision||0;baseFingerprint=fingerprint;}
@@ -69,19 +67,14 @@ export function setupProductUI({command,adopt,feedback,exportPrompt,getFolderSta
     const conflict=dirty&&(baseRevision!==(saved.revision||0)||baseFingerprint!==fingerprint);
     const status=$('#dialogs-product-status');status.textContent=dirty?'Есть несохранённые изменения':approved?'Согласовано · версия '+saved.revision:'Нужно согласование · версия '+(saved.revision||0);status.className='dialogs-status '+(approved?'good':'warn');
     $('#dialogs-product-conflict').hidden=!conflict;$('#dialogs-product-conflict').textContent=conflict?'Сохранённая версия изменилась в другом окне или после обновления настроек. Скопируйте нужные правки и загрузите сохранённую версию кнопкой сброса; устаревшие данные не будут перезаписаны.':'';
-    $('#dialogs-product-approval-note').textContent=settingsDirty?'Сохраните изменения настроек подключения и задания перед согласованием.':dirty?'Изменения ещё не применены. Сохраните их, затем согласуйте новую версию. Автоматические черновики при редактировании выключаются.':approved?'Согласовано '+displayTime(saved.approval.approvedAt)+'. Эта версия используется для ответов всем наблюдаемым поставщикам. Любое изменение материалов, правил, задания, WeChat или языка требует нового согласования.':invalidFiles?'Есть частично прочитанные, неподдерживаемые или ошибочные файлы. Повторите чтение, исключите их из задания или удалите перед согласованием.':approvalIssue||'Проверьте факты и вопросы. Согласование разрешает использовать сохранённую версию при подготовке черновиков.';
+    $('#dialogs-product-approval-note').textContent=settingsDirty?'Сохраните контекст переговоров перед согласованием.':dirty?'Изменения ещё не применены. Сохраните их, затем согласуйте новую версию. Обработка ответов приостановлена до нового согласования.':approved?'Согласовано '+displayTime(saved.approval.approvedAt)+'. Эта версия используется для ответов всем наблюдаемым поставщикам. Любое изменение материалов, правил, задания, WeChat или языка требует нового согласования.':invalidFiles?'Есть частично прочитанные, неподдерживаемые или ошибочные файлы. Повторите чтение, исключите их из задания или удалите перед согласованием.':approvalIssue||'Проверьте факты и вопросы. Согласование разрешает использовать сохранённую версию при подготовке черновиков.';
     for(const el of $('#dialogs-product-form').querySelectorAll('input,textarea'))el.disabled=!!operation;
     $('#dialogs-product-save').disabled=!!operation||!dirty;
-    $('#dialogs-product-extract').disabled=!!operation||!configurationReady()||!sourceReady()||settingsDirty;
-    $('#dialogs-product-export').disabled=!!operation||!sourceReady()||settingsDirty;
-    $('#dialogs-product-folder').disabled=!!operation||!sourceReady()||settingsDirty||!getFolderState().enabled;
+    $('#dialogs-product-folder').disabled=!!operation||!sourceReady()||settingsDirty||!getFolderState().enabled||getFolderState().dirty;
     $('#dialogs-product-approve').disabled=!!operation||dirty||settingsDirty||!!approvalIssue||approved;
     $('#dialogs-product-approve').textContent=approved?'Версия '+saved.revision+' согласована':'Согласовать версию '+(saved.revision||0);
     $('#dialogs-product-reset').disabled=!!operation||!dirty;
-    $('#dialogs-product-extraction-state').textContent=operation==='folder'?'Сохраняю задание в папку…':operation==='extract'?'Извлекаю информацию…':operation==='export'?'Формирую промпт…':operation==='import'?'Применяю ответ Claude…':operation==='files'?'Читаю выбранные файлы…':operation==='save'?'Сохраняю…':operation==='approve'?'Согласование…':saved.extraction?'Информация извлечена. Проверьте её перед согласованием.':!configurationReady()?'Без API-ключа используйте промпт TXT или подключите папку Claude.':'';
-    const auto=!!state.settings?.autoDraft;
-    $('#dialogs-auto-draft').checked=auto;$('#dialogs-auto-draft').disabled=autoBusy||(!auto&&(!approved||!configurationReady()));
-    $('#dialogs-auto-draft-state').textContent=disablePromise?'Выключаю автоматические черновики после изменения данных…':autoBusy?'Изменяю режим…':auto?(state.running?'Автоматические черновики включены для всех выбранных вкладок. Отправка сообщений отключена.':'Автоматические черновики включены. Начните мониторинг, чтобы обрабатывать новые сообщения.') :!approved?'Автоматические черновики выключены. Сохраните и согласуйте сведения о товаре.':!configurationReady()?'Автоматические черновики выключены. Укажите модель и API-ключ в настройках ниже.':'Автоматические черновики выключены. Можно готовить ответы вручную или включить этот режим.';
+    $('#dialogs-product-extraction-state').textContent=operation==='folder'?'Передаю материалы Claude…':operation==='files'?'Читаю выбранные файлы…':operation==='save'?'Сохраняю…':operation==='approve'?'Согласование…':saved.extraction?'Информация готова. Проверьте её перед согласованием.':!getFolderState().enabled?'Сначала подключите Claude в шаге 1.':'';
     renderFiles();
   }
   async function save(){
@@ -94,7 +87,7 @@ export function setupProductUI({command,adopt,feedback,exportPrompt,getFolderSta
   async function addFiles(selected,replacingId=null){
     if(operation||!selected.length)return;
     if(files.length-(replacingId?1:0)+selected.length>8){feedback('Можно прикрепить до 8 файлов. Новые файлы не добавлены; удалите лишние и повторите выбор.',true);return;}
-    dirty=true;pauseAutomatic();pendingFiles=selected.map(file=>file.name);
+    dirty=true;pauseAutomatic();onDirty();pendingFiles=selected.map(file=>file.name);
     await withOperation('files',async()=>{
       let records;
       const remaining=files.filter(file=>file.id!==replacingId),textBudget=Math.max(0,PRODUCT_FILE_LIMITS.textTotal-remaining.reduce((sum,file)=>sum+(file.text?.length||0),0)),imageBudget=Math.max(0,PRODUCT_FILE_LIMITS.images-remaining.reduce((sum,file)=>sum+(file.images?.length||0),0));
@@ -112,29 +105,12 @@ export function setupProductUI({command,adopt,feedback,exportPrompt,getFolderSta
   $('#dialogs-product-files').addEventListener('change',event=>{const selected=[...event.target.files];event.target.value='';addFiles(selected);});
   $('#dialogs-product-file-retry').addEventListener('change',event=>{const selected=[...event.target.files],id=retryId;retryId=null;event.target.value='';addFiles(selected,id);});
   $('#dialogs-product-reset').addEventListener('click',()=>withOperation('reset',async()=>{for(const file of files)if(!(product().files||[]).some(saved=>saved.id===file.id))await forgetFile(file.id);removed.clear();dirty=false;hydrate();feedback('Загружена сохранённая версия. Несохранённые правки сброшены.');}));
-  $('#dialogs-product-extract').addEventListener('click',()=>{
-    // Keep permission request in the original user gesture, before any storage awaits.
-    const provider=providerInfo(ai.provider),permission=chrome.permissions.request({origins:[provider.origin]});
-    withOperation('extract',async()=>{if(!await permission)throw new Error('Доступ к '+provider.label+' API не разрешён. Материалы не передавались.');await save();const result=await command('PRODUCT_EXTRACT',{revision:product().revision||0,fingerprint});dirty=false;adopt(result);hydrate();feedback('Важная информация извлечена. Проверьте факты и вопросы, затем согласуйте версию.');});
-  });
-  $('#dialogs-product-export').addEventListener('click',()=>withOperation('export',async()=>{$('#dialogs-prompt-panel').hidden=true;if(settingsDirty)throw new Error('Сначала сохраните настройки задания.');await save();const result=await command('EXPORT_PRODUCT_PROMPT',{revision:product().revision||0,fingerprint});if(result.state)adopt(result);exportPrompt(result.promptExport,{kind:'product'});feedback('Промпт готов. Скопируйте его или скачайте TXT и перенесите в Claude.');}));
-  $('#dialogs-product-folder').addEventListener('click',()=>withOperation('folder',async()=>{if(settingsDirty)throw new Error('Сначала сохраните настройки задания.');if(!getFolderState().enabled)throw new Error('Сначала подключите папку Claude.');await save();adopt(await command('FOLDER_PRODUCT',{revision:product().revision||0,fingerprint}));feedback('Задание по товару добавлено в папку Claude. После обработки проверьте результат и согласуйте сведения.');}));
-  $('#dialogs-product-approve').addEventListener('click',()=>withOperation('approve',async()=>{if(dirty||settingsDirty)throw new Error('Сначала сохраните изменения.');const result=await command('PRODUCT_APPROVE',{revision:product().revision||0,fingerprint});adopt(result);feedback('Информация согласована. Можно готовить черновики ответов.');}));
-  $('#dialogs-auto-draft').addEventListener('change',async()=>{
-    const enabled=$('#dialogs-auto-draft').checked;
-    const provider=providerInfo(ai.provider),permission=enabled?chrome.permissions.request({origins:[provider.origin]}):Promise.resolve(true);
-    autoBusy=true;render();
-    try{if(!await permission)throw new Error('Доступ к '+provider.label+' API не разрешён. Автоматические черновики не включены.');if(enabled&&(!isApproved()||!configurationReady()))throw new Error('Сначала согласуйте сведения о товаре и сохраните настройки '+provider.label+'.');adopt(await command('AUTODRAFT',{enabled}));feedback(enabled?'Автоматические черновики включены. Сообщения не отправляются.':'Автоматические черновики выключены.');}catch(error){feedback(error.message,true);}finally{autoBusy=false;render();}
-  });
+  $('#dialogs-product-folder').addEventListener('click',()=>withOperation('folder',async()=>{if(settingsDirty)throw new Error('Сначала сохраните настройки задания.');if(!getFolderState().enabled)throw new Error('Сначала подключите Claude.');if(getFolderState().dirty)throw new Error('Сначала сохраните модель Claude.');await save();adopt(await command('FOLDER_PRODUCT',{revision:product().revision||0,fingerprint}));feedback('Задание по товару добавлено в папку Claude. После обработки проверьте результат и согласуйте сведения.');}));
+  $('#dialogs-product-approve').addEventListener('click',()=>withOperation('approve',async()=>{if(dirty||settingsDirty)throw new Error('Сначала сохраните изменения.');const result=await command('PRODUCT_APPROVE',{revision:product().revision||0,fingerprint});adopt(result);await onApproved();feedback('Информация согласована. Claude будет использовать её для ответов.');}));
   return {
-    render(nextState,nextAI,nextFingerprint){state=nextState;ai=nextAI;fingerprint=nextFingerprint||nextState?.product?.fingerprint||'';if(!dirty&&!operation)hydrate();render();},
+    render(nextState,nextAI,nextFingerprint){state=nextState;fingerprint=nextFingerprint||nextState?.product?.fingerprint||'';if(!dirty&&!operation)hydrate();render();},
     isDirty:()=>dirty||settingsDirty,
     isApproved,
-    async importResult(request,text,imagesAttached){
-      let applied=false;
-      await withOperation('import',async()=>{if(dirty||settingsDirty)throw new Error('Сначала сохраните изменения и сформируйте новый промпт.');const result=await command('IMPORT_PRODUCT_RESULT',{request,text,imagesAttached});dirty=false;adopt(result);hydrate();applied=true;feedback('Ответ Claude применён. Проверьте факты и вопросы, затем согласуйте новую версию.');});
-      return applied;
-    },
     setSettingsDirty(value){settingsDirty=value;if(value)pauseAutomatic();render();onDirty();},
   };
 }

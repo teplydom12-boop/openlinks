@@ -13,100 +13,80 @@
       <a class="nav" href="dashboard.html">▤ <span>Очередь поставщиков</span></a>
       <a class="nav active" href="dialogs.html" aria-current="page">☷ <span>Диалоги с поставщиками</span></a>
     </nav>
-    <div class="sidebar-bottom"><span class="live-dot"></span> История хранится в Chrome<p>API, ручной промпт TXT или Claude Code через папку.</p></div>
+    <div class="sidebar-bottom"><span class="live-dot"></span> Ответы с Claude<p>Товар, правила и история переписки — в одном рабочем пространстве.</p></div>
   </aside>
   <main>
-    <header><div><div class="eyebrow">КОММУНИКАЦИЯ С ПОСТАВЩИКАМИ</div><h1>Диалоги с поставщиками</h1></div><div id="dialogs-run-state" class="state">Загрузка…</div></header>
+    <header><div><div class="eyebrow">OPENLINKS + CLAUDE</div><h1>Диалоги с поставщиками</h1><p class="dialogs-subtitle">Настройте задачу один раз. Claude подготовит ответы по вашим правилам.</p></div><div id="dialogs-run-state" class="state" role="status">Загрузка…</div></header>
     <div id="dialogs-feedback" role="status" hidden></div>
-    <section class="panel dialogs-intro">
-      <div><h2>Мониторинг и ответы</h2><p>Этот блок читает чаты и помогает подготовить ответы. По умолчанию ответы сохраняются черновиками. Отправка через папку Claude включается отдельно в её настройках. Очередь первичных обращений управляется отдельно.</p></div>
-      <div class="dialogs-monitor-controls"><div class="actions"><button id="dialogs-stop" class="button secondary" disabled>Остановить мониторинг</button><button id="dialogs-start" class="button primary" disabled>Начать мониторинг</button><button id="dialogs-scan" class="button secondary" disabled>Проверить сейчас</button></div><label class="check"><input id="dialogs-read-unread" type="checkbox" checked> Открывать диалоги с новыми сообщениями для чтения</label><p class="hint">Открытие переписки может снять отметку «непрочитано». При первом проходе могут открыться и прочитанные диалоги с превью. Сообщения не отправляются. Настройка применяется при запуске мониторинга; открываются только распознанные диалоги.</p></div>
+    <nav class="dialogs-steps" aria-label="Этапы настройки"><a href="#dialogs-folder"><span>1</span> Claude</a><a href="#dialogs-product"><span>2</span> Товар и правила</a><a href="#dialogs-monitor"><span>3</span> Мониторинг</a><a href="#dialogs-conversations"><span>4</span> Переписки</a></nav>
+
+    <section id="dialogs-folder" class="panel dialogs-folder" aria-labelledby="dialogs-folder-heading">
+      <div class="panel-heading"><div><div class="eyebrow">ШАГ 1</div><h2 id="dialogs-folder-heading">Подключение Claude</h2></div><span id="dialogs-folder-status" class="dialogs-status" role="status">Выключено</span></div>
+      <p>Claude Code получает задания через папку на вашем компьютере и возвращает готовые ответы. Используется ваша подписка Claude.</p>
+      <form id="dialogs-folder-form" class="dialogs-connection-form">
+        <div><label for="dialogs-folder-model">Модель Claude</label><select id="dialogs-folder-model"><option value="haiku">Haiku · экономный</option><option value="sonnet">Sonnet · сбалансированный</option><option value="opus">Opus · сложные задачи</option></select><p class="hint">Для обычной переписки начните с Haiku. Модель применяется к новым заданиям.</p></div>
+        <div class="actions"><button id="dialogs-folder-connect" class="button primary" type="button" disabled>Подключить Claude</button><button id="dialogs-folder-save" class="button secondary" type="submit" disabled>Сохранить модель</button></div>
+      </form>
+      <p id="dialogs-folder-detail" class="hint" role="status"></p><p id="dialogs-folder-edits" class="hint" role="status" hidden></p>
+      <details class="dialogs-inline-details"><summary>Подключение и локальный обработчик</summary><p id="dialogs-folder-path" class="hint"></p><p id="dialogs-folder-worker" class="hint"></p><p class="hint">Для работы нужны интернет и запущенный обработчик Claude Code. <a href="https://github.com/teplydom12-boop/openlinks/blob/main/bridge/README.md" target="_blank" rel="noopener noreferrer">Инструкция по установке ↗</a></p><button id="dialogs-folder-stop" class="link-button" type="button" disabled>Отключить Claude</button></details>
     </section>
+
     <section id="dialogs-product" class="panel dialogs-product" aria-labelledby="dialogs-product-heading">
-      <div class="panel-heading"><div><div class="eyebrow">1. ТОВАР И ПРАВИЛА ОБЩЕНИЯ</div><h2 id="dialogs-product-heading">Информация для ответов поставщикам</h2></div><span id="dialogs-product-status" class="dialogs-status" role="status">Не согласовано</span></div>
-      <p class="dialogs-product-scope">Один активный товар применяется ко всем поставщикам в выбранных вкладках 1688, Alibaba и Made-in-China. Перед работой с другим товаром измените сведения и согласуйте их заново.</p>
+      <div class="panel-heading"><div><div class="eyebrow">ШАГ 2</div><h2 id="dialogs-product-heading">Товар и правила общения</h2></div><span id="dialogs-product-status" class="dialogs-status" role="status">Не согласовано</span></div>
+      <p class="dialogs-product-scope">Эта задача применяется ко всем поставщикам в выбранных вкладках. Опишите товар, проверьте выводы Claude и согласуйте сведения для ответов.</p>
       <form id="dialogs-product-form">
-        <label for="dialogs-product-url">Ссылка на карточку товара (необязательно)</label><input id="dialogs-product-url" type="url" maxlength="4096" placeholder="https://…">
-        <div class="dialogs-form-grid"><div><label for="dialogs-product-card">Описание или текст карточки товара</label><textarea id="dialogs-product-card" rows="6" maxlength="30000" placeholder="Вставьте описание товара, комплектацию и сведения из карточки."></textarea></div><div><label for="dialogs-product-characteristics">Нужные характеристики</label><textarea id="dialogs-product-characteristics" rows="6" maxlength="12000" placeholder="Размеры, материал, модель, количество, требования к качеству и упаковке."></textarea></div></div>
-        <div class="dialogs-product-files"><div class="panel-heading"><h3>Файлы товара</h3><label class="file-button">Добавить файлы<input id="dialogs-product-files" type="file" multiple hidden></label></div><p class="hint">Excel, PDF, DOCX, изображения и текст. До 8 файлов. Результат чтения каждого файла показан ниже; неподдерживаемый формат не считается прочитанным.</p><div id="dialogs-product-file-list"></div><p id="dialogs-product-files-empty" class="hint">Файлов пока нет. Можно работать только с описанием.</p><input id="dialogs-product-file-retry" type="file" hidden aria-label="Выбрать файл повторно"></div>
-        <div class="actions"><button id="dialogs-product-extract" class="button secondary" type="button" disabled>Получить важную информацию через API</button><button id="dialogs-product-export" class="button secondary" type="button" disabled>Промпт для Claude · TXT</button><button id="dialogs-product-folder" class="button secondary" type="button" disabled>Обработать через папку Claude</button><span id="dialogs-product-extraction-state" class="hint" role="status"></span></div>
-        <p class="hint">Через API материалы передаются выбранному сервису. Промпт TXT формируется локально без ключа: перенесите его в Claude вручную, затем вставьте ответ обратно. Проверьте факты и вопросы перед согласованием. Исходные файлы хранятся в Chrome.</p>
-        <div class="dialogs-form-grid"><div><label for="dialogs-product-points">Факты и важная информация для переговоров</label><textarea id="dialogs-product-points" rows="7" maxlength="16000" placeholder="Подтверждённые характеристики и требования. Можно заполнить самостоятельно."></textarea></div><div><label for="dialogs-product-questions">Что уточнять у продавца</label><textarea id="dialogs-product-questions" rows="7" maxlength="8000" placeholder="Цена, MOQ, наличие, срок производства, доставка, образец…"></textarea></div></div>
-        <label for="dialogs-product-rules">Ваши правила общения</label><textarea id="dialogs-product-rules" rows="4" maxlength="8000" placeholder="Что можно обещать, какие условия требуют моего решения, когда предложить WeChat."></textarea>
-        <label for="dialogs-product-warnings">Неясности и ограничения материалов</label><textarea id="dialogs-product-warnings" rows="3" maxlength="4000" placeholder="Каких сведений нет, какие данные противоречат друг другу или требуют проверки."></textarea>
+        <div class="dialogs-form-grid"><div><label for="dialogs-product-card">Описание товара</label><textarea id="dialogs-product-card" rows="5" maxlength="30000" placeholder="Вставьте описание, комплектацию или текст карточки товара."></textarea></div><div><label for="dialogs-product-characteristics">Ваши требования</label><textarea id="dialogs-product-characteristics" rows="5" maxlength="12000" placeholder="Модель, материал, размеры, количество, качество и упаковка."></textarea></div></div>
+        <label for="dialogs-product-url">Ссылка на товар (необязательно)</label><input id="dialogs-product-url" type="url" maxlength="4096" placeholder="https://…">
+        <div class="dialogs-product-files"><div class="panel-heading"><h3>Материалы товара</h3><label class="file-button">Добавить файлы<input id="dialogs-product-files" type="file" multiple hidden></label></div><p class="hint">Excel, PDF, DOCX, изображения и текст — до 8 файлов. Результат чтения каждого файла появится здесь.</p><div id="dialogs-product-file-list"></div><p id="dialogs-product-files-empty" class="hint">Добавьте файлы или используйте только описание выше.</p><input id="dialogs-product-file-retry" type="file" hidden aria-label="Выбрать файл повторно"></div>
+        <div class="actions"><button id="dialogs-product-folder" class="button secondary" type="button" disabled>Получить важную информацию</button><span id="dialogs-product-extraction-state" class="hint" role="status"></span></div>
+        <p class="hint">Claude выделит факты и вопросы. Проверьте результат и при необходимости отредактируйте его перед согласованием.</p>
+        <div class="dialogs-form-grid"><div><label for="dialogs-product-points">Что мы знаем и можем сообщать</label><textarea id="dialogs-product-points" rows="6" maxlength="16000" placeholder="Подтверждённые характеристики и ваши требования. Можно заполнить самостоятельно."></textarea></div><div><label for="dialogs-product-questions">Что нужно узнать у продавца</label><textarea id="dialogs-product-questions" rows="6" maxlength="8000" placeholder="Цена, MOQ, наличие, срок производства, доставка, образец…"></textarea></div></div>
+        <label for="dialogs-product-rules">Правила общения</label><textarea id="dialogs-product-rules" rows="4" maxlength="8000" placeholder="Что можно обещать, какие решения оставить мне, когда предложить WeChat."></textarea>
+        <label for="dialogs-product-warnings">Неясности и ограничения</label><textarea id="dialogs-product-warnings" rows="3" maxlength="4000" placeholder="Что ещё не подтверждено или требует проверки."></textarea>
         <p id="dialogs-product-conflict" class="hint" hidden></p><p id="dialogs-product-approval-note" class="hint" aria-live="polite"></p>
         <div class="actions"><button id="dialogs-product-save" class="button secondary" type="submit" disabled>Сохранить изменения</button><button id="dialogs-product-approve" class="button primary" type="button" disabled>Согласовать информацию</button><button id="dialogs-product-reset" class="link-button" type="button" disabled>Сбросить несохранённые изменения</button></div>
       </form>
-      <div class="dialogs-auto-controls"><label class="check"><input id="dialogs-auto-draft" type="checkbox" disabled> Автоматически готовить черновики ответов через API</label><p id="dialogs-auto-draft-state" class="hint" role="status">Сначала сохраните и согласуйте сведения о товаре.</p><p class="hint">После включения выбранные переписки и согласованные сведения передаются выбранному сервису во время мониторинга. Ответы остаются в этом окне; сообщения продавцам не отправляются. По умолчанию используется язык последнего сообщения продавца и естественный деловой стиль. Ручной режим TXT не требует API.</p></div>
+      <details class="dialogs-inline-details dialogs-settings"><summary>Контекст переговоров и WeChat</summary>
+        <form id="dialogs-settings-form"><label for="dialogs-brief">Дополнительное задание (необязательно)</label><textarea id="dialogs-brief" rows="3" maxlength="12000" placeholder="Дополнительные пожелания по закупке и переговорам."></textarea><div class="dialogs-form-grid"><div><label for="dialogs-wechat">Ваш WeChat (необязательно)</label><input id="dialogs-wechat" type="text" maxlength="256" placeholder="WeChat ID"></div><div><label for="dialogs-language">Язык ответов (необязательно)</label><input id="dialogs-language" type="text" maxlength="100" placeholder="По умолчанию — язык продавца"></div></div><p class="hint">После изменения контекста согласуйте сведения о товаре заново.</p><button id="dialogs-save-settings" class="button secondary" type="submit" disabled>Сохранить контекст</button></form>
+      </details>
     </section>
-    <section id="dialogs-folder" class="panel dialogs-folder" aria-labelledby="dialogs-folder-heading">
-      <div class="panel-heading"><h2 id="dialogs-folder-heading">Claude через папку</h2><span id="dialogs-folder-status" class="dialogs-status" role="status">Выключено</span></div>
-      <p>Расширение сохраняет задания в папку на компьютере. Локальный обработчик запускает Claude Code, возвращает результат в расширение и ведёт журнал. API-ключ в расширении не нужен.</p>
-      <p class="hint">Нужен Claude Code с входом в вашу подписку; одного установленного приложения Claude Desktop недостаточно. Для ответов Claude требуется интернет. Без соединения задания остаются в очереди.</p>
-      <p id="dialogs-folder-detail" class="hint" role="status"></p><p id="dialogs-folder-path" class="hint"></p><p id="dialogs-folder-worker" class="hint"></p>
-      <form id="dialogs-folder-form">
-        <label for="dialogs-folder-model">Модель Claude Code</label><input id="dialogs-folder-model" type="text" maxlength="200" autocomplete="off" spellcheck="false" value="sonnet">
-        <label class="check"><input id="dialogs-folder-auto" type="checkbox"> Автоматически создавать задания по новым сообщениям</label>
-        <label class="check"><input id="dialogs-folder-send" type="checkbox"> Отправлять полученные ответы поставщикам автоматически</label>
-        <p id="dialogs-folder-send-note" class="hint">Отправка выключена. Полученные ответы остаются черновиками для проверки.</p>
-        <p id="dialogs-folder-edits" class="hint" role="status" hidden></p>
-        <div class="actions"><button id="dialogs-folder-connect" class="button primary" type="button">Подключить папку</button><button id="dialogs-folder-save" class="button secondary" type="submit" disabled>Сохранить настройки папки</button><button id="dialogs-folder-stop" class="button secondary" type="button" disabled>Остановить обработку</button><button id="dialogs-folder-poll" class="button secondary" type="button" disabled>Проверить результаты</button></div>
-      </form>
-      <p class="hint"><a href="https://github.com/teplydom12-boop/openlinks/blob/main/bridge/README.md" target="_blank" rel="noopener noreferrer">Установка и настройка обработчика Claude Code ↗</a>. Если локальный модуль не найден, установите его по инструкции и подключите папку повторно.</p>
-      <h3>Задания в папке</h3><ol id="dialogs-folder-jobs" class="dialogs-folder-jobs"></ol><p id="dialogs-folder-empty" class="hint">Заданий пока нет. После подключения обработайте товар или выберите переписку.</p>
-    </section>
-    <section aria-labelledby="dialogs-tabs-heading">
-      <div class="panel-heading"><h2 id="dialogs-tabs-heading">Три вкладки чатов</h2><button id="dialogs-refresh-tabs" class="link-button">Обновить список вкладок</button></div>
-      <p class="hint">Откройте центр сообщений каждой площадки в своём аккаунте и выберите его вкладку. Читается доступная на странице история; «непрочитано» в списке и «требует ответа» в открытой переписке — разные признаки.</p>
+
+    <section id="dialogs-monitor" class="panel dialogs-monitor" aria-labelledby="dialogs-tabs-heading">
+      <div class="panel-heading"><div><div class="eyebrow">ШАГ 3</div><h2 id="dialogs-tabs-heading">Мониторинг площадок</h2></div><button id="dialogs-refresh-tabs" class="link-button" type="button">Обновить список вкладок</button></div>
+      <p class="hint">Откройте центры сообщений в своём аккаунте и выберите их вкладки. Во время мониторинга держите Chrome и локальный обработчик запущенными.</p>
       <div id="dialogs-bindings" class="dialogs-platforms"></div>
+      <div class="dialogs-mode" id="dialogs-mode"><div class="panel-heading"><div><h3 id="dialogs-mode-label">С вашим одобрением</h3><p id="dialogs-folder-send-note" class="hint" role="status">Claude готовит черновики. Вы проверяете текст и нажимаете «Отправить».</p></div><label class="check dialogs-mode-check"><input id="dialogs-folder-send" type="checkbox" disabled> Отправлять ответы автоматически</label></div><p id="dialogs-monitor-note" class="hint" role="status"></p></div>
+      <div class="actions"><button id="dialogs-start" class="button primary" type="button" disabled>Начать мониторинг</button><button id="dialogs-stop" class="button secondary" type="button" disabled>Остановить мониторинг</button><button id="dialogs-scan" class="button secondary" type="button" disabled>Проверить сейчас</button></div>
+      <details class="dialogs-inline-details"><summary>Как читаются сообщения</summary><label class="check"><input id="dialogs-read-unread" type="checkbox" checked> Открывать диалоги с новыми сообщениями для чтения</label><p class="hint">Открытие переписки может снять отметку «непрочитано». При первом проходе также проверяются диалоги с доступным превью. Настройка применяется при запуске мониторинга. Если история или автор сообщения не распознаны, ответ приостанавливается до проверки.</p></details>
     </section>
-    <section class="panel">
-      <div class="panel-heading"><h2>Переписки</h2><span id="dialogs-count" class="tiny-tag">0</span></div>
-      <div class="dialogs-filters"><div><label for="dialogs-filter">Показать</label><select id="dialogs-filter"><option value="all">Все переписки</option><option value="unanswered">Требуют ответа</option><option value="unread">Непрочитанные по данным площадки</option><option value="takeover">Под моим управлением</option><option value="paused">На паузе</option></select></div><div><label for="dialogs-search">Найти поставщика или сообщение</label><input id="dialogs-search" type="search" placeholder="Имя поставщика, площадка или текст"></div></div>
+
+    <section id="dialogs-conversations" class="panel" aria-labelledby="dialogs-conversations-heading">
+      <div class="panel-heading"><div><div class="eyebrow">ШАГ 4</div><h2 id="dialogs-conversations-heading">Переписки и ответы</h2></div><span id="dialogs-count" class="tiny-tag">0</span></div>
+      <div class="dialogs-filters"><div><label for="dialogs-filter">Показать</label><select id="dialogs-filter"><option value="all">Все переписки</option><option value="unanswered">Требуют ответа</option><option value="unread">Непрочитанные на площадке</option><option value="takeover">Под моим управлением</option><option value="paused">На паузе</option></select></div><div><label for="dialogs-search">Найти поставщика или сообщение</label><input id="dialogs-search" type="search" placeholder="Имя, площадка или текст"></div></div>
       <div class="dialogs-workspace">
         <div><div id="dialogs-list" class="dialogs-list" aria-label="Список переписок"></div><p id="dialogs-empty" class="hint">Загрузка переписок…</p></div>
         <section id="dialogs-detail" class="dialogs-detail" hidden aria-label="Выбранная переписка">
-          <div class="panel-heading"><div><h3 id="dialogs-supplier"></h3><p id="dialogs-conversation-status" class="hint"></p></div><a id="dialogs-source" target="_blank" rel="noopener noreferrer" hidden>Открыть страницу ↗</a></div>
-          <div class="actions"><button id="dialogs-takeover" class="button secondary">Взять разговор на себя</button><button id="dialogs-mute" class="button secondary">Пауза для этой переписки</button></div>
-          <p id="dialogs-history-note" class="hint"></p>
-          <p id="dialogs-reader-detail" class="hint" role="status" hidden></p>
-          <p id="dialogs-coverage" class="hint" hidden></p>
+          <div class="panel-heading"><div><h3 id="dialogs-supplier"></h3><p id="dialogs-conversation-status" class="hint"></p></div><a id="dialogs-source" target="_blank" rel="noopener noreferrer" hidden>Открыть чат ↗</a></div>
+          <div class="actions"><button id="dialogs-takeover" class="button secondary" type="button">Взять разговор на себя</button><button id="dialogs-mute" class="button secondary" type="button">Пауза переписки</button></div>
+          <p id="dialogs-history-note" class="hint"></p><p id="dialogs-reader-detail" class="hint" role="status" hidden></p><p id="dialogs-coverage" class="hint" hidden></p>
           <div id="dialogs-history" class="dialogs-history" aria-label="История переписки"></div>
           <div class="dialogs-draft">
-            <div class="panel-heading"><h3>Черновик ответа</h3><div class="actions"><button id="dialogs-generate" class="button secondary" disabled>Подготовить ответ через API</button><button id="dialogs-export-draft" class="button secondary" disabled>Промпт для Claude · TXT</button><button id="dialogs-folder-draft" class="button secondary" disabled>Ответ через папку Claude</button></div></div>
-            <p id="dialogs-generate-hint" class="hint"></p><p id="dialogs-draft-reason" class="hint" hidden></p>
-            <p id="dialogs-auto-status" class="hint" role="status" hidden></p>
-            <label for="dialogs-draft-text">Текст для проверки и редактирования</label><textarea id="dialogs-draft-text" rows="6" maxlength="6000" placeholder="Здесь появится черновик из API. Можно вставить ответ Claude вручную, отредактировать и сохранить локально."></textarea>
+            <div class="panel-heading"><h3>Ответ поставщику</h3><button id="dialogs-folder-draft" class="button secondary" type="button" disabled>Подготовить ответ</button></div>
+            <p id="dialogs-generate-hint" class="hint"></p><p id="dialogs-draft-reason" class="hint" hidden></p><p id="dialogs-auto-status" class="hint" role="status" hidden></p>
+            <label for="dialogs-draft-text">Проверьте и при необходимости измените текст</label><textarea id="dialogs-draft-text" rows="6" maxlength="6000" placeholder="Здесь появится ответ Claude. Его можно отредактировать перед отправкой."></textarea>
             <p id="dialogs-draft-status" class="hint" aria-live="polite"></p>
-            <div class="actions"><button id="dialogs-save-draft" class="button primary" disabled>Сохранить черновик</button><button id="dialogs-discard-draft" class="link-button danger" disabled>Удалить черновик</button></div>
-            <p class="hint">Сохранение черновика не отправляет сообщение поставщику.</p>
+            <div class="actions"><button id="dialogs-send-draft" class="button primary" type="button" disabled>Отправить</button><button id="dialogs-save-draft" class="button secondary" type="button" disabled>Сохранить черновик</button><button id="dialogs-discard-draft" class="link-button danger" type="button" disabled>Удалить черновик</button></div>
+            <p id="dialogs-send-note" class="hint">Кнопка «Отправить» одобряет отправку показанного текста выбранному поставщику.</p>
           </div>
         </section>
-        <div id="dialogs-select-hint" class="dialogs-select-hint">Выберите переписку, чтобы увидеть историю и подготовить ответ.</div>
+        <div id="dialogs-select-hint" class="dialogs-select-hint">Выберите переписку, чтобы прочитать историю и проверить ответ.</div>
       </div>
     </section>
-    <section id="dialogs-prompt-panel" class="panel dialogs-prompt-panel" aria-labelledby="dialogs-prompt-heading" hidden>
-      <div class="panel-heading"><h2 id="dialogs-prompt-heading">Промпт для Claude</h2><button id="dialogs-prompt-close" class="link-button" type="button">Закрыть</button></div>
-      <p id="dialogs-prompt-note" class="hint"></p><p id="dialogs-prompt-warnings" class="hint" hidden></p>
-      <label for="dialogs-prompt-text">Готовый запрос</label><textarea id="dialogs-prompt-text" rows="12" readonly></textarea>
-      <div class="actions"><button id="dialogs-prompt-copy" class="button secondary" type="button">Скопировать промпт</button><button id="dialogs-prompt-download" class="button primary" type="button">Скачать TXT</button></div>
-      <p class="hint">Файл и буфер обмена содержат ваши материалы, а для ответа поставщику — историю выбранной переписки. Отправка в Claude выполняется вами вручную.</p>
-      <div id="dialogs-prompt-import" hidden><label for="dialogs-prompt-response">Ответ Claude с информацией о товаре (JSON)</label><textarea id="dialogs-prompt-response" rows="7" maxlength="40000" placeholder="Вставьте JSON из ответа Claude, включая keyPoints, questions и warnings."></textarea><label id="dialogs-prompt-images-label" class="check" hidden><input id="dialogs-prompt-images" type="checkbox"> Я приложил(а) в Claude все перечисленные изображения вместе с этим промптом</label><p id="dialogs-prompt-import-note" class="hint" role="status"></p><button id="dialogs-prompt-apply" class="button primary" type="button" disabled>Применить ответ Claude</button><p class="hint">После применения проверьте полученные сведения и согласуйте новую версию товара.</p></div>
-    </section>
-    <details class="panel dialogs-settings" open>
-      <summary>Задание для ИИ и подключение</summary>
-      <form id="dialogs-settings-form">
-        <label for="dialogs-brief">Дополнительное задание по закупке (необязательно)</label><textarea id="dialogs-brief" rows="4" maxlength="12000" placeholder="Дополнительные пожелания. Основные сведения о товаре и правила заполните в блоке выше."></textarea>
-        <div class="dialogs-form-grid"><div><label for="dialogs-wechat">Ваш WeChat (необязательно)</label><input id="dialogs-wechat" type="text" maxlength="256" placeholder="WeChat ID"></div><div><label for="dialogs-language">Язык ответа (необязательно)</label><input id="dialogs-language" type="text" maxlength="100" placeholder="Автоматически — язык продавца"></div></div>
-        <label for="dialogs-provider">Сервис для работы через API</label><select id="dialogs-provider"><option value="anthropic">Claude (Anthropic)</option><option value="openai">OpenAI</option></select>
-        <div class="dialogs-form-grid"><div><label id="dialogs-model-label" for="dialogs-model">Модель API</label><input id="dialogs-model" type="text" maxlength="200" autocomplete="off" placeholder="Название модели, доступной вашему API-аккаунту"></div><div><label id="dialogs-api-key-label" for="dialogs-api-key">API-ключ</label><input id="dialogs-api-key" type="password" autocomplete="off" spellcheck="false" placeholder="Введите ключ для сохранения или замены"><p id="dialogs-key-status" class="hint">Ключ не сохранён.</p><label class="check"><input id="dialogs-clear-key" type="checkbox"> Удалить сохранённый ключ выбранного сервиса</label></div></div>
-        <p class="hint">Ключ и модель сохраняются отдельно для каждого сервиса. API оплачивается по условиям вашего API-аккаунта; подписка на чат Claude не заменяет API-ключ. Ключ хранится локально в расширении и не попадает в журнал. Для ручного промпта TXT ключ не нужен. Изменение задания, WeChat или языка требует повторного согласования товара.</p>
-        <button id="dialogs-save-settings" class="button primary" type="submit" disabled>Сохранить задание и настройки</button>
-      </form>
-    </details>
-    <details class="panel"><summary>Журнал мониторинга</summary><p class="hint">Время показано в часовом поясе вашего компьютера. Журнал содержит действия и результаты проверок.</p><ol id="dialogs-events" class="dialogs-events"></ol><p id="dialogs-events-empty" class="hint">Событий пока нет.</p></details>
-    <details class="panel"><summary>Диагностика чтения страниц</summary><p class="hint">Если чат не распознаётся, можно сохранить его структуру для проверки. Диагностика ставит очередь первичных обращений на паузу; сообщения не отправляются. Файл может содержать переписку — не публикуйте его в GitHub или открытом доступе.</p><a id="dialogs-diagnostics" class="link-button" href="diagnostics.html" target="_blank" rel="noopener noreferrer">Открыть страницу диагностики ↗</a><p class="hint">Сбор начнётся только после нажатия «Сохранить диагностику» на открывшейся странице.</p></details>
-    <footer>OpenLinks · Мониторинг чатов и подготовка ответов</footer>
+
+    <details class="panel"><summary>Задания Claude</summary><div class="actions dialogs-details-actions"><button id="dialogs-folder-poll" class="button secondary" type="button" disabled>Проверить результаты</button></div><ol id="dialogs-folder-jobs" class="dialogs-folder-jobs"></ol><p id="dialogs-folder-empty" class="hint">Заданий пока нет. Подготовьте сведения о товаре или запустите мониторинг.</p></details>
+    <details class="panel"><summary>Журнал работы</summary><p class="hint">Действия, результаты и причины остановок. Время соответствует часовому поясу вашего компьютера.</p><ol id="dialogs-events" class="dialogs-events"></ol><p id="dialogs-events-empty" class="hint">Событий пока нет.</p></details>
+    <details class="panel"><summary>Диагностика чтения страниц</summary><p class="hint">Сохраните структуру чата для проверки, если история не читается. Файл может содержать переписку. Сбор приостанавливает очередь первичных обращений.</p><a id="dialogs-diagnostics" class="link-button" href="diagnostics.html" target="_blank" rel="noopener noreferrer">Открыть диагностику ↗</a></details>
+    <footer>OpenLinks · Переговоры с поставщиками через Claude</footer>
   </main><script src="dialogs-dashboard.js" type="module"></script>
 </body>
 </html>

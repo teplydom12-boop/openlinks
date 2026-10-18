@@ -18,7 +18,7 @@ const ALARM = 'openlinks-dialogs';
 const PLATFORMS = ['1688','alibaba','mic'];
 const DOMAINS = {'1688':'1688.com',alibaba:'alibaba.com',mic:'made-in-china.com'};
 const READ_TIMEOUT_MS=120000,READ_BACKOFF_MS=5*60000;
-const KNOWN_COMMANDS = new Set(['GET','LIST_TABS','BIND_TAB','UNBIND_TAB','START','STOP','SCAN','SETTINGS','CONTROL','GENERATE_DRAFT','SAVE_DRAFT','DISCARD_DRAFT','PRODUCT_SAVE','PRODUCT_EXTRACT','PRODUCT_APPROVE','AUTODRAFT','EXPORT_PRODUCT_PROMPT','EXPORT_DRAFT_PROMPT','IMPORT_PRODUCT_RESULT','FOLDER_STATUS','FOLDER_SETTINGS','FOLDER_PRODUCT','FOLDER_DRAFT','FOLDER_POLL','FOLDER_RETRY','FOLDER_CANCEL'].map(name=>'DIALOGS_'+name));
+const KNOWN_COMMANDS = new Set(['GET','LIST_TABS','BIND_TAB','UNBIND_TAB','START','STOP','SCAN','SETTINGS','CONTROL','CONTEXT_EDITING','GENERATE_DRAFT','SAVE_DRAFT','DRAFT_EDITING','SEND_DRAFT','DISCARD_DRAFT','PRODUCT_SAVE','PRODUCT_EXTRACT','PRODUCT_APPROVE','AUTODRAFT','EXPORT_PRODUCT_PROMPT','EXPORT_DRAFT_PROMPT','IMPORT_PRODUCT_RESULT','FOLDER_STATUS','FOLDER_SETTINGS','FOLDER_PRODUCT','FOLDER_DRAFT','FOLDER_POLL','FOLDER_RETRY','FOLDER_CANCEL'].map(name=>'DIALOGS_'+name));
 
 export function dialogPlatform(url) {
   try {
@@ -55,7 +55,14 @@ export function createDialogMonitor({api=globalThis.chrome, fetchImpl=globalThis
   const bridge=folderBridge || createFolderBridge({api});
   const loadFolder=async()=>normalizeFolder((await api.storage.local.get(FOLDER_KEY))[FOLDER_KEY]);
   const saveFolder=folder=>api.storage.local.set({[FOLDER_KEY]:folder});
-  const load = async () => normalizeDialogs((await api.storage.local.get(DIALOGS_KEY))[DIALOGS_KEY]);
+  const apiAutoAvailable=()=>{
+    try {return typeof api.permissions?.contains==='function'&&api.runtime.getManifest().optional_host_permissions?.some(origin=>['https://api.openai.com/*','https://api.anthropic.com/*'].includes(origin))===true;}catch{return false;}
+  };
+  const load = async () => {
+    const raw=(await api.storage.local.get(DIALOGS_KEY))[DIALOGS_KEY],state=normalizeDialogs(raw);
+    if(!apiAutoAvailable()&&state.settings.autoDraft) {state.settings.autoDraft=false;await api.storage.local.set({[DIALOGS_KEY]:state});}
+    return state;
+  };
   const save = state => api.storage.local.set({[DIALOGS_KEY]:state});
   const provider = async () => {
     const raw = (await api.storage.local.get(PROVIDER_KEY))[PROVIDER_KEY] || {};
@@ -567,6 +574,56 @@ export function createDialogMonitor({api=globalThis.chrome, fetchImpl=globalThis
     job.ack=outcome;job.ackPending=true;await saveFolder(folder);
     try {await bridge.call('ack',{id:job.id,outcome});job.ackPending=false;await saveFolder(folder);}catch{}
   }
+  async function sendContext(state,key) {
+    const item=state.conversations[key],last=item?.messages.filter(message=>message.direction==='inbound').at(-1);
+    if(!last)throw new Error('Последнее входящее сообщение не подтверждено.');
+    // One reply per incoming supplier message, even if model, buyer settings or
+    // the reviewed text change while the platform has not refreshed its DOM.
+    return folderDigest([key,last.key,last.text,last.at,(last.attachments || []).map(file=>file.sourceFingerprint)]);
+  }
+  async function guardedReply(state,folder,{request,text,source,job=null,jobEpoch}) {
+    const context=await sendContext(state,request.key),item=state.conversations[request.key];
+    const prior=folder.sendReceipts.find(receipt=>receipt.context===context&&['reserved','sent','unknown'].includes(receipt.status));
+    const legacy=folder.jobs.some(candidate=>candidate.key===request.key&&candidate.request?.fingerprint===request.fingerprint&&['sending','sent','send_unknown'].includes(candidate.status));
+    if(prior||legacy)return {status:'blocked',reason:'Для этого входящего сообщения отправка уже выполнена или её исход неизвестен. Проверьте переписку; повтор запрещён.'};
+    const textHash=await folderDigest(text);let receipt=null,outcome;
+    try {
+      outcome=await folderSender({api,now,state,request,text,enabled:true,source,shouldContinue:()=>epoch(request.key)===jobEpoch,reserve:async reservation=>{
+        if(epoch(request.key)!==jobEpoch)return {ok:false,reason:'Отправка остановлена: режим или контекст изменился.'};
+        if(typeof reserveDialogSendQuota!=='function')return {ok:false,reason:'Недоступна общая очередь лимитов отправки.'};
+        folder.sendReceipts=folder.sendReceipts.filter(entry=>entry.status!=='blocked');
+        if(folder.sendReceipts.length>=FOLDER_LIMITS.sendReceipts)return {ok:false,reason:'Журнал подтверждённых отправок заполнен. Отправка остановлена; сохранённые подтверждения не удаляются автоматически.'};
+        const jobId=job?.id || crypto.randomUUID(),quota=await reserveDialogSendQuota({...reservation,jobId});if(quota?.ok!==true)return quota;
+        receipt={id:reservation.attemptId,jobId,context,textHash,key:request.key,fingerprint:item.fingerprint,status:'reserved',at:now()};folder.sendReceipts.push(receipt);
+        if(job)finishFolderJob(folder,job,'sending','Попытка отправки зарегистрирована. Автоматический повтор запрещён.',now());
+        await saveFolder(folder);return {ok:true};
+      }});
+    } catch {outcome={status:receipt?'unknown':'blocked',reason:receipt?'Связь потеряна после регистрации отправки. Проверьте переписку; повтор запрещён.':'Не удалось подготовить отправку. Проверьте вкладку чата.'};}
+    if(receipt) {
+      receipt.status=outcome?.status==='attempted'?'sent':outcome?.status==='blocked'?'blocked':'unknown';receipt.at=now();
+      await saveFolder(folder);
+    }
+    return outcome || {status:'blocked',reason:'Отправка не выполнялась.'};
+  }
+  async function sendReviewedDraft(state,folder,message,jobEpoch) {
+    if(!state.running)throw new Error('Сначала запустите мониторинг привязанных чатов.');
+    if(typeof folderSender!=='function')throw new Error('Обработчик отправки недоступен.');
+    const validate=()=>{
+      if(epoch(message.key)!==jobEpoch)throw new Error('Отправка остановлена: режим, черновик или контекст изменился.');
+      const request=draftRequest(state,message.key),item=state.conversations[message.key];
+      if(!item?.draft || item.draft.status!=='draft' || item.draft.revision!==request.revision || item.draft.fingerprint!==request.fingerprint || item.draft.productFingerprint!==request.productFingerprint || typeof message.text!=='string' || message.text!==item.draft.text || message.revision!==request.revision || message.fingerprint!==request.fingerprint || message.productFingerprint!==request.productFingerprint)throw new Error('Черновик или задание изменились. Проверьте и сохраните актуальный ответ перед отправкой.');
+      return {request,item};
+    };
+    let {item}=validate();
+    const observed=await scan(state,item.platform),checked=validate(),source=observed.find(row=>row.platform===item.platform&&row.id===item.id&&row.active);
+    item=checked.item;
+    if(!source || source.busy || state.traversal[item.platform].pending)throw new Error('Откройте именно этот диалог и дождитесь полного чтения. Поле чата должно быть свободно.');
+    const outcome=await guardedReply(state,folder,{request:checked.request,text:message.text,source:{tabId:state.bindings[item.platform].tabId,frameId:source.frameId,documentToken:source.documentToken,sourceUrl:source.sourceUrl,replyFingerprint:source.replyFingerprint},jobEpoch});
+    const status=['attempted','unknown','deferred'].includes(outcome.status)?outcome.status:'blocked';
+    const detail=status==='attempted'?'Кнопка отправки нажата. Доставка и прочтение не проверяются.':status==='unknown'?'Исход отправки неизвестен. Проверьте переписку; повтор запрещён.':status==='deferred'?'Лимит площадки пока исчерпан. Ответ сохранён; после обновления лимита подтвердите отправку заново.':outcome.reason || 'Отправка остановлена до нажатия. Проверьте диалог.';
+    log(state,'draft_send',detail,{key:message.key,platform:item.platform,level:status==='unknown'?'warning':'info'});await save(state);
+    return {...await publicState(state),send:{status,detail,...(Number.isFinite(outcome.retryAt)?{retryAt:outcome.retryAt}:{})}};
+  }
   async function pollFolder(state,folder) {
     if(!folder.enabled)return;
     const pollEpoch=cancelEpoch;
@@ -611,12 +668,7 @@ export function createDialogMonitor({api=globalThis.chrome, fetchImpl=globalThis
         if(!awaitingLimit)acceptDraft(state,job.request,{text:result.text,reason:'Ответ Claude получен из локальной папки.'},now());
         finishFolderJob(folder,job,'accepted','Ответ сохранён как черновик.',now());await save(state);await saveFolder(folder);
         if(folder.autoSend&&folder.auto&&state.running&&approved(state)&&typeof folderSender==='function') {
-          let outcome;try {outcome=await folderSender({api,now,state,request:job.request,text:current.draft.text,enabled:true,source:{tabId:job.tabId,frameId:source.frameId,documentToken:source.documentToken,sourceUrl:source.sourceUrl,replyFingerprint:source.replyFingerprint},shouldContinue:()=>epoch(job.key)===jobEpoch,reserve:async reservation=>{
-            if(epoch(job.key)!==jobEpoch)return {ok:false,reason:'cancelled'};
-            if(typeof reserveDialogSendQuota!=='function')return {ok:false,reason:'quota_unavailable'};
-            const quota=await reserveDialogSendQuota({...reservation,jobId:job.id});if(quota?.ok!==true)return quota;
-            finishFolderJob(folder,job,'sending','Попытка отправки зарегистрирована. Автоматический повтор запрещён.',now());await saveFolder(folder);return {ok:true};
-          }});}catch {outcome={status:job.status==='sending'?'unknown':'blocked'};}
+          const outcome=await guardedReply(state,folder,{request:job.request,text:current.draft.text,source:{tabId:job.tabId,frameId:source.frameId,documentToken:source.documentToken,sourceUrl:source.sourceUrl,replyFingerprint:source.replyFingerprint},job,jobEpoch});
           const deferred=outcome?.status==='deferred'&&outcome.reserved!==true&&Number.isFinite(outcome.retryAt)&&(job.sendDeferrals || 0)<100;
           const status=deferred?'awaiting_limit':outcome?.status==='attempted'?'sent':outcome?.status==='unknown'?'send_unknown':'accepted';
           if(deferred){job.retryAt=Math.max(now()+30000,outcome.retryAt+500);job.sendDeferrals=(job.sendDeferrals || 0)+1;job.draftGuard=await folderDraftGuard(current);}
@@ -633,16 +685,24 @@ export function createDialogMonitor({api=globalThis.chrome, fetchImpl=globalThis
     if(!next.enabled){next.auto=false;next.autoSend=false;}if(!next.auto)next.autoSend=false;
     if(next.enabled&&!await api.permissions?.contains({permissions:['nativeMessaging']}))throw new Error('Разрешите подключение к локальной папке.');
     if(next.auto&&!approved(state))throw new Error('Сначала проверьте и утвердите тезисы товара.');
-    if(next.auto&&state.settings.autoDraft)throw new Error('Сначала выключите авточерновики через API, чтобы одно сообщение не обрабатывалось двумя способами.');
-    if(Object.entries(next).some(([key,value])=>folder[key]!==value)) {await folderCancelPending(folder);folder.revision++;}
+    if(next.enabled)state.settings.autoDraft=false;
+    const generationChanged=['enabled','auto','model'].some(key=>folder[key]!==next[key]);
+    const workerChanged=['enabled','model'].some(key=>folder[key]!==next[key]);
+    if(generationChanged) {await folderCancelPending(folder);folder.revision++;}
     Object.assign(folder,next);await saveFolder(folder);
-    try {await bridge.call('configure',{enabled:folder.enabled,model:folder.model});}catch {folder.status='unavailable';folder.detail='Настройки сохранены. Установите локальный мост и обработчик папки.';await saveFolder(folder);}
+    try {
+      // Switching only send approval never cancels a paid draft generation or
+      // silently resumes a worker paused for connection/auth/subscription limits.
+      if(workerChanged || message.resume===true || !folder.enabled)await bridge.call('configure',{enabled:folder.enabled,model:folder.model});
+      await folderStatus(folder);
+    }catch {folder.status='unavailable';folder.detail='Настройки сохранены. Установите локальный мост и обработчик папки.';await saveFolder(folder);}
     if(folder.enabled)await schedule();else if(!state.running)await clearAlarm();
     log(state,'folder_settings',folder.enabled?`Обработка через папку включена. ${folder.autoSend?'Автоматическая отправка разрешена для проверенных ответов.':'Ответы сохраняются черновиками.'}`:'Обработка через папку выключена.');await save(state);
   }
 
   async function toggleAuto(state,enabled) {
     if(enabled) {
+      if(!apiAutoAvailable())throw new Error('Автоматические ответы доступны через локальную папку Claude.');
       if((await loadFolder()).auto)throw new Error('Сначала выключите автоматическую обработку через папку.');
       if(!approved(state))throw new Error('Сначала проверьте и утвердите тезисы товара.');
       const config=await provider();
@@ -653,12 +713,15 @@ export function createDialogMonitor({api=globalThis.chrome, fetchImpl=globalThis
     log(state,'auto_drafts',enabled?'Авточерновики включены для новых входящих по утверждённому заданию. Отправка отключена.':'Авточерновики выключены.');
   }
 
-  async function command(message) {
+  async function command(message,commandEpoch) {
     const state=await load(),folder=await loadFolder();
-    const invalidates=['DIALOGS_STOP','DIALOGS_SETTINGS','DIALOGS_PRODUCT_SAVE','DIALOGS_PRODUCT_APPROVE','DIALOGS_IMPORT_PRODUCT_RESULT','DIALOGS_BIND_TAB','DIALOGS_UNBIND_TAB'];
+    const invalidates=['DIALOGS_STOP','DIALOGS_SETTINGS','DIALOGS_CONTEXT_EDITING','DIALOGS_PRODUCT_SAVE','DIALOGS_PRODUCT_APPROVE','DIALOGS_IMPORT_PRODUCT_RESULT','DIALOGS_BIND_TAB','DIALOGS_UNBIND_TAB'];
     if(invalidates.includes(message.type))await folderCancelPending(folder);
-    else if(['DIALOGS_CONTROL','DIALOGS_SAVE_DRAFT','DIALOGS_DISCARD_DRAFT'].includes(message.type))await folderCancelPending(folder,{key:message.key});
+    else if(['DIALOGS_CONTROL','DIALOGS_SAVE_DRAFT','DIALOGS_DRAFT_EDITING','DIALOGS_SEND_DRAFT','DIALOGS_DISCARD_DRAFT'].includes(message.type))await folderCancelPending(folder,{key:message.key});
     switch(message.type) {
+      case 'DIALOGS_SEND_DRAFT':return sendReviewedDraft(state,folder,message,commandEpoch);
+      case 'DIALOGS_DRAFT_EDITING':return publicState(state);
+      case 'DIALOGS_CONTEXT_EDITING':folder.auto=false;folder.autoSend=false;state.settings.autoDraft=false;await saveFolder(folder);await save(state);return publicState(state);
       case 'DIALOGS_FOLDER_STATUS':await folderStatus(folder);return publicState(state);
       case 'DIALOGS_FOLDER_SETTINGS':await folderSettings(state,folder,message);return publicState(state);
       case 'DIALOGS_FOLDER_PRODUCT':await enqueueFolder(state,folder,{kind:'product',message});return publicState(state);
@@ -737,6 +800,7 @@ export function createDialogMonitor({api=globalThis.chrome, fetchImpl=globalThis
       case 'DIALOGS_UNBIND_TAB': cancel();unbindDialogTab(state,platform(message.platform),now());break;
       case 'DIALOGS_START':
         if(!Object.values(state.bindings).some(binding=>Number.isInteger(binding.tabId)))throw new Error('Сначала привяжите вкладки площадок.');
+        if(folder.enabled || !apiAutoAvailable())state.settings.autoDraft=false;
         state.running=true;state.readUnread=message.readUnread===true;log(state,'monitor_started',`${state.readUnread?'Мониторинг запущен с открытием существующих непрочитанных диалогов.':'Мониторинг запущен без переключения диалогов.'} ${folder.enabled&&folder.auto?'Автоматическая обработка через папку включена.':state.settings.autoDraft?'Авточерновики включены по утверждённому заданию.':'Автоматическая подготовка ответов отключена.'} ${folder.enabled&&folder.auto&&folder.autoSend?'Автоматическая отправка разрешена после проверки контекста и общего лимита.':'Ввод и отправка сообщений отключены.'}`);await schedule();break;
       case 'DIALOGS_STOP': cancel();state.running=false;for(const name of PLATFORMS)state.traversal[name].pending=null;log(state,'monitor_stopped','Мониторинг приостановлен.');if(folder.enabled)await schedule();else await clearAlarm();break;
       case 'DIALOGS_SCAN': await scan(state,message.platform);return publicState(state);
@@ -757,7 +821,7 @@ export function createDialogMonitor({api=globalThis.chrome, fetchImpl=globalThis
           const enable=message.settings.autoDraft===true;
           if(enable&&folder.auto)throw new Error('Сначала выключите автоматическую обработку через папку.');
           setDialogSettings(state,{...message.settings,autoDraft:false},now());
-          if(enable && approved(state) && profile.apiKey && profile.model && await api.permissions?.contains({origins:[providerInfo(selected).origin]}))setDialogSettings(state,{...state.settings,autoDraft:true},now());
+          if(enable && apiAutoAvailable() && approved(state) && profile.apiKey && profile.model && await api.permissions?.contains({origins:[providerInfo(selected).origin]}))setDialogSettings(state,{...state.settings,autoDraft:true},now());
         }
         cancel();await api.storage.local.set({[PROVIDER_KEY]:next});break;
       }
@@ -766,6 +830,7 @@ export function createDialogMonitor({api=globalThis.chrome, fetchImpl=globalThis
         cancel(message.key);setConversationControl(state,message.key,patch,now());break;
       }
       case 'DIALOGS_SAVE_DRAFT': {
+        if(Object.hasOwn(message,'productFingerprint')&&message.productFingerprint!==productFingerprint(state))throw new Error('Задание по товару изменилось. Проверьте актуальный ответ перед сохранением.');
         if(message.request) {
           const item=state.conversations[message.key];
           if(!item)throw new Error('Диалог не найден.');
@@ -791,11 +856,13 @@ export function createDialogMonitor({api=globalThis.chrome, fetchImpl=globalThis
   async function handle(message,sender) {
     if(!KNOWN_COMMANDS.has(message?.type))return {ok:false,error:'Неизвестная команда диалогов.'};
     if(!isUI(sender))return {ok:false,error:'Команда доступна только в интерфейсе расширения.'};
+    if(['DIALOGS_PRODUCT_EXTRACT','DIALOGS_GENERATE_DRAFT'].includes(message.type)&&!apiAutoAvailable())return {ok:false,error:'Используйте подключённый Claude через локальную папку.'};
     if(message.type==='DIALOGS_PRODUCT_EXTRACT')return extractProduct(message);
     if(message.type==='DIALOGS_GENERATE_DRAFT')return generate(message.key);
-    if(['DIALOGS_FOLDER_CANCEL','DIALOGS_FOLDER_SETTINGS','DIALOGS_STOP','DIALOGS_SETTINGS','DIALOGS_PRODUCT_SAVE','DIALOGS_PRODUCT_APPROVE','DIALOGS_IMPORT_PRODUCT_RESULT','DIALOGS_BIND_TAB','DIALOGS_UNBIND_TAB'].includes(message.type) || (message.type==='DIALOGS_AUTODRAFT' && message.enabled!==true))cancel();
-    else if(['DIALOGS_CONTROL','DIALOGS_SAVE_DRAFT','DIALOGS_DISCARD_DRAFT'].includes(message.type))cancel(message.key);
-    try { return await exclusive(()=>command(message)); }
+    if(['DIALOGS_FOLDER_CANCEL','DIALOGS_FOLDER_SETTINGS','DIALOGS_STOP','DIALOGS_SETTINGS','DIALOGS_CONTEXT_EDITING','DIALOGS_PRODUCT_SAVE','DIALOGS_PRODUCT_APPROVE','DIALOGS_IMPORT_PRODUCT_RESULT','DIALOGS_BIND_TAB','DIALOGS_UNBIND_TAB'].includes(message.type) || (message.type==='DIALOGS_AUTODRAFT' && message.enabled!==true))cancel();
+    else if(['DIALOGS_CONTROL','DIALOGS_SAVE_DRAFT','DIALOGS_DRAFT_EDITING','DIALOGS_SEND_DRAFT','DIALOGS_DISCARD_DRAFT'].includes(message.type))cancel(message.key);
+    const commandEpoch=epoch(message.key);
+    try { return await exclusive(()=>command(message,commandEpoch)); }
     catch(error) { return {ok:false,error:error instanceof Error && /^[А-ЯЁ]/.test(error.message)?error.message:'Не удалось выполнить команду диалогов. Проверьте выбранную вкладку и настройки.'}; }
   }
   const onAlarm=async alarm=>{

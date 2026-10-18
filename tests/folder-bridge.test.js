@@ -7,7 +7,14 @@ test('folder settings start off and public status never exposes request, prompt 
   const empty=normalizeFolder();assert.equal(empty.enabled,false);assert.equal(empty.auto,false);assert.equal(empty.autoSend,false);
   const state=normalizeFolder({jobs:[job()],model:'sonnet'}),value=publicFolder(state);
   assert.equal(state.jobs.length,1);assert.equal(value.jobs[0].id,id);assert.equal(JSON.stringify(value).includes('PRIVATE'),false);assert.equal('request' in value.jobs[0],false);assert.equal('prompt' in state.jobs[0],false);
-  assert.equal(normalizeFolder({model:'--dangerous'}).model,'sonnet');assert.throws(()=>folderModel('sonnet; rm x'));assert.equal(folderModel('claude-sonnet-4-6'),'claude-sonnet-4-6');
+  assert.equal(empty.model,'haiku');assert.equal(folderModel(),'haiku');assert.equal(normalizeFolder({model:'--dangerous'}).model,'haiku');assert.equal(normalizeFolder({model:'sonnet'}).model,'sonnet');assert.throws(()=>folderModel('sonnet; rm x'));assert.equal(folderModel('claude-sonnet-4-6'),'claude-sonnet-4-6');
+});
+test('durable reply receipts survive restart without exposing private text hashes or reopening unknown attempts',()=>{
+  const receipt={id,jobId:'2fb5a305-cdea-4364-93fb-86f5108664c2',context:'b'.repeat(64),textHash:'c'.repeat(64),key:'1688:shop',fingerprint:'current-message',status:'reserved',at:200,text:'PRIVATE'};
+  const state=normalizeFolder({sendReceipts:[receipt,{...receipt,id:'invalid'}],model:'claude-haiku-4-5'}),value=publicFolder(state);
+  assert.equal(state.model,'claude-haiku-4-5');assert.equal(state.sendReceipts.length,1);assert.equal(state.sendReceipts[0].status,'unknown');assert.equal(state.sendReceipts[0].context,receipt.context);
+  assert.deepEqual(value.sendReceipts,[{key:'1688:shop',fingerprint:'current-message',status:'unknown',at:200}]);assert.equal(JSON.stringify(value).includes('PRIVATE'),false);assert.equal(JSON.stringify(value).includes(receipt.textHash),false);
+  assert.equal(normalizeFolder({sendReceipts:Array.from({length:FOLDER_LIMITS.sendReceipts+1},()=>receipt)}).sendReceipts.length,FOLDER_LIMITS.sendReceipts);
 });
 test('native transport is permission gated, fixed-host, bounded and uses action envelope',async()=>{
   let calls=0,allowed=false,last;

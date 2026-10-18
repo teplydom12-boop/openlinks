@@ -16,7 +16,7 @@ function harness({attachmentResolver,folderSender,reserveDialogSendQuota,reorder
   const replies=new Map([[1,snapshot()],[2,snapshot('alibaba')],[3,snapshot('mic')]]);
   const frameLists=new Map(),images=new Map();let reads=0,fetches=0,allowed=true,time=1000000,openAction=async message=>({ok:true,openedId:message.conversationId}),revealAction=async message=>({ok:true,revealedId:message.conversationId}),fetchAction=async()=>new Response(JSON.stringify({choices:[{message:{content:'We need 100 units. Could you share your WeChat?'}}]}));
   const listeners=()=>({list:[],addListener(fn){this.list.push(fn);}});
-  const api={runtime:{id:'test',getURL:path=>'chrome-extension://test/'+path,onMessage:listeners(),onStartup:listeners(),onInstalled:listeners()},
+  const api={runtime:{id:'test',getURL:path=>'chrome-extension://test/'+path,getManifest:()=>({optional_host_permissions:['https://api.openai.com/*','https://api.anthropic.com/*']}),onMessage:listeners(),onStartup:listeners(),onInstalled:listeners()},
     storage:{local:{get:async name=>{reads++;return {[name]:structuredClone(storage[name])};},set:async data=>Object.assign(storage,reorderStorage?sortedJSON(structuredClone(data)):structuredClone(data)),setAccessLevel:async value=>calls.push({access:value})}},
     tabs:{get:async id=>{if(!tabs.has(id))throw new Error('No tab');return structuredClone(tabs.get(id));},query:async()=>[...tabs.values()],
       sendMessage:async(id,message,options)=>{calls.push({id,...structuredClone(message),frameId:options.frameId});if(message.type==='DIALOGS_OPEN_CONVERSATION')return openAction(message,id);if(message.type==='DIALOGS_REVEAL_LATEST')return revealAction(message,id);const value=replies.get(`${id}:${options.frameId}`) || replies.get(id);return typeof value==='function'?value(message):structuredClone(value);},onUpdated:listeners(),onRemoved:listeners()},
@@ -707,6 +707,126 @@ test('folder send requires separate opt-in and durable quota reservation; uncert
 });
 test('folder sends stay off in draft mode even when the worker returns a ready answer',async()=>{
   let sends=0;const h=harness({folderSender:async()=>{sends++;return {status:'attempted'};}}),host=await folderReady(h,{auto:true});await h.command('START');await poll(h);host.done();await poll(h);assert.equal(sends,0);assert.equal((await h.command('GET')).folder.jobs[0].status,'accepted');
+});
+const reviewedPayload=(response,selected=key)=>{
+  const item=response.state.conversations[selected],draft=item.draft;
+  return {key:selected,text:draft.text,revision:draft.revision,fingerprint:draft.fingerprint,productFingerprint:draft.productFingerprint};
+};
+async function reviewedReady(h,text='We need 100 units. Please quote the lead time.',selected=key) {
+  await ready(h);await h.command('START');const state=(await h.command('GET')).state,item=state.conversations[selected];
+  const saved=await h.command('SAVE_DRAFT',{key:selected,text,revision:item.revision,fingerprint:item.fingerprint,productFingerprint:state.product.fingerprint});assert.equal(saved.ok,true,saved.error);return reviewedPayload(saved,selected);
+}
+async function realManualFixture({quota=async()=>({ok:true}),send=async()=>({clicked:true})}={}) {
+  const calls=[],h=harness({reserveDialogSendQuota:quota});await ready(h);await h.command('BIND_TAB',{platform:'alibaba',tabId:2});h.replies.get(2).conversations[0].replyFingerprint='exact-reply-2';await h.command('SCAN',{platform:'alibaba'});await h.command('START');
+  const selected=conversationKey('alibaba','supplier-1'),before=await h.command('GET'),item=before.state.conversations[selected];
+  const saved=await h.command('SAVE_DRAFT',{key:selected,text:'We need 100 units. Please confirm 220 V.',revision:item.revision,fingerprint:item.fingerprint,productFingerprint:before.productFingerprint});assert.equal(saved.ok,true,saved.error);
+  const native=h.api.tabs.sendMessage;h.api.tabs.sendMessage=async(tabId,message,options)=>{
+    if(['PREPARE','SEND'].includes(message.type)) {
+      calls.push(message);assert.equal(tabId,2);assert.equal(options.frameId,0);assert.equal(h.storage.openlinksClaudeFolder.sendReceipts.at(-1).status,'reserved');
+      if(message.type==='PREPARE')return {ok:true,pageUrl:urls.alibaba};return send(message);
+    }
+    return native(tabId,message,options);
+  };
+  return {h,calls,selected,payload:reviewedPayload(saved,selected)};
+}
+test('reviewed manual Send uses the guarded sender and reserves before editor actions with auto-send off',async()=>{
+  const reservations=[],{h,calls,payload}=await realManualFixture({quota:async value=>{reservations.push(value);return {ok:true};}});
+  const reply=await h.command('SEND_DRAFT',payload);assert.equal(reply.ok,true,reply.error);assert.equal(reply.send.status,'attempted');assert.deepEqual(calls.map(call=>call.type),['PREPARE','SEND']);assert.equal(calls[1].message,payload.text);
+  assert.equal(reply.folder.autoSend,false);assert.equal(reply.folder.sendReceipts[0].status,'sent');assert.equal(reply.folder.sendReceipts[0].key,payload.key);assert.equal(reservations.length,1);assert.match(reservations[0].jobId,/^[a-f\d-]{36}$/);
+  assert.equal(JSON.stringify(h.storage.openlinksClaudeFolder).includes(payload.text),false);
+  const duplicate=await h.command('SEND_DRAFT',payload);assert.equal(duplicate.send.status,'blocked');assert.equal(calls.length,2);assert.equal(reservations.length,1);assert.equal(h.fetches,0);
+});
+test('manual quota deferral never fills or clicks and requires a new explicit confirmation',async()=>{
+  let available=false;const {h,calls,payload}=await realManualFixture({quota:async()=>available?{ok:true}:{ok:false,retryAt:2000000,reason:'Quota exhausted'}});
+  const first=await h.command('SEND_DRAFT',payload);assert.equal(first.send.status,'deferred');assert.equal(first.send.retryAt,2000000);assert.equal(calls.length,0);assert.equal(first.folder.sendReceipts.length,0);
+  available=true;h.advanceTime(2000000);await poll(h);assert.equal(calls.length,0);
+  const second=await h.command('SEND_DRAFT',payload);assert.equal(second.send.status,'attempted');assert.equal(calls.length,2);
+});
+test('manual uncertain and persisted reserved outcomes block duplicates after worker recreation and text edits',async()=>{
+  for(const reserved of [false,true]) {
+    const {h,calls,payload}=await realManualFixture({send:async()=>{throw new Error('Lost acknowledgement');}});
+    const first=await h.command('SEND_DRAFT',payload);assert.equal(first.send.status,'unknown');assert.equal(calls.length,2);
+    if(reserved)h.storage.openlinksClaudeFolder.sendReceipts[0].status='reserved';
+    const recreated=createDialogMonitor({api:h.api,now:()=>h.time,reserveDialogSendQuota:async()=>({ok:true})});
+    const edited=await recreated.handle({type:'DIALOGS_SAVE_DRAFT',...payload,text:payload.text+' Please reply.'},ui);assert.equal(edited.ok,true,edited.error);
+    const duplicate=await recreated.handle({type:'DIALOGS_SEND_DRAFT',...reviewedPayload(edited,payload.key)},ui);assert.equal(duplicate.send.status,'blocked');assert.equal(duplicate.folder.sendReceipts[0].status,'unknown');assert.equal(calls.length,2);
+  }
+});
+test('manual review requires exact saved text and current draft metadata, even with fresh requested history',async()=>{
+  for(const change of ['text','revision','fingerprint','product','new-inbound','stored-metadata','inactive','busy','stopped']) {
+    const {h,calls,payload,selected}=await realManualFixture();let request={...payload};
+    if(change==='text')request.text+=' Edited only in another UI';
+    if(change==='revision')request.revision++;
+    if(change==='fingerprint')request.fingerprint='other';
+    if(change==='product')request.productFingerprint='other';
+    if(change==='stored-metadata')h.storage.openlinksDialogs.conversations[selected].draft.revision++;
+    if(change==='inactive')h.replies.get(2).conversations[0].active=false;
+    if(change==='busy')h.replies.get(2).busy={hasDraft:true};
+    if(change==='stopped')await h.command('STOP');
+    if(change==='new-inbound') {h.replies.get(2).conversations[0].messages.push({id:'new',direction:'inbound',text:'Quantity changed?'});const fresh=await h.command('SCAN',{platform:'alibaba'});request={...request,revision:fresh.state.conversations[selected].revision,fingerprint:fresh.state.conversations[selected].fingerprint};}
+    const reply=await h.command('SEND_DRAFT',request);assert.equal(reply.ok,false,change);assert.equal(calls.length,0,change);
+  }
+  const {h,calls,payload,selected}=await realManualFixture();h.replies.get(2).conversations[0].messages.push({id:'new',direction:'inbound',text:'Quantity changed?'});const fresh=await h.command('SCAN',{platform:'alibaba'}),item=fresh.state.conversations[selected];
+  const saved=await h.command('SAVE_DRAFT',{...payload,revision:item.revision,fingerprint:item.fingerprint});assert.equal(saved.ok,true,saved.error);assert.equal((await h.command('SEND_DRAFT',reviewedPayload(saved,selected))).send.status,'attempted');assert.equal(calls.length,2);
+});
+test('STOP, unsaved review or context edits and send-mode changes during quota wait cancel before editor actions',async()=>{
+  for(const change of ['STOP','DRAFT_EDITING','CONTEXT_EDITING','FOLDER_SETTINGS']) {
+    const entered=deferred(),release=deferred();const {h,calls,payload}=await realManualFixture({quota:async()=>{entered.resolve();await release.promise;return {ok:true};}});
+    const pending=h.command('SEND_DRAFT',payload);await entered.promise;
+    const cancellation=h.command(change,change==='DRAFT_EDITING'?{key:payload.key}:change==='FOLDER_SETTINGS'?{enabled:false,autoSend:false}:{});release.resolve();
+    const [reply]=await Promise.all([pending,cancellation]);assert.equal(reply.send.status,'blocked',change);assert.equal(calls.length,0,change);assert.equal((await h.command('GET')).folder.sendReceipts[0].status,'blocked');
+    if(change==='DRAFT_EDITING'){const item=(await h.command('GET')).state.conversations[payload.key];assert.equal(item.takeover,false);assert.equal(item.paused,false);assert.equal(item.draft.text,payload.text);}
+    if(change==='CONTEXT_EDITING'){const current=await h.command('GET');assert.equal(current.folder.auto,false);assert.equal(current.folder.autoSend,false);assert.ok(current.state.product.approval);assert.equal(current.state.conversations[payload.key].draft.text,payload.text);}
+  }
+});
+test('known refusal before click remains retryable with a new explicit review',async()=>{
+  let refuse=true;const {h,calls,payload}=await realManualFixture({send:async()=>refuse?{clicked:false,reason:'Not ready'}:{clicked:true}});
+  assert.equal((await h.command('SEND_DRAFT',payload)).send.status,'blocked');assert.equal((await h.command('GET')).folder.sendReceipts[0].status,'blocked');
+  refuse=false;assert.equal((await h.command('SEND_DRAFT',payload)).send.status,'attempted');assert.equal(calls.filter(call=>call.type==='SEND').length,2);assert.equal((await h.command('GET')).folder.sendReceipts.length,1);
+});
+test('automatic and reviewed sends share durable deduplication for the same inbound supplier message',async()=>{
+  let sends=0;const h=harness({folderSender:async options=>{sends++;const result=await options.reserve({attemptId:crypto.randomUUID(),platform:'1688'});assert.equal(result.ok,true);return {status:'attempted'};},reserveDialogSendQuota:async()=>({ok:true})}),host=await folderReady(h,{auto:true,autoSend:true});
+  await h.command('START');await poll(h);host.done();await poll(h);const sent=await h.command('GET');assert.equal(sent.folder.sendReceipts[0].status,'sent');
+  assert.equal((await h.command('SEND_DRAFT',reviewedPayload(sent))).send.status,'blocked');assert.equal(sends,1);
+  await h.command('DISCARD_DRAFT',{key});await h.command('FOLDER_SETTINGS',{model:'sonnet',enabled:true,auto:true,autoSend:true});await poll(h);assert.equal(host.jobs.size,2);host.done('Reworded reply',[...host.jobs.values()].at(-1));await poll(h);assert.equal(sends,1);assert.equal((await h.command('GET')).folder.jobs.at(-1).status,'accepted');
+});
+test('send-only checkbox changes preserve paid generation and continue collecting review drafts',async()=>{
+  let sends=0;const h=harness({folderSender:async()=>{sends++;return {status:'attempted'};}}),host=await folderReady(h,{auto:true,autoSend:true});await h.command('START');await poll(h);
+  const id=host.first.id,revision=h.storage.openlinksClaudeFolder.revision,configureCalls=host.calls.filter(call=>call.action==='configure').length;
+  const off=await h.command('FOLDER_SETTINGS',{enabled:true,auto:true,autoSend:false});assert.equal(off.folder.jobs[0].id,id);assert.equal(off.folder.jobs[0].status,'queued');assert.equal(h.storage.openlinksClaudeFolder.revision,revision);assert.equal(host.calls.filter(call=>call.action==='configure').length,configureCalls);
+  host.done();await poll(h);const first=await h.command('GET');assert.equal(first.folder.jobs[0].status,'accepted');assert.equal(first.state.conversations[key].draft.text,'Could you quote 100 units?');assert.equal(sends,0);
+  await h.command('FOLDER_SETTINGS',{enabled:true,auto:true,autoSend:true});await poll(h);assert.equal(sends,0,'Enabling auto-send must not transmit a previously reviewed draft');await h.command('FOLDER_SETTINGS',{enabled:true,auto:true,autoSend:false});
+  h.replies.get(1).conversations[0].messages.push({id:'next-inbound',direction:'inbound',text:'Do you need delivery?'});await poll(h);assert.equal(host.jobs.size,2);host.done('Please quote delivery.',[...host.jobs.values()].at(-1));await poll(h);assert.equal((await h.command('GET')).state.conversations[key].draft.text,'Please quote delivery.');assert.equal(sends,0);
+});
+test('explicit resume reconfigures an unchanged paused worker but send checkbox changes do not',async()=>{
+  const h=harness(),host=await folderReady(h,{auto:true,autoSend:false});let paused=true;const native=h.api.runtime.sendNativeMessage;
+  h.api.runtime.sendNativeMessage=async(name,message)=>{
+    if(message.action==='status')return {ok:true,protocol:1,folder:'C:\\Jobs',worker:{running:true,status:paused?'paused':'idle',pauseReason:paused?'offline':''},claude:{available:true}};
+    if(message.action==='configure')paused=false;
+    return native(name,message);
+  };
+  const before=host.calls.filter(call=>call.action==='configure').length;
+  const toggled=await h.command('FOLDER_SETTINGS',{enabled:true,auto:true,autoSend:true,model:'haiku'});assert.equal(toggled.folder.status,'paused');assert.equal(host.calls.filter(call=>call.action==='configure').length,before);
+  const editing=await h.command('FOLDER_SETTINGS',{enabled:true,auto:false,autoSend:false,model:'haiku'});assert.equal(editing.folder.status,'paused');assert.equal(host.calls.filter(call=>call.action==='configure').length,before);
+  const resumed=await h.command('FOLDER_SETTINGS',{enabled:true,auto:true,autoSend:true,model:'haiku',resume:true});assert.equal(resumed.folder.status,'ready');assert.equal(resumed.folder.worker.status,'idle');assert.equal(host.calls.filter(call=>call.action==='configure').length,before+1);
+});
+test('Claude-only manifest disables persisted API automation and rejects legacy API generation',async()=>{
+  const manifest=JSON.parse(await readFile(new URL('../extension/manifest.json',import.meta.url),'utf8'));
+  for(const surface of ['current-manifest','missing-manifest','missing-permissions']) {
+    const h=harness();await ready(h);h.storage.openlinksDialogs.settings.autoDraft=true;
+    if(surface==='current-manifest')h.api.runtime.getManifest=()=>manifest;
+    if(surface==='missing-manifest')delete h.api.runtime.getManifest;
+    if(surface==='missing-permissions')delete h.api.permissions;
+    const current=await h.command('GET');assert.equal(current.state.settings.autoDraft,false,surface);assert.equal(h.storage.openlinksDialogs.settings.autoDraft,false);
+    await h.command('START');await h.command('SCAN');await poll(h);assert.equal(h.fetches,0,surface);
+    assert.equal((await h.command('AUTODRAFT',{enabled:true})).ok,false);assert.equal((await h.command('GENERATE_DRAFT',{key})).ok,false);assert.equal((await h.command('PRODUCT_EXTRACT')).ok,false);assert.equal(h.fetches,0);
+    assert.equal((await h.command('SETTINGS',{settings:{...current.state.settings,autoDraft:true}})).state.settings.autoDraft,false);
+  }
+});
+test('marketplace pages cannot approve or cancel reviewed sends',async()=>{
+  const h=harness(),payload=await reviewedReady(h),before=h.reads;
+  for(const type of ['SEND_DRAFT','DRAFT_EDITING','CONTEXT_EDITING'])assert.equal((await h.command(type,payload,{id:'test',url:urls['1688']})).ok,false);
+  assert.equal(h.reads,before);
 });
 test('folder jobs persist across service-worker recreation and startup revokes automatic sending authority',async()=>{
   const h=harness(),host=await folderReady(h,{auto:true,autoSend:true});await h.command('FOLDER_DRAFT',{key});host.done();

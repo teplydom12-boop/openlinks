@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
   "name": "OpenLinks — поставщики",
-  "version": "0.14.1",
-  "description": "Чаты поставщиков, Claude через папку и подписку, API, TXT, черновики и включаемые автоматические ответы.",
+  "version": "0.15.0",
+  "description": "Диалоги с поставщиками через Claude: согласование товара, мониторинг трёх площадок, проверка ответов или автоматическая отправка.",
   "permissions": [
     "storage",
     "alarms",
@@ -47,10 +47,6 @@
   "content_security_policy": {
     "extension_pages": "script-src 'self'; object-src 'none'"
   },
-  "optional_host_permissions": [
-    "https://api.openai.com/*",
-    "https://api.anthropic.com/*"
-  ],
   "minimum_chrome_version": "120",
   "optional_permissions": [
     "nativeMessaging"
