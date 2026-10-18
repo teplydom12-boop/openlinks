@@ -29,10 +29,11 @@ HARNESS = r"""
 (() => {
   const now=Date.UTC(2026,9,18,1,10),listeners=[];
   let state=null,core=null,ai={provider:'openai',keyStored:false,model:'',providers:{openai:{keyStored:false,model:''},anthropic:{keyStored:false,model:''}}};
+  let folder={enabled:false,auto:false,autoSend:false,model:'sonnet',status:'disabled',detail:'',folder:'',worker:{running:false},claude:{available:true},jobs:[]};
   const coreModule=()=>import('/extension/lib/dialogs.js');
-  window.calls=[];window.permissionCalls=[];window.allowPermission=true;window.failGet=false;
+  window.calls=[];window.permissionCalls=[];window.allowPermission=true;window.failGet=false;window.failFolder=false;
   const tabs=[{id:11,platform:'1688',title:'1688 chat',url:'https://air.1688.com/chat/'},{id:22,platform:'alibaba',title:'Alibaba messages',url:'https://message.alibaba.com/'},{id:33,platform:'mic',title:'Made-in-China messages',url:'https://webim.made-in-china.com/'}];
-  const publicState=()=>({ok:true,state:structuredClone(state),ai:structuredClone(ai),productFingerprint:core.productFingerprint(state)});
+  const publicState=()=>({ok:true,state:structuredClone(state),ai:structuredClone(ai),folder:structuredClone(folder),productFingerprint:core.productFingerprint(state)});
   window.chrome={storage:{onChanged:{addListener:f=>listeners.push(f)}},permissions:{request:async data=>{permissionCalls.push(data);return allowPermission;}},runtime:{sendMessage:async message=>{
     calls.push(structuredClone(message));const t=message.type;core=await coreModule();state??=core.initialDialogs();
     try {
@@ -55,6 +56,13 @@ HARNESS = r"""
     else if(t==='DIALOGS_SAVE_DRAFT'){const request=message.request||core.draftRequest(state,message.key);core.buildDraftPrompt(state,request);if(request.revision!==message.revision||request.fingerprint!==message.fingerprint)return {ok:false,error:'Переписка изменилась'};core.acceptDraft(state,request,{text:message.text},now);}
     else if(t==='DIALOGS_DISCARD_DRAFT')state.conversations[message.key].draft=null;
     else if(t==='DIALOGS_GENERATE_DRAFT')core.acceptDraft(state,core.draftRequest(state,message.key),{text:'Could you confirm the minimum order?',reason:'Нужно уточнить MOQ.'},now);
+    else if(t==='DIALOGS_FOLDER_STATUS')return publicState();
+    else if(t==='DIALOGS_FOLDER_SETTINGS'){if(failFolder)throw new Error('Локальный модуль не найден. Установите обработчик Claude Code.');for(const key of ['enabled','auto','autoSend','model'])if(Object.hasOwn(message,key))folder[key]=message[key];if(!folder.enabled){folder.status='paused';folder.autoSend=false;for(const job of folder.jobs)if(['queued','running'].includes(job.status))job.status='cancelled';}else {folder.status='offline';folder.detail='Claude недоступен: задания ждут подключения к интернету.';folder.folder='C:\\Users\\Test\\Desktop\\OpenLinks Claude';folder.worker={running:true,heartbeat:now,status:'offline'};}}
+    else if(t==='DIALOGS_FOLDER_PRODUCT'){if(!folder.enabled)throw new Error('Папка выключена');if(message.revision!==state.product.revision||message.fingerprint!==core.productFingerprint(state))throw new Error('Версия товара изменилась');folder.jobs.push({id:'job-product-'+folder.jobs.length,kind:'product',status:'queued',at:now});}
+    else if(t==='DIALOGS_FOLDER_DRAFT'){if(!folder.enabled)throw new Error('Папка выключена');core.buildDraftPrompt(state,core.draftRequest(state,message.key));folder.jobs.push({id:'job-draft-'+folder.jobs.length,kind:'draft',key:message.key,status:'queued',at:now});}
+    else if(t==='DIALOGS_FOLDER_POLL')return publicState();
+    else if(t==='DIALOGS_FOLDER_RETRY')folder.jobs.find(job=>job.id===message.id).status='queued';
+    else if(t==='DIALOGS_FOLDER_CANCEL')folder.jobs.find(job=>job.id===message.id).status='cancelled';
     else return {ok:false,error:'Unknown test action '+t};
     return publicState();
     } catch(error) {return {ok:false,error:error.message};}
@@ -66,6 +74,8 @@ HARNESS = r"""
   window.changeProduct=patch=>{core.saveProduct(state,patch,now);announce();};
   window.dialogAI=()=>structuredClone(ai);
   window.dialogState=()=>structuredClone(state);
+  window.folderState=()=>structuredClone(folder);
+  window.changeFolder=patch=>{Object.assign(folder,patch);for(const listener of listeners)listener({openlinksClaudeFolder:{newValue:structuredClone(folder)}},'local');};
   window.announceDialogs=announce;
 })();
 """
@@ -445,12 +455,14 @@ try:
         passed('manual product import rejects malformed or stale responses and requires explicit approval after applying JSON')
 
         manual.locator('#dialogs-export-draft').click()
+        expect(manual.locator('#dialogs-export-draft')).to_be_enabled()
         expect(manual.locator('#dialogs-prompt-panel')).to_be_visible()
         expect(manual.locator('#dialogs-prompt-heading')).to_contain_text('Alibaba · Supplier alpha')
         manual.locator('[data-key="1688:list"]').click()
         expect(manual.locator('#dialogs-prompt-panel')).to_be_hidden()
         manual.locator('[data-key="alibaba:alpha"]').click()
         manual.locator('#dialogs-export-draft').click()
+        expect(manual.locator('#dialogs-export-draft')).to_be_enabled()
         expect(manual.locator('#dialogs-prompt-panel')).to_be_visible()
         draft_prompt = manual.locator('#dialogs-prompt-text').input_value()
         assert 'What quantity do you need?' in draft_prompt and '20 упаковочных машин' in draft_prompt
@@ -464,6 +476,7 @@ try:
         assert saved_manual['request']['settingsFingerprint']
         assert manual.evaluate('permissionCalls.length') == 0
         manual.locator('#dialogs-export-draft').click()
+        expect(manual.locator('#dialogs-export-draft')).to_be_enabled()
         manual.locator('#dialogs-draft-text').fill('An answer prepared for the old context')
         manual.evaluate("changeProduct({rules:'New rule after export'})")
         manual.locator('#dialogs-product-approve').click()
@@ -537,6 +550,138 @@ try:
         assert manual.evaluate("calls.every(c=>!/(SEND|FILL|CLICK)/.test(c.type))")
         passed('Claude extraction, reply drafts and automatic drafting request only Anthropic permission and never send supplier messages')
         manual.close()
+
+        folder_ui = context.new_page()
+        folder_ui.on('pageerror', lambda error: errors.append(str(error)))
+        folder_ui.goto(f'http://127.0.0.1:{server.server_port}/extension/dialogs.html')
+        expect(folder_ui.locator('#dialogs-folder-status')).to_have_text('Выключено')
+        expect(folder_ui.locator('#dialogs-folder-model')).to_have_value('sonnet')
+        expect(folder_ui.locator('#dialogs-folder-auto')).not_to_be_checked()
+        expect(folder_ui.locator('#dialogs-folder-send')).not_to_be_checked()
+        expect(folder_ui.locator('#dialogs-product-folder')).to_be_disabled()
+        expect(folder_ui.locator('#dialogs-folder')).to_contain_text('одного установленного приложения Claude Desktop недостаточно')
+        expect(folder_ui.locator('#dialogs-folder')).to_contain_text('Для ответов Claude требуется интернет')
+        assert folder_ui.evaluate('permissionCalls.length') == 0
+        assert folder_ui.evaluate("calls.every(call=>!call.type.includes('FOLDER'))")
+        folder_ui.evaluate('seedDialogs()')
+        folder_ui.locator('[data-key="alibaba:alpha"]').click()
+        folder_ui.locator('#dialogs-product-card').fill('Packaging machine; 20 units required.')
+        folder_ui.locator('#dialogs-product-points').fill('20 machines, 220 V.')
+        folder_ui.evaluate('allowPermission=false')
+        folder_ui.locator('#dialogs-folder-connect').click()
+        expect(folder_ui.locator('#dialogs-feedback')).to_contain_text('Доступ к локальному модулю не разрешён')
+        assert folder_ui.evaluate("calls.filter(call=>call.type==='DIALOGS_FOLDER_SETTINGS').length") == 0
+        folder_ui.evaluate('allowPermission=true;failFolder=true')
+        folder_ui.locator('#dialogs-folder-connect').click()
+        expect(folder_ui.locator('#dialogs-feedback')).to_contain_text('Установите обработчик Claude Code')
+        folder_ui.evaluate('failFolder=false')
+        folder_ui.locator('#dialogs-folder-connect').click()
+        expect(folder_ui.locator('#dialogs-folder-status')).to_have_text('Нет соединения с Claude')
+        expect(folder_ui.locator('#dialogs-folder-path')).to_contain_text('Desktop\\OpenLinks Claude')
+        assert folder_ui.evaluate('permissionCalls.at(-1)') == {'permissions':['nativeMessaging']}
+        assert folder_ui.evaluate('folderState().autoSend') is False
+        assert folder_ui.evaluate('folderState().auto') is False
+        folder_ui.evaluate("changeFolder({status:'ready',worker:{running:true,heartbeat:1792314600000,status:'paused',pauseReason:'offline'}})")
+        expect(folder_ui.locator('#dialogs-folder-status')).to_have_text('Нет соединения с Claude')
+        expect(folder_ui.locator('#dialogs-folder-worker')).to_contain_text('Подключите интернет')
+        expect(folder_ui.locator('#dialogs-folder-connect')).to_have_text('Возобновить обработку')
+        passed('folder mode is off by default; explicit connect requests nativeMessaging and explains missing host/Claude Code/offline state')
+
+        expect(folder_ui.locator('#dialogs-product-folder')).to_be_enabled()
+        folder_ui.locator('#dialogs-product-folder').click()
+        expect(folder_ui.locator('#dialogs-folder-jobs')).to_contain_text('Сведения о товаре')
+        expect(folder_ui.locator('#dialogs-product-save')).to_be_disabled()
+        saved_product = folder_ui.evaluate("calls.filter(call=>call.type==='DIALOGS_PRODUCT_SAVE').at(-1)")
+        queued_product = folder_ui.evaluate("calls.filter(call=>call.type==='DIALOGS_FOLDER_PRODUCT').at(-1)")
+        assert saved_product['product']['cardText'] == 'Packaging machine; 20 units required.'
+        assert queued_product['revision'] == folder_ui.evaluate('dialogState().product.revision')
+        assert queued_product['fingerprint']
+        assert folder_ui.evaluate('dialogAI().keyStored') is False
+        assert folder_ui.evaluate("calls.every(call=>!['DIALOGS_PRODUCT_EXTRACT','DIALOGS_GENERATE_DRAFT','DIALOGS_SETTINGS'].includes(call.type))")
+        folder_ui.locator('#dialogs-product-approve').click()
+        expect(folder_ui.locator('#dialogs-folder-draft')).to_be_enabled()
+        expect(folder_ui.locator('#dialogs-generate')).to_be_disabled()
+        folder_ui.locator('#dialogs-folder-draft').click()
+        expect(folder_ui.locator('#dialogs-folder-jobs')).to_contain_text('Alibaba · Supplier alpha')
+        assert folder_ui.evaluate("calls.filter(call=>call.type==='DIALOGS_FOLDER_DRAFT').at(-1)") == {'type':'DIALOGS_FOLDER_DRAFT','key':'alibaba:alpha'}
+        expect(folder_ui.locator('#dialogs-folder-send-note')).to_contain_text('остаются черновиками')
+        passed('keyless folder jobs save dirty product before enqueue and bind replies to the selected approved conversation while offline')
+
+        folder_ui.evaluate("changeFolder({jobs:[{id:'failed-job',kind:'draft',key:'alibaba:alpha',status:'error',at:1792314600000,detail:'Offline <img src=x onerror=alert(1)>'},{id:'uncertain-send',kind:'draft',key:'alibaba:alpha',status:'send_unknown',at:1792314600000,detail:'Check supplier chat'},{id:'limit-job',kind:'draft',key:'alibaba:alpha',status:'awaiting_limit',at:1792314600000,detail:'Next check 10:20'}]})")
+        failed_job = folder_ui.locator('[data-job-id="failed-job"]')
+        expect(failed_job).to_contain_text('Offline <img src=x onerror=alert(1)>')
+        assert failed_job.locator('img,script').count() == 0
+        expect(folder_ui.locator('[data-job-id="uncertain-send"]')).to_contain_text('Отправка не подтверждена')
+        assert folder_ui.locator('[data-job-id="uncertain-send"] button').count() == 0
+        limited_job = folder_ui.locator('[data-job-id="limit-job"]')
+        expect(limited_job).to_contain_text('ожидание лимита площадки')
+        assert limited_job.get_by_role('button', name='Повторить', exact=True).count() == 0
+        limited_job.get_by_role('button', name='Отменить', exact=True).click()
+        expect(limited_job).to_contain_text('Отменено')
+        failed_job.get_by_role('button', name='Повторить', exact=True).click()
+        expect(failed_job).to_contain_text('В очереди')
+        failed_job.get_by_role('button', name='Отменить', exact=True).click()
+        expect(failed_job).to_contain_text('Отменено')
+        folder_ui.locator('#dialogs-folder-poll').click()
+        assert folder_ui.evaluate("calls.filter(call=>call.type==='DIALOGS_FOLDER_POLL').length") == 1
+        passed('folder queue renders safe per-job diagnostics and supports retry/cancel without retrying uncertain sends')
+
+        folder_ui.locator('#dialogs-folder-model').fill('opus')
+        folder_ui.locator('#dialogs-folder-auto').check()
+        folder_ui.evaluate('announceDialogs()')
+        expect(folder_ui.locator('#dialogs-folder-model')).to_have_value('opus')
+        expect(folder_ui.locator('#dialogs-folder-edits')).to_be_visible()
+        assert folder_ui.evaluate('folderState().auto') is False
+        folder_ui.locator('#dialogs-folder-save').click()
+        expect(folder_ui.locator('#dialogs-folder-edits')).to_be_hidden()
+        assert folder_ui.evaluate('folderState().auto') is True
+        assert folder_ui.evaluate('folderState().autoSend') is False
+        assert folder_ui.evaluate('folderState().model') == 'opus'
+        folder_ui.locator('#dialogs-folder-send').check()
+        assert folder_ui.evaluate('folderState().autoSend') is False
+        folder_ui.locator('#dialogs-folder-save').click()
+        expect(folder_ui.locator('#dialogs-folder-edits')).to_be_hidden()
+        expect(folder_ui.locator('#dialogs-folder-send-note')).to_contain_text('Автоотправка включена')
+        assert folder_ui.evaluate('folderState().autoSend') is True
+        folder_ui.locator('#dialogs-draft-text').fill('A draft I am editing personally')
+        expect(folder_ui.locator('#dialogs-folder-status')).to_have_text('Приостановлено')
+        assert folder_ui.evaluate('folderState().autoSend') is False
+        folder_ui.locator('#dialogs-discard-draft').click()
+        folder_ui.locator('#dialogs-folder-connect').click()
+        expect(folder_ui.locator('#dialogs-folder-draft')).to_be_enabled()
+        folder_ui.locator('#dialogs-folder-send').check()
+        folder_ui.locator('#dialogs-folder-save').click()
+        expect(folder_ui.locator('#dialogs-folder-edits')).to_be_hidden()
+        folder_ui.locator('#dialogs-product-rules').fill('Never promise payment or agree on final terms.')
+        expect(folder_ui.locator('#dialogs-folder-status')).to_have_text('Приостановлено')
+        expect(folder_ui.locator('#dialogs-folder-send')).not_to_be_checked()
+        expect(folder_ui.locator('#dialogs-folder-draft')).to_be_disabled()
+        assert folder_ui.evaluate('folderState().enabled') is False
+        assert folder_ui.evaluate('folderState().autoSend') is False
+        assert folder_ui.evaluate("calls.filter(call=>call.type==='DIALOGS_FOLDER_SETTINGS').at(-1)") == {'type':'DIALOGS_FOLDER_SETTINGS','enabled':False,'auto':False,'autoSend':False}
+        passed('folder auto mode and sending need separate explicit settings; unsaved product edits immediately pause processing and clear sending')
+
+        folder_ui.locator('#dialogs-product-save').click()
+        folder_ui.locator('#dialogs-product-approve').click()
+        folder_ui.locator('#dialogs-folder-connect').click()
+        expect(folder_ui.locator('#dialogs-folder-draft')).to_be_enabled()
+        folder_ui.locator('#dialogs-draft-text').fill('Keep this unsaved draft')
+        folder_ui.locator('#dialogs-folder-draft').click()
+        expect(folder_ui.locator('#dialogs-feedback')).to_contain_text('несохранённый черновик')
+        assert folder_ui.evaluate("calls.filter(call=>call.type==='DIALOGS_FOLDER_DRAFT').length") == 1
+        folder_ui.locator('#dialogs-draft-text').fill('')
+        folder_ui.locator('#dialogs-discard-draft').click()
+        folder_ui.locator('#dialogs-brief').fill('Unsaved procurement rule')
+        expect(folder_ui.locator('#dialogs-folder-status')).to_have_text('Приостановлено')
+        expect(folder_ui.locator('#dialogs-product-folder')).to_be_disabled()
+        assert folder_ui.evaluate('dialogAI().provider') == 'openai'
+        assert folder_ui.evaluate('dialogAI().keyStored') is False
+        assert folder_ui.evaluate("permissionCalls.every(call=>call.permissions?.join(',')==='nativeMessaging')")
+        assert folder_ui.evaluate("calls.every(call=>!/(SEND|FILL|CLICK)/.test(call.type))")
+        passed('folder mode preserves local draft edits, pauses on unsaved task rules and leaves API profiles untouched')
+        folder_ui.set_viewport_size({'width':600,'height':850})
+        assert folder_ui.evaluate('document.documentElement.scrollWidth <= window.innerWidth')
+        folder_ui.close()
 
         ui.set_viewport_size({'width':600,'height':850})
         assert ui.evaluate('document.documentElement.scrollWidth <= window.innerWidth')

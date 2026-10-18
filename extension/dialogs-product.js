@@ -10,7 +10,7 @@ const clone=value=>structuredClone(value);
 const element=(tag,text,className)=>{const el=document.createElement(tag);if(text!==undefined)el.textContent=text;if(className)el.className=className;return el;};
 const emptyProduct=()=>({revision:0,files:[],sourceUrl:'',cardText:'',characteristics:'',keyPoints:'',questions:'',rules:'',warnings:'',approval:null,extraction:null});
 
-export function setupProductUI({command,adopt,feedback,exportPrompt,onDirty=()=>{}}){
+export function setupProductUI({command,adopt,feedback,exportPrompt,getFolderState=()=>({enabled:false}),onDirty=()=>{}}){
   let state=null,ai={},fingerprint='',baseFingerprint='',baseRevision=0,files=[],dirty=false,settingsDirty=false;
   let operation='',autoBusy=false,pendingFiles=[],retryId=null,disablePromise=null;
   const originals=new Map(),removed=new Set(),expanded=new Set();
@@ -74,10 +74,11 @@ export function setupProductUI({command,adopt,feedback,exportPrompt,onDirty=()=>
     $('#dialogs-product-save').disabled=!!operation||!dirty;
     $('#dialogs-product-extract').disabled=!!operation||!configurationReady()||!sourceReady()||settingsDirty;
     $('#dialogs-product-export').disabled=!!operation||!sourceReady()||settingsDirty;
+    $('#dialogs-product-folder').disabled=!!operation||!sourceReady()||settingsDirty||!getFolderState().enabled;
     $('#dialogs-product-approve').disabled=!!operation||dirty||settingsDirty||!!approvalIssue||approved;
     $('#dialogs-product-approve').textContent=approved?'Версия '+saved.revision+' согласована':'Согласовать версию '+(saved.revision||0);
     $('#dialogs-product-reset').disabled=!!operation||!dirty;
-    $('#dialogs-product-extraction-state').textContent=operation==='extract'?'Извлекаю информацию…':operation==='export'?'Формирую промпт…':operation==='import'?'Применяю ответ Claude…':operation==='files'?'Читаю выбранные файлы…':operation==='save'?'Сохраняю…':operation==='approve'?'Согласование…':saved.extraction?'Информация извлечена. Проверьте её перед согласованием.':!configurationReady()?'Без API-ключа используйте «Промпт для Claude · TXT».':'';
+    $('#dialogs-product-extraction-state').textContent=operation==='folder'?'Сохраняю задание в папку…':operation==='extract'?'Извлекаю информацию…':operation==='export'?'Формирую промпт…':operation==='import'?'Применяю ответ Claude…':operation==='files'?'Читаю выбранные файлы…':operation==='save'?'Сохраняю…':operation==='approve'?'Согласование…':saved.extraction?'Информация извлечена. Проверьте её перед согласованием.':!configurationReady()?'Без API-ключа используйте промпт TXT или подключите папку Claude.':'';
     const auto=!!state.settings?.autoDraft;
     $('#dialogs-auto-draft').checked=auto;$('#dialogs-auto-draft').disabled=autoBusy||(!auto&&(!approved||!configurationReady()));
     $('#dialogs-auto-draft-state').textContent=disablePromise?'Выключаю автоматические черновики после изменения данных…':autoBusy?'Изменяю режим…':auto?(state.running?'Автоматические черновики включены для всех выбранных вкладок. Отправка сообщений отключена.':'Автоматические черновики включены. Начните мониторинг, чтобы обрабатывать новые сообщения.') :!approved?'Автоматические черновики выключены. Сохраните и согласуйте сведения о товаре.':!configurationReady()?'Автоматические черновики выключены. Укажите модель и API-ключ в настройках ниже.':'Автоматические черновики выключены. Можно готовить ответы вручную или включить этот режим.';
@@ -117,6 +118,7 @@ export function setupProductUI({command,adopt,feedback,exportPrompt,onDirty=()=>
     withOperation('extract',async()=>{if(!await permission)throw new Error('Доступ к '+provider.label+' API не разрешён. Материалы не передавались.');await save();const result=await command('PRODUCT_EXTRACT',{revision:product().revision||0,fingerprint});dirty=false;adopt(result);hydrate();feedback('Важная информация извлечена. Проверьте факты и вопросы, затем согласуйте версию.');});
   });
   $('#dialogs-product-export').addEventListener('click',()=>withOperation('export',async()=>{$('#dialogs-prompt-panel').hidden=true;if(settingsDirty)throw new Error('Сначала сохраните настройки задания.');await save();const result=await command('EXPORT_PRODUCT_PROMPT',{revision:product().revision||0,fingerprint});if(result.state)adopt(result);exportPrompt(result.promptExport,{kind:'product'});feedback('Промпт готов. Скопируйте его или скачайте TXT и перенесите в Claude.');}));
+  $('#dialogs-product-folder').addEventListener('click',()=>withOperation('folder',async()=>{if(settingsDirty)throw new Error('Сначала сохраните настройки задания.');if(!getFolderState().enabled)throw new Error('Сначала подключите папку Claude.');await save();adopt(await command('FOLDER_PRODUCT',{revision:product().revision||0,fingerprint}));feedback('Задание по товару добавлено в папку Claude. После обработки проверьте результат и согласуйте сведения.');}));
   $('#dialogs-product-approve').addEventListener('click',()=>withOperation('approve',async()=>{if(dirty||settingsDirty)throw new Error('Сначала сохраните изменения.');const result=await command('PRODUCT_APPROVE',{revision:product().revision||0,fingerprint});adopt(result);feedback('Информация согласована. Можно готовить черновики ответов.');}));
   $('#dialogs-auto-draft').addEventListener('change',async()=>{
     const enabled=$('#dialogs-auto-draft').checked;

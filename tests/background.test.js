@@ -830,3 +830,20 @@ test('tab ownership validation is serialized even while Chrome lookup is delayed
   assert.equal(replies.filter(reply=>reply.ok).length,1);
  }
 });
+
+test('dialogue replies reserve outreach quota atomically and never authorize a duplicate attempt',async()=>{
+ reset();const {reserveDialogSendQuota}=await import('../extension/background.js');
+ const jobId=crypto.randomUUID(),attemptId=crypto.randomUUID();
+ const first=await reserveDialogSendQuota({platform:'alibaba',jobId,attemptId});assert.equal(first.ok,true);
+ const replay=await reserveDialogSendQuota({platform:'alibaba',jobId,attemptId});assert.equal(replay.ok,false);assert.equal(replay.unknown,true);assert.equal(stored.slots.length,1);
+ const rest=await Promise.all(Array.from({length:4},()=>reserveDialogSendQuota({platform:'alibaba',jobId:crypto.randomUUID(),attemptId:crypto.randomUUID()})));
+ assert.equal(rest.filter(r=>r.ok).length,2);assert.equal(stored.slots.length,3);assert.ok(rest.filter(r=>!r.ok).every(r=>r.retryAt>Date.now()));assert.equal(clicks,0);
+});
+test('dialogue quota includes prior outreach sends and protects future reservations after clock rollback',async()=>{
+ reset();const {reserveDialogSendQuota}=await import('../extension/background.js');
+ stored.slots=Array.from({length:7},()=>({platform:'1688',kind:'send',at:Date.now(),jobId:crypto.randomUUID()}));
+ assert.equal((await reserveDialogSendQuota({platform:'1688',jobId:crypto.randomUUID(),attemptId:crypto.randomUUID()})).ok,false);
+ stored.slots=[{platform:'mic',kind:'send',at:Date.now()+100000,jobId:'future'}];
+ assert.equal((await reserveDialogSendQuota({platform:'mic',jobId:crypto.randomUUID(),attemptId:crypto.randomUUID()})).ok,false);
+ await assert.rejects(reserveDialogSendQuota({platform:'foreign',jobId:'invalid',attemptId:'invalid'}));assert.equal(clicks,0);
+});

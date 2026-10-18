@@ -5,6 +5,8 @@ import {
 } from './lib/dialogs.js';
 import {generateDialogDraft, extractProductKeyPoints, validateModel, validateProvider, providerInfo, parseProductKeyPoints} from './lib/dialog-ai.js';
 import {buildManualProductPrompt, buildManualDialogPrompt} from './lib/manual-prompts.js';
+import {FOLDER_KEY,FOLDER_LIMITS,normalizeFolder,publicFolder,folderModel,folderDigest,folderPending,finishFolderJob,reserveFolderJob,folderImages,renderFolderPrompt,createFolderBridge} from './lib/folder-bridge.js';
+import {sendDialogReply} from './dialog-send.js';
 import {withTabOwnership} from './lib/tab-ownership.js';
 import {loadProductImage} from './lib/product-files.js';
 import {resolveChatAttachments,pruneChatAttachmentCache} from './lib/chat-attachments.js';
@@ -15,7 +17,7 @@ const ALARM = 'openlinks-dialogs';
 const PLATFORMS = ['1688','alibaba','mic'];
 const DOMAINS = {'1688':'1688.com',alibaba:'alibaba.com',mic:'made-in-china.com'};
 const READ_TIMEOUT_MS=120000,READ_BACKOFF_MS=5*60000;
-const KNOWN_COMMANDS = new Set(['GET','LIST_TABS','BIND_TAB','UNBIND_TAB','START','STOP','SCAN','SETTINGS','CONTROL','GENERATE_DRAFT','SAVE_DRAFT','DISCARD_DRAFT','PRODUCT_SAVE','PRODUCT_EXTRACT','PRODUCT_APPROVE','AUTODRAFT','EXPORT_PRODUCT_PROMPT','EXPORT_DRAFT_PROMPT','IMPORT_PRODUCT_RESULT'].map(name=>'DIALOGS_'+name));
+const KNOWN_COMMANDS = new Set(['GET','LIST_TABS','BIND_TAB','UNBIND_TAB','START','STOP','SCAN','SETTINGS','CONTROL','GENERATE_DRAFT','SAVE_DRAFT','DISCARD_DRAFT','PRODUCT_SAVE','PRODUCT_EXTRACT','PRODUCT_APPROVE','AUTODRAFT','EXPORT_PRODUCT_PROMPT','EXPORT_DRAFT_PROMPT','IMPORT_PRODUCT_RESULT','FOLDER_STATUS','FOLDER_SETTINGS','FOLDER_PRODUCT','FOLDER_DRAFT','FOLDER_POLL','FOLDER_RETRY','FOLDER_CANCEL'].map(name=>'DIALOGS_'+name));
 
 export function dialogPlatform(url) {
   try {
@@ -38,7 +40,7 @@ const timeout = async (promise, ms = 7000) => {
   finally { clearTimeout(timer); }
 };
 
-export function createDialogMonitor({api=globalThis.chrome, fetchImpl=globalThis.fetch, now=()=>Date.now(),imageLoader=loadProductImage,attachmentResolver=resolveChatAttachments}={}) {
+export function createDialogMonitor({api=globalThis.chrome, fetchImpl=globalThis.fetch, now=()=>Date.now(),imageLoader=loadProductImage,attachmentResolver=resolveChatAttachments,folderBridge,folderSender=sendDialogReply,reserveDialogSendQuota}={}) {
   let serial = Promise.resolve();
   let providerTask=null, cancelEpoch=0;
   const keyEpochs=new Map();
@@ -49,6 +51,9 @@ export function createDialogMonitor({api=globalThis.chrome, fetchImpl=globalThis
     serial = result.catch(()=>{});
     return result;
   };
+  const bridge=folderBridge || createFolderBridge({api});
+  const loadFolder=async()=>normalizeFolder((await api.storage.local.get(FOLDER_KEY))[FOLDER_KEY]);
+  const saveFolder=folder=>api.storage.local.set({[FOLDER_KEY]:folder});
   const load = async () => normalizeDialogs((await api.storage.local.get(DIALOGS_KEY))[DIALOGS_KEY]);
   const save = state => api.storage.local.set({[DIALOGS_KEY]:state});
   const provider = async () => {
@@ -65,7 +70,7 @@ export function createDialogMonitor({api=globalThis.chrome, fetchImpl=globalThis
   const publicState = async state => {
     const config=await provider();
     const profiles=Object.fromEntries(Object.entries(config.profiles).map(([name,value])=>[name,{model:value.model,keyStored:!!value.apiKey}]));
-    return {ok:true,state,productFingerprint:productFingerprint(state),ai:{provider:config.provider,model:config.model,keyStored:!!config.apiKey,providers:profiles,busy:!!providerTask}};
+    return {ok:true,state,folder:publicFolder(await loadFolder()),productFingerprint:productFingerprint(state),ai:{provider:config.provider,model:config.model,keyStored:!!config.apiKey,providers:profiles,busy:!!providerTask}};
   };
   const cancel = key => {
     if(key)keyEpochs.set(key,(keyEpochs.get(key) || 0)+1);else {cancelEpoch++;keyEpochs.clear();}
@@ -215,7 +220,7 @@ export function createDialogMonitor({api=globalThis.chrome, fetchImpl=globalThis
     }
     const confirmed=conversations.filter(row=>{
       const item=state.conversations[conversationKey(name,row.id)];return row.identityReliable===true && item?.identityReliable===true && item.orderReliable===true && item.tailKnown===true && item.messages?.length;
-    }).map(row=>({platform:name,id:row.id,documentToken:row.documentToken,frameId:row.frameId,active:row.active===true,busy:row.selectionBusy===true}));
+    }).map(row=>({platform:name,id:row.id,documentToken:row.documentToken,frameId:row.frameId,active:row.active===true,busy:row.selectionBusy===true,replyFingerprint:row.replyFingerprint,sourceUrl:row.sourceUrl}));
     confirmed.rows=conversations;confirmed.sources=valid;
     return confirmed;
   }
@@ -230,7 +235,7 @@ export function createDialogMonitor({api=globalThis.chrome, fetchImpl=globalThis
     log(state,type,detail,{key,platform:name,level:failed?'warning':'info'});
   }
 
-  async function advanceRead(state,name,observed,allowSelect,autoConfig=null) {
+  async function advanceRead(state,name,observed,allowSelect,autoConfig=null,folderConfig=null) {
     const traversal=state.traversal[name],binding=state.bindings[name],rows=observed.rows || [],sources=observed.sources || [];
     for(const key of Object.keys(traversal.backoff))if(traversal.backoff[key]<=now())delete traversal.backoff[key];
     const keyOf=row=>{try{return conversationKey(name,row.id);}catch{return '';}};
@@ -285,13 +290,19 @@ export function createDialogMonitor({api=globalThis.chrome, fetchImpl=globalThis
       if(last?.type!=='read_busy')log(state,'read_busy','Диалоги не переключаются: в чате есть черновик или пользователь работает с ним.',{platform:name});
       return;
     }
+    const folderWanted=new Set();
+    if(folderConfig?.enabled&&folderConfig.auto&&approved(state)&&folderConfig.jobs.filter(folderPending).length<FOLDER_LIMITS.pending)for(const row of rows) {
+      const key=keyOf(row),item=controls(row);if(!key||!item||row.active||item.draft||item.paused||item.takeover)continue;
+      try {if(folderMayQueue(folderConfig,await folderSignature(state,draftRequest(state,key),folderConfig)))folderWanted.add(key);}catch{}
+    }
     const candidates=rows.filter(row=>{
       const key=keyOf(row),item=controls(row);
       if(!key || !item || row.active===true || row.identityReliable!==true || row.canSelect!==true || row.selectionBusy || item.paused || item.takeover || traversal.backoff[key]>now())return false;
       if(typeof row.selectionToken!=='string' || !row.selectionToken || row.selectionToken.length>1024 || typeof row.documentToken!=='string' || !row.documentToken || row.documentToken.length>200)return false;
       const preview=String(row.preview || '').slice(0,1000),changed=preview && preview!==traversal.seenPreviews[key];
       const attempt=item.autoDraft,retry=autoConfig && !item.draft && item.unanswered && attempt && attempt.status!=='done' && attempt.attempts<3 && (attempt.status==='pending'?now()-attempt.at>=300000:now()>=(attempt.retryAt || 0));
-      return (row.unread===true && (!preview || changed)) || (row.needsRead===true && changed) || retry;
+      const folderReady=folderConfig?.enabled && folderConfig.jobs.some(job=>job.kind==='dialog'&&job.key===key&&(job.status==='done'||job.status==='awaiting_limit'&&now()>=(job.retryAt || 0)));
+      return (row.unread===true && (!preview || changed)) || (row.needsRead===true && changed) || retry || folderReady || folderWanted.has(key);
     }).sort((left,right)=>Number(right.unread===true)-Number(left.unread===true));
     const row=candidates[0];if(!row)return;
     const key=keyOf(row),readEpoch=epoch(key);
@@ -313,15 +324,18 @@ export function createDialogMonitor({api=globalThis.chrome, fetchImpl=globalThis
     }
   }
 
-  async function scan(state, selected, {traverse=false,autoConfig=null}={}) {
-    const confirmed=[],scanEpoch=cancelEpoch;
+  async function scan(state, selected, {traverse=false,autoConfig=null,folderConfig=null}={}) {
+    const confirmed=[],scanEpoch=cancelEpoch;confirmed.folderKeys=[];
     for(const name of selected?[platform(selected)]:PLATFORMS) {
       const observed=await scanPlatform(state,name);confirmed.push(...observed);
       const localKey=autoConfig?await candidate(state,observed,autoConfig,{ignoreBusy:true}):null;
       if(!confirmed.autoKey && !providerTask)confirmed.autoKey=localKey;
       // Preserve every eligible open history until its turn in the single AI
       // queue, including while a different platform request is in flight.
-      await advanceRead(state,name,observed,traverse && !localKey && cancelEpoch===scanEpoch,autoConfig);
+      const localFolderKey=folderConfig?await folderCandidate(state,observed,folderConfig):null;
+      if(localFolderKey)confirmed.folderKeys.push(localFolderKey);
+      const folderHolding=folderConfig?.enabled && observed.some(row=>row.active && folderConfig.jobs.some(job=>job.kind==='dialog' && job.key===conversationKey(name,row.id) && folderPending(job) && now()-job.createdAt<600000));
+      await advanceRead(state,name,observed,traverse && !localKey && !localFolderKey && !folderHolding && cancelEpoch===scanEpoch,autoConfig,folderConfig);
     }
     await save(state);
     return confirmed;
@@ -451,8 +465,184 @@ export function createDialogMonitor({api=globalThis.chrome, fetchImpl=globalThis
     }
   }
 
+  const folderDraftGuard=item=>folderDigest(item?.draft || null);
+  const sameRequest=(left,right)=>JSON.stringify(left)===JSON.stringify(right);
+  const folderCurrentRequest=(request,job)=>({...request,imageKeys:job.request.imageKeys || []});
+  async function folderSignature(state,request,folder) {
+    return folderDigest(request.key?{kind:'dialog',context:await attemptFingerprint(state,request,{revision:0}),model:folder.model}:{kind:'product',request,model:folder.model});
+  }
+  function folderMayQueue(folder,signature) {
+    if(folder.completed.includes(signature))return false;
+    const prior=folder.jobs.filter(job=>job.signature===signature);
+    if(prior.some(job=>folderPending(job)||['accepted','sending','sent','send_unknown','cancelled'].includes(job.status)))return false;
+    // Failed jobs are retried explicitly. Never spend subscription quota in a loop.
+    return !prior.length || prior.every(job=>job.status==='stale')&&Math.max(...prior.map(job=>job.attempts))<FOLDER_LIMITS.attempts;
+  }
+  async function folderCandidate(state,observed,folder) {
+    if(!folder.enabled||!folder.auto||!state.running||!approved(state)||providerTask||folder.jobs.filter(folderPending).length>=FOLDER_LIMITS.pending)return null;
+    for(const row of observed) {
+      if(!row.active||row.busy||state.traversal[row.platform].pending)continue;
+      const key=conversationKey(row.platform,row.id),item=state.conversations[key];
+      if(item?.draft)continue;
+      try {if(folderMayQueue(folder,await folderSignature(state,draftRequest(state,key),folder)))return key;}catch{}
+    }
+    return null;
+  }
+  async function folderStatus(folder) {
+    try {
+      const response=await bridge.call('status');
+      if(response.protocol!==1)throw new Error('Несовместимая версия локального моста.');
+      folder.folder=typeof response.folder==='string'?response.folder.slice(0,1000):'';
+      folder.worker={running:response.worker?.running===true,heartbeat:Number.isFinite(response.worker?.heartbeat)?response.worker.heartbeat:null,status:typeof response.worker?.status==='string'?response.worker.status.slice(0,80):'',pauseReason:typeof response.worker?.pauseReason==='string'?response.worker.pauseReason.slice(0,80):''};
+      folder.claude={available:response.claude?.available===true};
+      folder.status=!folder.enabled?'disabled':!folder.claude.available?'claude_missing':folder.worker.status==='paused'?'paused':folder.worker.running?'ready':'waiting';
+      folder.detail=!folder.enabled?'Обработка через папку выключена.':!folder.claude.available?'Claude Code не найден. Установите его и войдите в аккаунт; для ответов нужен интернет.':folder.worker.running?'Локальный обработчик доступен. Доступ к Claude требует интернет-соединения.':'Задания сохраняются в папку. Запустите обработчик; для ответов Claude нужен интернет.';
+      if(folder.enabled&&folder.worker.status==='paused')folder.detail=({offline:'Claude без интернета. Задания сохранены; после подключения нажмите «Подключить / возобновить».',authentication_required:'Нужен вход в Claude Code. После входа возобновите обработчик.',usage_limit:'Достигнут лимит Claude. После обновления лимита возобновите обработку.',claude_update_required:'Обновите Claude Code и возобновите обработку.'})[folder.worker.pauseReason] || 'Обработчик Claude приостановлен. Проверьте его локальный журнал и возобновите работу.';
+    } catch {
+      folder.status='unavailable';folder.detail='Локальный мост недоступен. Проверьте установку компонента Windows и разрешение nativeMessaging.';
+    }
+    await saveFolder(folder);return folder;
+  }
+  async function folderCancelPending(folder,{key=null,automaticOnly=false}={}) {
+    const jobs=folder.jobs.filter(job=>folderPending(job)&&(!key||job.key===key)&&(!automaticOnly||job.automatic));
+    for(const job of jobs) {finishFolderJob(folder,job,'cancelled','Задание отменено. Полученный ответ не будет использован.',now());job.ack='cancelled';job.ackPending=true;}
+    await saveFolder(folder);
+    await Promise.all(jobs.map(async job=>{try {await bridge.call('cancel',{id:job.id});job.ackPending=false;}catch{}}));
+    await saveFolder(folder);
+  }
+  const folderImageDescriptors=(state,kind,key)=>kind==='product'?state.product.files.filter(file=>!file.excluded).flatMap(file=>(file.images || []).map(image=>({...image,name:file.name}))):state.conversations[key].messages.flatMap(message=>(message.attachments || []).flatMap(file=>(file.resolution?.images || []).map(image=>({...image,name:file.name,messageKey:message.key,direction:message.direction}))));
+  async function folderPayload(state,job) {
+    let prompt;const descriptors=folderImageDescriptors(state,job.kind,job.key);
+    if(job.kind==='product') {
+      prompt=buildProductExtractionPrompt(state,job.request);
+    } else {
+      prompt=buildDraftPrompt(state,job.request);
+      if(descriptors.length)prompt.user=JSON.stringify({...JSON.parse(prompt.user),imageInputs:descriptors.map(({imageKey,messageKey,direction,name})=>({imageKey,messageKey,direction,attachmentName:name}))});
+    }
+    const images=await folderImages(descriptors,imageLoader);
+    return {id:job.id,kind:job.kind,createdAt:job.createdAt,request:job.request,prompt:renderFolderPrompt(prompt),images};
+  }
+  async function submitFolder(state,folder,job,preparedPayload=null) {
+    const jobEpoch=epoch(job.key);let payload;
+    try {payload=preparedPayload || await folderPayload(state,job);}catch {finishFolderJob(folder,job,'error','Не удалось прочитать все материалы задания. Проверьте локальные изображения.',now());await saveFolder(folder);return;}
+    if(epoch(job.key)!==jobEpoch)throw new Error('Задание отменено до записи в папку.');
+    // Record the UUID before writing a file: timeout means outcome unknown, not absent.
+    job.status='unknown';job.at=now();job.detail='Записываю задание в локальную папку.';await saveFolder(folder);
+    try {
+      const response=await bridge.call('submit',{job:payload});
+      if(response.jobId!==job.id||!['queued','running','done','error','cancelled'].includes(response.status))throw new Error('Некорректный ответ моста.');
+      if(epoch(job.key)!==jobEpoch) {finishFolderJob(folder,job,'cancelled','Задание отменено во время записи.',now());job.ack='cancelled';job.ackPending=true;}
+      else {job.status=response.status;job.detail=response.status==='error'?'Обработчик сообщил об ошибке. Проверьте локальный журнал.':'Задание записано. Ожидаю ответ Claude.';}
+    } catch {job.status='unknown';job.detail='Ответ моста потерян. Проверю тот же идентификатор; новая копия задания не создаётся.';}
+    await saveFolder(folder);
+    log(state,'folder_queued','Задание записано или ожидает подтверждения локальной папки. Сообщение поставщику не отправлено.',{key:job.key,platform:state.conversations[job.key]?.platform});await save(state);
+  }
+  async function enqueueFolder(state,folder,{kind='dialog',key='',message={},automatic=false,observed=null}={}) {
+    if(!folder.enabled)throw new Error('Сначала включите обработку через локальную папку.');
+    if(!await api.permissions?.contains({permissions:['nativeMessaging']}))throw new Error('Разрешите подключение к локальной папке.');
+    if(providerTask)throw new Error('Дождитесь завершения текущего запроса к ИИ.');
+    let request,source;
+    if(kind==='product') {checkProductVersion(state,message);request=productExtractionRequest(state);buildProductExtractionPrompt(state,request);key='__product_extraction__';}
+    else {
+      const item=state.conversations[key];if(!item)throw new Error('Диалог не найден.');
+      if(item.draft)throw new Error('В диалоге уже есть черновик. Сначала проверьте или удалите его.');
+      observed=observed || await scan(state,item.platform);
+      source=observed.find(row=>row.platform===item.platform&&row.id===item.id&&row.active);
+      if(!source||source.busy||state.traversal[item.platform].pending)throw new Error('Откройте диалог и дождитесь полного чтения. Поле чата должно быть свободно.');
+      request=draftRequest(state,key);
+    }
+    const signature=await folderSignature(state,request,folder);
+    if(!folderMayQueue(folder,signature))throw new Error('Такое задание уже есть в журнале папки. При ошибке используйте повтор той же записи.');
+    request={...request,imageKeys:[...new Set(folderImageDescriptors(state,kind,key).map(image=>image.imageKey))]};
+    const job={id:crypto.randomUUID(),kind,key,signature,request,createdAt:now(),at:now(),status:'preparing',detail:'Подготовка задания.',configRevision:folder.revision,attempts:1+Math.max(0,...folder.jobs.filter(job=>job.signature===signature).map(job=>job.attempts)),automatic,draftGuard:await folderDraftGuard(state.conversations[key]),tabId:source?state.bindings[state.conversations[key].platform].tabId:null,frameId:source?.frameId??null,documentToken:source?.documentToken||'',sourceUrl:source?.sourceUrl||'',ack:null,ackPending:false};
+    // Missing images become a retryable error, never a text-only Claude request.
+    let checkedPayload;
+    try {checkedPayload=await folderPayload(state,job);job.request={...job.request,imageKeys:checkedPayload.images.map(image=>image.imageKey)};checkedPayload.request=job.request;}
+    catch {reserveFolderJob(folder,job);finishFolderJob(folder,job,'error','Не удалось прочитать все материалы задания. Проверьте локальные изображения.',now());await saveFolder(folder);throw new Error('Не удалось прочитать изображения задания. Проверьте вложения и повторите запись из журнала.');}
+    reserveFolderJob(folder,job);await saveFolder(folder);
+    await submitFolder(state,folder,job,checkedPayload);await schedule();return job;
+  }
+  async function acknowledgeFolder(folder,job,outcome) {
+    job.ack=outcome;job.ackPending=true;await saveFolder(folder);
+    try {await bridge.call('ack',{id:job.id,outcome});job.ackPending=false;await saveFolder(folder);}catch{}
+  }
+  async function pollFolder(state,folder) {
+    if(!folder.enabled)return;
+    const pollEpoch=cancelEpoch;
+    await folderStatus(folder);if(cancelEpoch!==pollEpoch)return;if(folder.status==='unavailable')return;
+    for(const job of folder.jobs.filter(job=>job.ackPending))await acknowledgeFolder(folder,job,job.ack);
+    const jobs=folder.jobs.filter(job=>folderPending(job)&&(job.status!=='awaiting_limit'||now()>=(job.retryAt || 0))).slice(0,FOLDER_LIMITS.poll);if(!jobs.length)return;
+    let response;
+    try {response=await bridge.call('poll',{ids:jobs.map(job=>job.id)});if(!Array.isArray(response.results))throw new Error('Invalid poll');}
+    catch {folder.status='unavailable';folder.detail='Не удалось проверить файлы ответов. Ожидающие задания сохранены.';await saveFolder(folder);return;}
+    if(cancelEpoch!==pollEpoch)return;
+    const seen=new Set();
+    for(const result of response.results.slice(0,FOLDER_LIMITS.poll)) {
+      if(cancelEpoch!==pollEpoch)break;
+      const job=jobs.find(job=>job.id===result?.id);if(!job||seen.has(job.id))continue;seen.add(job.id);
+      if(!['queued','running','done','error','cancelled'].includes(result.status))continue;
+      if(result.status!=='done') {job.status=result.status;job.at=now();job.detail=result.status==='error'?'Claude не обработал задание. Проверьте интернет, вход и журнал; повтор доступен вручную.':result.status==='cancelled'?'Обработчик отменил задание.':'Ожидаю ответ Claude в локальной папке.';continue;}
+      const awaitingLimit=job.status==='awaiting_limit'||(job.sendDeferrals || 0)>0;
+      job.status='done';job.at=now();job.detail='Ответ готов; проверяю актуальность диалога.';
+      const jobEpoch=epoch(job.key);
+      const reject=async detail=>{finishFolderJob(folder,job,'stale',detail,now());await acknowledgeFolder(folder,job,'stale');log(state,'folder_stale',detail,{key:job.key,level:'warning'});};
+      if(!sameRequest(result.request,job.request)||!sameRequest(result.imageKeys || [],job.request.imageKeys || [])||job.configRevision!==folder.revision) {await reject('Ответ отклонён: задание или настройки изменились.');continue;}
+      try {
+        if(job.kind==='product') {
+          if(!sameRequest(folderCurrentRequest(productExtractionRequest(state),job),job.request))throw new Error('stale');
+          const parsed=parseProductKeyPoints(result.text,'anthropic');
+          if(epoch(job.key)!==jobEpoch)throw new Error('cancelled');
+          const imageKeys=state.product.files.filter(file=>!file.excluded).flatMap(file=>(file.images || []).map(image=>image.imageKey));
+          acceptProductExtraction(state,job.request,{...parsed,processedImageKeys:imageKeys},now());state.settings.autoDraft=false;
+          finishFolderJob(folder,job,'accepted','Тезисы получены. Проверьте и утвердите товар вручную.',now());await save(state);await acknowledgeFolder(folder,job,'accepted');continue;
+        }
+        const item=state.conversations[job.key];
+        if(!item||item.paused||item.takeover||await folderDraftGuard(item)!==job.draftGuard||state.bindings[item.platform]?.tabId!==job.tabId)throw new Error('stale');
+        // Pausing observation freezes automatic consumption. Explicit/manual
+        // jobs can still become drafts, but can never send with the monitor off.
+        if(job.automatic&&(!state.running||!folder.auto))continue;
+        const observed=await scan(state,item.platform),current=state.conversations[job.key],source=observed.find(row=>row.platform===item.platform&&row.id===item.id&&row.active);
+        if(!source){job.detail='Ответ готов. Ожидаю повторного чтения именно этого диалога.';continue;}
+        if(source.busy){job.detail='Ответ готов. Ожидаю завершения работы пользователя в чате.';continue;}
+        if(source.documentToken!==job.documentToken||source.frameId!==job.frameId||source.sourceUrl!==job.sourceUrl||!sameRequest(folderCurrentRequest(draftRequest(state,job.key),job),job.request)||await folderDraftGuard(current)!==job.draftGuard||epoch(job.key)!==jobEpoch)throw new Error('stale');
+        if(typeof result.text!=='string'||!result.text.trim()||result.text.length>6000)throw new Error('invalid');
+        if(awaitingLimit&&current.draft?.text!==result.text.trim())throw new Error('draft changed');
+        if(!awaitingLimit)acceptDraft(state,job.request,{text:result.text,reason:'Ответ Claude получен из локальной папки.'},now());
+        finishFolderJob(folder,job,'accepted','Ответ сохранён как черновик.',now());await save(state);await saveFolder(folder);
+        if(folder.autoSend&&folder.auto&&state.running&&approved(state)&&typeof folderSender==='function') {
+          let outcome;try {outcome=await folderSender({api,now,state,request:job.request,text:current.draft.text,enabled:true,source:{tabId:job.tabId,frameId:source.frameId,documentToken:source.documentToken,sourceUrl:source.sourceUrl,replyFingerprint:source.replyFingerprint},shouldContinue:()=>epoch(job.key)===jobEpoch,reserve:async reservation=>{
+            if(epoch(job.key)!==jobEpoch)return {ok:false,reason:'cancelled'};
+            if(typeof reserveDialogSendQuota!=='function')return {ok:false,reason:'quota_unavailable'};
+            const quota=await reserveDialogSendQuota({...reservation,jobId:job.id});if(quota?.ok!==true)return quota;
+            finishFolderJob(folder,job,'sending','Попытка отправки зарегистрирована. Автоматический повтор запрещён.',now());await saveFolder(folder);return {ok:true};
+          }});}catch {outcome={status:job.status==='sending'?'unknown':'blocked'};}
+          const deferred=outcome?.status==='deferred'&&outcome.reserved!==true&&Number.isFinite(outcome.retryAt)&&(job.sendDeferrals || 0)<100;
+          const status=deferred?'awaiting_limit':outcome?.status==='attempted'?'sent':outcome?.status==='unknown'?'send_unknown':'accepted';
+          if(deferred){job.retryAt=Math.max(now()+30000,outcome.retryAt+500);job.sendDeferrals=(job.sendDeferrals || 0)+1;job.draftGuard=await folderDraftGuard(current);}
+          finishFolderJob(folder,job,status,status==='awaiting_limit'?'Ответ готов. Ожидаю освобождения общего лимита площадки; новый запрос Claude не выполняется.':status==='sent'?'Нажатие отправки выполнено; доставка не проверяется.':status==='send_unknown'?'Исход отправки неизвестен. Проверьте переписку; автоматического повтора не будет.':'Черновик сохранён. Отправка отложена или заблокирована; проверьте диалог.',now());
+          log(state,'folder_send',job.detail,{key:job.key,platform:item.platform,level:status==='send_unknown'?'warning':'info'});await save(state);
+        }
+        if(job.status==='awaiting_limit')await saveFolder(folder);else await acknowledgeFolder(folder,job,'accepted');
+      } catch {await reject('Ответ не применён: история, получатель, товар или черновик изменились либо ответ некорректен.');}
+    }
+    await saveFolder(folder);await save(state);
+  }
+  async function folderSettings(state,folder,message) {
+    const next={enabled:Object.hasOwn(message,'enabled')?message.enabled===true:folder.enabled,auto:Object.hasOwn(message,'auto')?message.auto===true:folder.auto,autoSend:Object.hasOwn(message,'autoSend')?message.autoSend===true:folder.autoSend,model:Object.hasOwn(message,'model')?folderModel(message.model):folder.model};
+    if(!next.enabled){next.auto=false;next.autoSend=false;}if(!next.auto)next.autoSend=false;
+    if(next.enabled&&!await api.permissions?.contains({permissions:['nativeMessaging']}))throw new Error('Разрешите подключение к локальной папке.');
+    if(next.auto&&!approved(state))throw new Error('Сначала проверьте и утвердите тезисы товара.');
+    if(next.auto&&state.settings.autoDraft)throw new Error('Сначала выключите авточерновики через API, чтобы одно сообщение не обрабатывалось двумя способами.');
+    if(Object.entries(next).some(([key,value])=>folder[key]!==value)) {await folderCancelPending(folder);folder.revision++;}
+    Object.assign(folder,next);await saveFolder(folder);
+    try {await bridge.call('configure',{enabled:folder.enabled,model:folder.model});}catch {folder.status='unavailable';folder.detail='Настройки сохранены. Установите локальный мост и обработчик папки.';await saveFolder(folder);}
+    if(folder.enabled)await schedule();else if(!state.running)await clearAlarm();
+    log(state,'folder_settings',folder.enabled?`Обработка через папку включена. ${folder.autoSend?'Автоматическая отправка разрешена для проверенных ответов.':'Ответы сохраняются черновиками.'}`:'Обработка через папку выключена.');await save(state);
+  }
+
   async function toggleAuto(state,enabled) {
     if(enabled) {
+      if((await loadFolder()).auto)throw new Error('Сначала выключите автоматическую обработку через папку.');
       if(!approved(state))throw new Error('Сначала проверьте и утвердите тезисы товара.');
       const config=await provider();
       if(!config.apiKey || !config.model)throw new Error(`Укажите API-ключ и модель ${providerInfo(config.provider).label}.`);
@@ -463,8 +653,39 @@ export function createDialogMonitor({api=globalThis.chrome, fetchImpl=globalThis
   }
 
   async function command(message) {
-    const state=await load();
+    const state=await load(),folder=await loadFolder();
+    const invalidates=['DIALOGS_STOP','DIALOGS_SETTINGS','DIALOGS_PRODUCT_SAVE','DIALOGS_PRODUCT_APPROVE','DIALOGS_IMPORT_PRODUCT_RESULT','DIALOGS_BIND_TAB','DIALOGS_UNBIND_TAB'];
+    if(invalidates.includes(message.type))await folderCancelPending(folder);
+    else if(['DIALOGS_CONTROL','DIALOGS_SAVE_DRAFT','DIALOGS_DISCARD_DRAFT'].includes(message.type))await folderCancelPending(folder,{key:message.key});
     switch(message.type) {
+      case 'DIALOGS_FOLDER_STATUS':await folderStatus(folder);return publicState(state);
+      case 'DIALOGS_FOLDER_SETTINGS':await folderSettings(state,folder,message);return publicState(state);
+      case 'DIALOGS_FOLDER_PRODUCT':await enqueueFolder(state,folder,{kind:'product',message});return publicState(state);
+      case 'DIALOGS_FOLDER_DRAFT':await enqueueFolder(state,folder,{key:message.key});return publicState(state);
+      case 'DIALOGS_FOLDER_POLL':await pollFolder(state,folder);return publicState(state);
+      case 'DIALOGS_FOLDER_CANCEL': {
+        const job=folder.jobs.find(job=>job.id===message.id);if(!job)throw new Error('Задание папки не найдено.');
+        if(!folderPending(job))throw new Error('Задание уже завершено.');
+        cancel(job.key);await folderCancelPending(folder,{key:job.key});return publicState(state);
+      }
+      case 'DIALOGS_FOLDER_RETRY': {
+        const job=folder.jobs.find(job=>job.id===message.id);if(!job)throw new Error('Задание папки не найдено.');
+        if(!folder.enabled)throw new Error('Сначала включите обработку через папку.');
+        if(!['unknown','error'].includes(job.status)||job.attempts>=FOLDER_LIMITS.attempts)throw new Error('Повтор недоступен: задание завершено, ещё работает или достигнут предел трёх попыток.');
+        if(job.configRevision!==folder.revision)throw new Error('Настройки изменились. Создайте актуальное задание.');
+        if(job.kind==='dialog') {
+          const item=state.conversations[job.key];if(!item)throw new Error('Диалог не найден.');
+          const observed=await scan(state,item.platform),source=observed.find(row=>row.active&&row.id===item.id&&row.platform===item.platform);
+          if(!source||source.busy||source.frameId!==job.frameId||source.documentToken!==job.documentToken||await folderDraftGuard(item)!==job.draftGuard||!sameRequest(folderCurrentRequest(draftRequest(state,job.key),job),job.request))throw new Error('Диалог изменился. Создайте актуальное задание.');
+        } else if(!sameRequest(folderCurrentRequest(productExtractionRequest(state),job),job.request))throw new Error('Товар изменился. Создайте актуальное задание.');
+        const related=folder.jobs.filter(item=>item.signature===job.signature);
+        if(related.some(item=>item.id!==job.id&&folderPending(item))||folder.completed.includes(job.signature))throw new Error('Это задание уже обрабатывается или завершено.');
+        const attempts=Math.max(...related.map(item=>item.attempts));if(attempts>=FOLDER_LIMITS.attempts)throw new Error('Достигнут предел трёх попыток. Проверьте ошибку вручную.');
+        if(job.status==='error') {
+          const retry={...job,id:crypto.randomUUID(),createdAt:now(),at:now(),status:'preparing',attempts:attempts+1,ack:null,ackPending:false};reserveFolderJob(folder,retry);await saveFolder(folder);await submitFolder(state,folder,retry);
+        } else {job.attempts=attempts+1;await submitFolder(state,folder,job);}
+        return publicState(state);
+      }
       case 'DIALOGS_GET': return publicState(state);
       case 'DIALOGS_EXPORT_PRODUCT_PROMPT': {
         checkProductVersion(state,message);
@@ -515,8 +736,8 @@ export function createDialogMonitor({api=globalThis.chrome, fetchImpl=globalThis
       case 'DIALOGS_UNBIND_TAB': cancel();unbindDialogTab(state,platform(message.platform),now());break;
       case 'DIALOGS_START':
         if(!Object.values(state.bindings).some(binding=>Number.isInteger(binding.tabId)))throw new Error('Сначала привяжите вкладки площадок.');
-        state.running=true;state.readUnread=message.readUnread===true;log(state,'monitor_started',`${state.readUnread?'Мониторинг запущен с открытием существующих непрочитанных диалогов.':'Мониторинг запущен без переключения диалогов.'} ${state.settings.autoDraft?'Авточерновики включены по утверждённому заданию.':'Автоматические запросы к ИИ отключены.'} Ввод и отправка сообщений отключены.`);await schedule();break;
-      case 'DIALOGS_STOP': cancel();state.running=false;for(const name of PLATFORMS)state.traversal[name].pending=null;log(state,'monitor_stopped','Мониторинг приостановлен.');await clearAlarm();break;
+        state.running=true;state.readUnread=message.readUnread===true;log(state,'monitor_started',`${state.readUnread?'Мониторинг запущен с открытием существующих непрочитанных диалогов.':'Мониторинг запущен без переключения диалогов.'} ${folder.enabled&&folder.auto?'Автоматическая обработка через папку включена.':state.settings.autoDraft?'Авточерновики включены по утверждённому заданию.':'Автоматическая подготовка ответов отключена.'} ${folder.enabled&&folder.auto&&folder.autoSend?'Автоматическая отправка разрешена после проверки контекста и общего лимита.':'Ввод и отправка сообщений отключены.'}`);await schedule();break;
+      case 'DIALOGS_STOP': cancel();state.running=false;for(const name of PLATFORMS)state.traversal[name].pending=null;log(state,'monitor_stopped','Мониторинг приостановлен.');if(folder.enabled)await schedule();else await clearAlarm();break;
       case 'DIALOGS_SCAN': await scan(state,message.platform);return publicState(state);
       case 'DIALOGS_SETTINGS': {
         const config=await provider(), selected=validateProvider(message.provider ?? config.provider);
@@ -533,6 +754,7 @@ export function createDialogMonitor({api=globalThis.chrome, fetchImpl=globalThis
         if(changed)state.settings.autoDraft=false;
         if(message.settings) {
           const enable=message.settings.autoDraft===true;
+          if(enable&&folder.auto)throw new Error('Сначала выключите автоматическую обработку через папку.');
           setDialogSettings(state,{...message.settings,autoDraft:false},now());
           if(enable && approved(state) && profile.apiKey && profile.model && await api.permissions?.contains({origins:[providerInfo(selected).origin]}))setDialogSettings(state,{...state.settings,autoDraft:true},now());
         }
@@ -570,7 +792,7 @@ export function createDialogMonitor({api=globalThis.chrome, fetchImpl=globalThis
     if(!isUI(sender))return {ok:false,error:'Команда доступна только в интерфейсе расширения.'};
     if(message.type==='DIALOGS_PRODUCT_EXTRACT')return extractProduct(message);
     if(message.type==='DIALOGS_GENERATE_DRAFT')return generate(message.key);
-    if(['DIALOGS_STOP','DIALOGS_SETTINGS','DIALOGS_PRODUCT_SAVE','DIALOGS_PRODUCT_APPROVE','DIALOGS_IMPORT_PRODUCT_RESULT','DIALOGS_BIND_TAB','DIALOGS_UNBIND_TAB'].includes(message.type) || (message.type==='DIALOGS_AUTODRAFT' && message.enabled!==true))cancel();
+    if(['DIALOGS_FOLDER_CANCEL','DIALOGS_FOLDER_SETTINGS','DIALOGS_STOP','DIALOGS_SETTINGS','DIALOGS_PRODUCT_SAVE','DIALOGS_PRODUCT_APPROVE','DIALOGS_IMPORT_PRODUCT_RESULT','DIALOGS_BIND_TAB','DIALOGS_UNBIND_TAB'].includes(message.type) || (message.type==='DIALOGS_AUTODRAFT' && message.enabled!==true))cancel();
     else if(['DIALOGS_CONTROL','DIALOGS_SAVE_DRAFT','DIALOGS_DISCARD_DRAFT'].includes(message.type))cancel(message.key);
     try { return await exclusive(()=>command(message)); }
     catch(error) { return {ok:false,error:error instanceof Error && /^[А-ЯЁ]/.test(error.message)?error.message:'Не удалось выполнить команду диалогов. Проверьте выбранную вкладку и настройки.'}; }
@@ -578,21 +800,30 @@ export function createDialogMonitor({api=globalThis.chrome, fetchImpl=globalThis
   const onAlarm=async alarm=>{
     if(alarm.name!==ALARM)return;
     const autoKey=await exclusive(async()=>{
-      const state=await load();if(!state.running)return null;
+      const cycleEpoch=cancelEpoch,state=await load(),folder=await loadFolder();if(!state.running){if(folder.enabled)await pollFolder(state,folder);return null;}
       let config=null;
       if(state.settings.autoDraft) {
         const value=await provider();
         if(approved(state) && value.apiKey && value.model && await api.permissions?.contains({origins:[providerInfo(value.provider).origin]}))config=value;
         else {state.settings.autoDraft=false;log(state,'auto_drafts_paused','Авточерновики остановлены: проверьте утверждение задания и доступ к ИИ.',{level:'warning'});}
       }
-      const observed=await scan(state,undefined,{traverse:true,autoConfig:config});
+      const observed=await scan(state,undefined,{traverse:true,autoConfig:config,folderConfig:folder.enabled?folder:null});
+      if(cancelEpoch!==cycleEpoch)return null;
+      if(folder.enabled) {
+        for(const key of observed.folderKeys) {
+          if(cancelEpoch!==cycleEpoch)break;
+          try {await enqueueFolder(state,folder,{key,automatic:true,observed});}
+          catch {log(state,'folder_failed','Не удалось подготовить задание папки. Проверьте вложения и локальный обработчик.',{key,level:'warning'});}
+        }
+        if(cancelEpoch===cycleEpoch)await pollFolder(state,folder);
+      }
       if(globalThis.indexedDB)await pruneChatAttachmentCache({api,state,now:now()}).catch(()=>{});
       return observed.autoKey || null;
     });
     if(autoKey)await generate(autoKey,{automatic:true});
   };
   const resetBindings=()=>exclusive(async()=>{
-    cancel();const state=await load();state.running=false;
+    cancel();const state=await load(),folder=await loadFolder();state.running=false;await folderCancelPending(folder);folder.enabled=false;folder.auto=false;folder.autoSend=false;await saveFolder(folder);
     for(const name of PLATFORMS)if(Number.isInteger(state.bindings[name]?.tabId))unbindDialogTab(state,name,now());
     log(state,'bindings_reset','После перезапуска Chrome или обновления расширения привяжите вкладки заново.');
     await clearAlarm();await save(state);
@@ -612,9 +843,9 @@ export function createDialogMonitor({api=globalThis.chrome, fetchImpl=globalThis
 }
 
 let installed;
-export function installDialogMonitor(api=globalThis.chrome) {
+export function installDialogMonitor(api=globalThis.chrome,options={}) {
   if(installed)return installed;
-  installed=createDialogMonitor({api});
+  installed=createDialogMonitor({api,...options});
   // Only extension pages/service workers can read the separately stored API credential.
   api.storage.local.setAccessLevel?.({accessLevel:'TRUSTED_CONTEXTS'}).catch(()=>{});
   api.runtime.onMessage.addListener((message,sender,reply)=>{

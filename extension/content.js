@@ -145,6 +145,31 @@
   const editorSpaces = value => String(value ?? '').replace(/\u00a0/g,' ');
   function draftText(value) {return norm(site==='1688'?editorSpaces(value):value);}
   function textOf(node) { return draftText('value' in node ? node.value : node.innerText); }
+  function exactReplyText(value) {const text=String(value ?? '').replace(/\r\n/g,'\n');return site==='1688'?editorSpaces(text):text;}
+  function exactEditorText(node) {return exactReplyText('value' in node?node.value:node.innerText);}
+  function guardedReply(request,found,{initial=false}={}) {
+    if(!request.dialogGuard)return {ok:true};
+    const guard=request.dialogGuard;
+    if(typeof guard.operation!=='string' || !guard.operation || typeof request.message!=='string' || !request.message.trim() || request.message.length>6000)return {ok:false,reason:'Некорректное разрешение на ответ.'};
+    const verified=globalThis.OpenLinksDialogsReader?.guardReply(guard);
+    if(!verified?.ok)return {ok:false,reason:verified?.reason || 'Проверка получателя недоступна. Обновите расширение и вкладку чата.'};
+    if(!found)return verified;
+    if(found.kind!=='chat')return {ok:false,reason:found.reason || found.obstacle || 'Не найден однозначный редактор чата.'};
+    let composer=found.editor.parentElement;
+    while(composer && !composer.contains(found.send))composer=composer.parentElement;
+    if(!composer)return {ok:false,reason:'Редактор и кнопка отправки не связаны.'};
+    // This path sends text only. Never accidentally submit a user's queued file
+    // or image alongside an automatic reply, including hidden file inputs.
+    const queuedFile=[...composer.querySelectorAll('input[type="file"]')].some(input=>input.files?.length);
+    const queuedMedia=found.editor.querySelector('img,video,audio,iframe,object,[data-attachment]') || [...composer.querySelectorAll('[data-pending-attachment],[data-uploading="true"],.attachment-preview,.upload-preview,.file-preview,.image-preview,.upload-list,.file-list')].some(visible);
+    if(queuedFile || queuedMedia)return {ok:false,reason:'В редакторе есть вложение. Автоматический ответ остановлен.'};
+    const prepared=preparedEditors.get(found.editor),owned=prepared?.dialogOperation===guard.operation && prepared.dialogSend===found.send;
+    if(initial && !owned) {
+      const raw=String('value' in found.editor?found.editor.value:found.editor.innerText ?? found.editor.textContent ?? '');
+      if(raw || Object.values(verified.busy || {}).some(value=>value===true))return {ok:false,reason:'В чате есть ручной черновик или пользователь работает с редактором. Текст сохранён без изменений.'};
+    } else if(!initial && !owned)return {ok:false,reason:'Редактор или подготовленная попытка ответа изменились.'};
+    return {ok:true};
+  }
   function chatReady(profile) {
     if(site!=='1688')return {ok:true};
     const found=inspect(profile);
@@ -166,6 +191,7 @@
     if(request.stage==='locate') {const ready=chatReady(request.profile);if(!ready.ok)return ready;}
     const found=inspect(request.profile),editor=found.editor;
     if(found.kind!=='chat')return {ok:false,reason:'Редактор чата изменился'};
+    const guarded=guardedReply(request,found);if(!guarded.ok)return guarded;
     // Check the message before the click and after both keys, not halfway
     // through the browser's temporary representation of the inserted space.
     if(request.stage!=='space' && textOf(editor)!==draftText(request.message))return {ok:false,reason:'Черновик изменился'};
@@ -193,7 +219,7 @@
       if(tail.toString())return {ok:false,reason:'Курсор перемещён'};
     }
     if(request.stage==='done') {
-      preparedEditors.set(editor,{text:draftText(request.message),method:'chrome-mouse-keyboard',native:true});
+      preparedEditors.set(editor,{...preparedEditors.get(editor),text:draftText(request.message),method:'chrome-mouse-keyboard',native:true});
     }
     return {ok:true};
   }
@@ -237,20 +263,27 @@
     return invalid.length ? 'На форме есть незаполненные или неверные обязательные поля. Заполните их вручную.' : '';
   }
   async function prepare(request) {
+    const context=guardedReply(request);if(!context.ok)return context;
     const ready=chatReady(request.profile);if(!ready.ok)return ready;
     const found=inspect(request.profile);
     if(found.kind!=='chat') return {ok:false,reason:found.obstacle || found.reason || 'Не найден однозначный редактор внутри чата. Форма запроса не используется.'};
+    const guard=guardedReply(request,found,{initial:true});if(!guard.ok)return guard;
     const current=textOf(found.editor);
+    if(request.dialogGuard && preparedEditors.get(found.editor)?.dialogOperation===request.dialogGuard.operation && current!==draftText(request.message))return {ok:false,reason:'Подготовленный ответ изменён вручную. Текст сохранён без изменений.'};
     const mustFill=!current || current!==draftText(request.message) || preparedEditors.get(found.editor)?.text!==draftText(request.message) || (site!=='1688' && request.reactivate);
     const draftReplaced=!!current && !!mustFill,reply=result=>({draftReplaced,...result});
     if(site==='1688' && request.reactivate && preparedEditors.has(found.editor))preparedEditors.get(found.editor).native=false;
     let inputMethod=preparedEditors.get(found.editor)?.method || 'existing-draft';
     // The user requested replacing existing drafts in the selected chat editor.
     if(mustFill) {
-      inputMethod=fill(found.editor,request.message);await new Promise(resolve=>setTimeout(resolve,350));
+      inputMethod=fill(found.editor,request.message);
+      if(request.dialogGuard)Object.assign(preparedEditors.get(found.editor),{dialogOperation:request.dialogGuard.operation,dialogSend:found.send});
+      await new Promise(resolve=>setTimeout(resolve,350));
     }
     const fresh=inspect(request.profile);
     if(fresh.kind!=='chat' || fresh.editor!==found.editor) return reply({ok:false,reason:fresh.reason || fresh.obstacle || 'Интерфейс чата изменился при заполнении'});
+    const rechecked=guardedReply(request,fresh);if(!rechecked.ok)return reply(rechecked);
+    if(request.dialogGuard && exactEditorText(fresh.editor)!==exactReplyText(request.message))return reply({ok:false,reason:'Текст ответа изменился, включая пробелы. Отправка остановлена.'});
     if(textOf(fresh.editor)!==draftText(request.message)) return reply({ok:false,reason:'Сайт не принял текст. Проверьте редактор вручную.'});
     const reason=validation(fresh.send);
     if(reason) return reply({ok:false,reason});
@@ -399,6 +432,8 @@
       if(location.href!==request.expectedUrl) return {clicked:false,reason:'Адрес страницы изменился. Проверьте получателя.'};
       const found=inspect(profile);
       if(found.kind!=='chat') return {clicked:false,reason:found.reason || found.obstacle || 'Чат больше не доступен; форма запроса не используется'};
+      const guard=guardedReply(request,found);if(!guard.ok)return {clicked:false,reason:guard.reason};
+      if(request.dialogGuard && exactEditorText(found.editor)!==exactReplyText(request.message))return {clicked:false,reason:'Текст ответа изменился, включая пробелы. Отправка остановлена.'};
       if(textOf(found.editor)!==draftText(request.message)) return {clicked:false,reason:'Текст изменился. Отправка остановлена.'};
       const reason=validation(found.send);
       if(reason) return {clicked:false,reason};

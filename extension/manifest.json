@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
   "name": "OpenLinks — поставщики",
-  "version": "0.13.0",
-  "description": "Мониторинг чатов поставщиков, Claude и OpenAI API, ручные промпты TXT и черновики без отправки.",
+  "version": "0.14.0",
+  "description": "Чаты поставщиков, Claude через папку и подписку, API, TXT, черновики и включаемые автоматические ответы.",
   "permissions": [
     "storage",
     "alarms",
@@ -51,5 +51,8 @@
     "https://api.openai.com/*",
     "https://api.anthropic.com/*"
   ],
-  "minimum_chrome_version": "120"
+  "minimum_chrome_version": "120",
+  "optional_permissions": [
+    "nativeMessaging"
+  ]
 }

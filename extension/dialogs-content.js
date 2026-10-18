@@ -14,6 +14,10 @@
   const usedTokens = new Set();
   let selectionRows = new Map(), lastTrustedInput = 0, active1688Evidence = null, activeAlibabaEvidence = null, activeMicEvidence = null, pendingReveal = null;
   let modelRequest=null,modelAttempt='',modelAccepted={threadId:'',rows:new Map()};
+  // Opaque tokens bind a reply to the exact current document and transcript.
+  // They change on any message/attachment/evidence change, never persist across
+  // navigation, and are checked synchronously immediately before editing/clicking.
+  let replyEvidence=new Map();
   const LIMIT = {conversations: 200, messages: 500, text: 12000, nodes: 3000};
   const HISTORY = '[data-message-history],[data-chat-history],[data-message-list],[role="log"],.message-list,.messages-list,.chat-messages,.message-history,.chat-history,.buyer-messenger-container .message-box .im-message-flow .scroll-box,.conversation-area .window-center-messages-main > .msg-list';
   const ROOT = '[data-dialog-root],[data-chat-root],[data-conversation-root],.chat-panel,.chat-window,.conversation-panel,.message-panel,.ww_box,.buyer-messenger-container .message-box,.conversation-area .conversation-window,.conversation-area';
@@ -405,11 +409,28 @@
         byId.set(id,{id,identityReliable:provenAccount(item),title:title(item),url:safeUrl(item.matches('a[href]')?item.href:select(item,'a[href]')[0]?.href||location.href),unread:unread(item),active:item.matches(INBOX)&&rowActive(item),orderReliable:false,tailKnown:false,preview,needsRead:true,messages:[],...selectable(item,id)});
       }
       result.conversations=[...byId.values()].slice(0,LIMIT.conversations);
+      const nextReplyEvidence=new Map();
+      for(const row of result.conversations.filter(item=>item.active)){
+        const signature=JSON.stringify([row.id,row.identityReliable,row.orderReliable,row.tailKnown,row.historyOrderReliable,row.historyTailKnown,row.needsRead,row.messages,row.coverage]);
+        const prior=replyEvidence.get(row.id),entry=prior?.signature===signature?prior:{signature,token:crypto.randomUUID()};
+        row.replyFingerprint=entry.token;nextReplyEvidence.set(row.id,entry);
+      }
+      replyEvidence=nextReplyEvidence;
       if(result.conversations.length){result.status='ready';result.detail=result.conversations.some(item=>item.active)?'Прочитаны доступные сообщения. Предпросмотры других диалогов требуют открытия пользователем.':'Доступен только список диалогов. Откройте нужную переписку, чтобы прочитать сообщения.';}
       else if(select(document,PENDING+(platform()==='mic'?',.conversation-lst .ant-skeleton-active':'')).length){result.status='loading';result.detail='История чата ещё загружается.';}
       else if(result.frames.some(frame=>frame.visible)){result.detail='Чат может находиться во вложенном фрейме; требуется отдельное чтение фрейма.';}
       requestModelEvidence(result);return result;
     } catch {return {...result,status:'error',detail:'Не удалось прочитать структуру чата. Отправка и ввод не выполнялись.',conversations:[]};}
+  }
+  function guardReply(expected) {
+    const invalid=reason=>({ok:false,reason});
+    if(!expected || expected.documentToken!==DOCUMENT_TOKEN || expected.platform!==platform() || expected.sourceUrl!==location.href || typeof expected.id!=='string' || typeof expected.replyFingerprint!=='string' || !expected.replyFingerprint)return invalid('Страница или разрешение на ответ изменились.');
+    const current=snapshot(),active=current.conversations.filter(row=>row.active);
+    if(current.status!=='ready' || active.length!==1)return invalid('Не подтверждён один открытый диалог без ограничений площадки.');
+    const row=active[0];
+    if(row.id!==expected.id || row.replyFingerprint!==expected.replyFingerprint || !row.identityReliable)return invalid('Получатель, история или вложения изменились. Ответ остановлен.');
+    if((row.historyOrderReliable??row.orderReliable)!==true || (row.historyTailKnown??row.tailKnown)!==true || row.messages.some(message=>message.direction==='unknown') || row.messages.filter(message=>message.direction!=='system').at(-1)?.direction!=='inbound')return invalid('Последнее входящее сообщение и порядок истории не подтверждены.');
+    return {ok:true,busy:current.busy};
   }
   function openConversation(request) {
     if(request?.documentToken!==DOCUMENT_TOKEN||typeof request.selectionToken!=='string'||typeof request.conversationId!=='string')return {ok:false,detail:'Документ или разрешение выбора устарели.'};
@@ -443,7 +464,7 @@
     return {ok:true,revealedId:request.conversationId};
   }
   for(const type of ['keydown','pointerdown','input','wheel','touchstart'])document.addEventListener(type,event=>{if(event.isTrusted){lastTrustedInput=Date.now();pendingReveal=null;}},{capture:true,passive:true});
-  globalThis.OpenLinksDialogsReader=Object.freeze({snapshot,openConversation,revealLatest,applyModelEvidence});
+  globalThis.OpenLinksDialogsReader=Object.freeze({snapshot,openConversation,revealLatest,applyModelEvidence,guardReply});
   globalThis.chrome?.runtime?.onMessage?.addListener((message,sender,respond)=>{
     if(!['DIALOGS_SNAPSHOT','DIALOGS_OPEN_CONVERSATION','DIALOGS_REVEAL_LATEST','DIALOGS_APPLY_MODEL_EVIDENCE'].includes(message?.type))return;
     if(sender?.id!==chrome.runtime.id){respond({status:'error',detail:'Источник запроса не подтверждён.'});return;}

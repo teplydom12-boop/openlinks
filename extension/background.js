@@ -22,6 +22,20 @@ const exclusive = task => {
 };
 async function load() { return migrateState((await chrome.storage.local.get(KEY))[KEY]); }
 async function save(state) { await chrome.storage.local.set({[KEY]:state}); }
+// Both outreach and dialogue replies reserve the same rolling quota inside
+// the outreach serializer. A replayed reservation never authorizes another click.
+export function reserveDialogSendQuota({platform,jobId,attemptId}={}) {
+  return exclusive(async()=>{
+    if(!Object.hasOwn(PLATFORMS,platform) || !/^[a-f0-9-]{36}$/i.test(jobId || '') || !/^[a-f0-9-]{36}$/i.test(attemptId || ''))throw new Error('Некорректная попытка ответа поставщику.');
+    const state=await load(),at=Date.now();
+    if(state.slots.some(slot=>slot.dialogAttemptId===attemptId))return {ok:false,unknown:true,reason:'Попытка уже зарегистрирована. Повторное нажатие запрещено.'};
+    const allowed=eligibility(state,platform,'send',at);
+    if(allowed.at>at)return {ok:false,retryAt:allowed.at,reason:allowed.reasons.join('; ')};
+    state.slots.push({platform,kind:'send',at,jobId:'dialog:'+jobId,dialogAttemptId:attemptId});
+    event(state,'dialog_send_reserved',null,'Зарезервирован лимит для ответа в диалоге '+PLATFORMS[platform].label+'. Повтор этой попытки запрещён.','decision');
+    await save(state);return {ok:true,at};
+  });
+}
 function event(state, type, job, detail = '', level = 'action') {
   const entry={id:crypto.randomUUID(), at:Date.now(), type, level, jobId:job?.id, url:job?.url || '', detail,jobStatus:job?.status,errorCount:job?.errorCount || 0};
   state.events.push(entry);
@@ -934,4 +948,4 @@ chrome.action.onClicked.addListener(async()=>{
   if(tabs[0]) { await chrome.tabs.update(tabs[0].id,{active:true}); await chrome.windows.update(tabs[0].windowId,{focused:true}); }
   else await chrome.windows.create({url,type:'popup',width:1240,height:900});
 });
-installDialogMonitor();
+installDialogMonitor(chrome,{reserveDialogSendQuota});

@@ -10,7 +10,7 @@ const key=conversationKey('1688','supplier-1');
 function snapshot(platform='1688',extra={}) {
   return {platform,status:'ready',url:urls[platform],documentToken:'doc-1',frames:[],conversations:[{id:'supplier-1',title:'Supplier',identityReliable:true,active:true,unread:true,orderReliable:true,tailKnown:true,messages:[{id:'m1',direction:'inbound',text:'What quantity do you need?'}]}],...extra};
 }
-function harness({attachmentResolver}={}) {
+function harness({attachmentResolver,folderSender,reserveDialogSendQuota}={}) {
   const storage={},calls=[],alarms=[],permissionRequests=[],tabs=new Map([[1,{id:1,url:urls['1688'],status:'complete'}],[2,{id:2,url:urls.alibaba}],[3,{id:3,url:urls.mic}]]);
   const replies=new Map([[1,snapshot()],[2,snapshot('alibaba')],[3,snapshot('mic')]]);
   const frameLists=new Map(),images=new Map();let reads=0,fetches=0,allowed=true,time=1000000,openAction=async message=>({ok:true,openedId:message.conversationId}),revealAction=async message=>({ok:true,revealedId:message.conversationId}),fetchAction=async()=>new Response(JSON.stringify({choices:[{message:{content:'We need 100 units. Could you share your WeChat?'}}]}));
@@ -23,7 +23,7 @@ function harness({attachmentResolver}={}) {
     alarms:{create:async(name,options)=>alarms.push({name,...options}),clear:async()=>true,onAlarm:listeners()},
     permissions:{contains:async request=>{permissionRequests.push(structuredClone(request));return typeof allowed==='function'?allowed(request):allowed;}},
   };
-  const monitor=createDialogMonitor({api,now:()=>time,attachmentResolver,imageLoader:async key=>{if(!images.has(key))throw new Error('Файл изображения недоступен.');return images.get(key);},fetchImpl:async(...args)=>{fetches++;return fetchAction(...args);}});
+  const monitor=createDialogMonitor({api,now:()=>time,attachmentResolver,folderSender,reserveDialogSendQuota,imageLoader:async key=>{if(!images.has(key))throw new Error('Файл изображения недоступен.');return images.get(key);},fetchImpl:async(...args)=>{fetches++;return fetchAction(...args);}});
   return {api,monitor,storage,calls,alarms,permissionRequests,tabs,replies,frameLists,images,advanceTime:ms=>{time+=ms;},get time(){return time;},get reads(){return reads;},get fetches(){return fetches;},set allowed(value){allowed=value;},set fetchAction(value){fetchAction=value;},set openAction(value){openAction=value;},set revealAction(value){revealAction=value;},command:(type,extra={},sender=ui)=>monitor.handle({type:'DIALOGS_'+type,...extra},sender)};
 }
 async function ready(h) {
@@ -585,4 +585,150 @@ test('marketplace pages cannot export prompts or import Claude answers',async()=
   const h=harness();await manualReady(h);const exported=await exportProduct(h),before=h.reads,sender={id:'test',url:urls['1688'],tab:{id:1}};
   for(const [type,payload] of [['EXPORT_PRODUCT_PROMPT',{}],['EXPORT_DRAFT_PROMPT',{key}],['IMPORT_PRODUCT_RESULT',{request:exported.request,text:JSON.stringify(extractedProduct)}]])assert.equal((await h.command(type,payload,sender)).ok,false,type);
   assert.equal(h.reads,before);assert.equal(h.fetches,0);
+});
+
+function fakeFolder(h) {
+  const jobs=new Map(),calls=[];let loseSubmit=false;
+  h.api.runtime.sendNativeMessage=async(host,message)=>{
+    assert.equal(host,'com.openlinks.claude_folder');calls.push(structuredClone(message));
+    if(message.action==='status')return {ok:true,protocol:1,folder:'C:\\Users\\Buyer\\Desktop\\OpenLinks Claude',worker:{running:false,status:'offline'},claude:{available:true}};
+    if(message.action==='configure')return {ok:true};
+    if(message.action==='submit') {if(!jobs.has(message.job.id))jobs.set(message.job.id,{...structuredClone(message.job),status:'queued'});if(loseSubmit){loseSubmit=false;throw new Error('lost after durable write');}return {ok:true,jobId:message.job.id,status:jobs.get(message.job.id).status};}
+    if(message.action==='poll')return {ok:true,results:message.ids.flatMap(id=>jobs.has(id)?[{id,status:jobs.get(id).status,request:jobs.get(id).request,imageKeys:(jobs.get(id).images||[]).map(image=>image.imageKey),text:jobs.get(id).text}]:[])};
+    if(message.action==='cancel') {if(jobs.has(message.id))jobs.get(message.id).status='cancelled';return {ok:true};}
+    if(message.action==='ack')return {ok:true};
+    throw new Error('Unexpected native action');
+  };
+  return {jobs,calls,get first(){return [...jobs.values()][0];},loseNextSubmit(){loseSubmit=true;},done(text='Could you quote 100 units?',job=[...jobs.values()][0]){job.status='done';job.text=text;},error(job=[...jobs.values()][0]){job.status='error';}};
+}
+async function folderReady(h,options={}) {await ready(h);const host=fakeFolder(h);const reply=await h.command('FOLDER_SETTINGS',{enabled:true,...options});assert.equal(reply.ok,true,reply.error);return host;}
+
+test('folder job round trip requires explicit enable, native permission and current recipient; no API call or supplier send',async()=>{
+  const h=harness();await ready(h);const host=fakeFolder(h);
+  assert.equal((await h.command('GET')).folder.enabled,false);assert.equal((await h.command('FOLDER_DRAFT',{key})).ok,false);
+  h.allowed=request=>!request.permissions;assert.equal((await h.command('FOLDER_SETTINGS',{enabled:true})).ok,false);assert.equal(host.calls.length,0);
+  h.allowed=true;await h.command('FOLDER_SETTINGS',{enabled:true});const queued=await h.command('FOLDER_DRAFT',{key});assert.equal(queued.ok,true,queued.error);assert.equal(queued.folder.jobs[0].status,'queued');
+  assert.equal(host.first.request.key,key);assert.match(host.first.prompt,/What quantity/);assert.equal(JSON.stringify(h.storage.openlinksClaudeFolder).includes('What quantity'),false);
+  host.done();const accepted=await h.command('FOLDER_POLL');assert.equal(accepted.ok,true);assert.equal(accepted.state.conversations[key].draft.text,'Could you quote 100 units?');assert.equal(accepted.folder.jobs[0].status,'accepted');
+  assert.equal(h.fetches,0);assert.ok(h.calls.every(call=>call.type==='DIALOGS_SNAPSHOT'));assert.ok(host.calls.some(call=>call.action==='ack'&&call.outcome==='accepted'));
+  await h.command('DISCARD_DRAFT',{key});assert.equal((await h.command('FOLDER_DRAFT',{key})).ok,false);
+});
+test('folder output for changed history, document, recipient or edited draft cannot overwrite current context',async()=>{
+  for(const change of ['history','document','recipient','draft','product']) {
+    const h=harness(),host=await folderReady(h);await h.command('FOLDER_DRAFT',{key});host.done('Late answer');
+    if(change==='history')h.replies.get(1).conversations[0].messages.push({id:'m2',direction:'inbound',text:'New question'});
+    if(change==='document')h.replies.get(1).documentToken='another-document';
+    if(change==='recipient')host.first.request={...host.first.request,key:'1688:wrong'};
+    if(change==='draft'){const item=(await h.command('GET')).state.conversations[key];await h.command('SAVE_DRAFT',{key,text:'Human draft',revision:item.revision,fingerprint:item.fingerprint});}
+    if(change==='product')await h.command('PRODUCT_SAVE',{product:{cardText:'Different product',keyPoints:'Different product'}});
+    const response=await h.command('FOLDER_POLL');assert.notEqual(response.state.conversations[key].draft?.text,'Late answer',change);assert.ok(['stale','cancelled'].includes(response.folder.jobs[0].status),change);
+    assert.equal(h.fetches,0);
+  }
+});
+test('folder submit with lost acknowledgment is polled or retried with exactly the same UUID',async()=>{
+  const h=harness(),host=await folderReady(h);host.loseNextSubmit();const first=await h.command('FOLDER_DRAFT',{key}),id=first.folder.jobs[0].id;
+  assert.equal(first.folder.jobs[0].status,'unknown');assert.equal(host.jobs.size,1);
+  const retried=await h.command('FOLDER_RETRY',{id});assert.equal(retried.ok,true,retried.error);assert.equal(host.jobs.size,1);assert.equal(host.calls.filter(call=>call.action==='submit').every(call=>call.job.id===id),true);
+  host.done();assert.equal((await h.command('FOLDER_POLL')).folder.jobs[0].status,'accepted');
+});
+test('confirmed failed folder jobs retry explicitly with bounded new IDs and cannot fork from an old record',async()=>{
+  const h=harness(),host=await folderReady(h);await h.command('FOLDER_DRAFT',{key});const first=host.first.id;
+  host.error();await h.command('FOLDER_POLL');assert.equal((await h.command('FOLDER_RETRY',{id:first})).ok,true);assert.equal(host.jobs.size,2);
+  assert.equal((await h.command('FOLDER_RETRY',{id:first})).ok,false);
+  const second=[...host.jobs.values()].at(-1);host.error(second);await h.command('FOLDER_POLL');assert.equal((await h.command('FOLDER_RETRY',{id:second.id})).ok,true);
+  const third=[...host.jobs.values()].at(-1);host.error(third);await h.command('FOLDER_POLL');assert.equal((await h.command('FOLDER_RETRY',{id:third.id})).ok,false);assert.equal((await h.command('FOLDER_RETRY',{id:first})).ok,false);assert.equal(host.jobs.size,3);
+});
+test('automatic folder mode queues each platform once, holds pending target and respects product approval',async()=>{
+  const h=harness(),host=await folderReady(h,{auto:true});await h.command('BIND_TAB',{platform:'alibaba',tabId:2});
+  // Binding change cancels prior tasks but leaves the chosen mode; no job exists yet.
+  h.replies.get(1).conversations.push(unreadRow('later'));await h.command('START',{readUnread:true});await poll(h);
+  assert.equal(host.jobs.size,2);assert.equal(opening(h).length,0);await poll(h);assert.equal(host.jobs.size,2);assert.equal(opening(h).length,0);
+  host.done();await poll(h);assert.equal((await h.command('GET')).state.conversations[key].draft.text,'Could you quote 100 units?');
+  await h.command('PRODUCT_SAVE',{product:{keyPoints:'Changed approved points'}});await poll(h);assert.equal(host.jobs.size,2);
+});
+test('folder product extraction imports structured result but requires new user approval',async()=>{
+  const h=harness(),host=await folderReady(h);const before=await h.command('GET');const queued=await h.command('FOLDER_PRODUCT',{revision:before.state.product.revision,fingerprint:before.productFingerprint});assert.equal(queued.ok,true,queued.error);
+  host.done(JSON.stringify({keyPoints:'Quantity: 100 units',questions:'Price?',warnings:''}));const result=await h.command('FOLDER_POLL');assert.equal(result.state.product.keyPoints,'Quantity: 100 units');assert.equal(result.state.product.approval,null);assert.equal(result.folder.jobs[0].status,'accepted');assert.equal(h.fetches,0);
+});
+test('folder busy UI defers a ready answer and pause cancels it without replacing manual work',async()=>{
+  const h=harness(),host=await folderReady(h);await h.command('FOLDER_DRAFT',{key});host.done();h.replies.get(1).busy={hasDraft:true};const deferred=await h.command('FOLDER_POLL');assert.equal(deferred.folder.jobs[0].status,'done');assert.equal(deferred.state.conversations[key].draft,null);
+  await h.command('CONTROL',{key,takeover:true});assert.equal((await h.command('FOLDER_POLL')).folder.jobs[0].status,'cancelled');
+});
+test('folder send requires separate opt-in and durable quota reservation; uncertain sends never retry',async()=>{
+  const sends=[],quotas=[];const h=harness({folderSender:async options=>{sends.push(options);assert.equal(options.enabled,true);assert.equal(options.shouldContinue(),true);const result=await options.reserve({attemptId:'attempt-1',platform:'1688',at:100});assert.equal(result.ok,true);assert.equal(h.storage.openlinksClaudeFolder.jobs[0].status,'sending');return {status:'unknown'};},reserveDialogSendQuota:async request=>{quotas.push(request);return {ok:true};}}),host=await folderReady(h,{auto:true,autoSend:true});
+  await h.command('START');await poll(h);host.done();await poll(h);const response=await h.command('GET');assert.equal(response.folder.jobs[0].status,'send_unknown');assert.equal(sends.length,1);assert.equal(quotas[0].jobId,host.first.id);
+  await poll(h);await h.command('FOLDER_POLL');assert.equal(sends.length,1);assert.equal((await h.command('FOLDER_RETRY',{id:host.first.id})).ok,false);
+});
+test('folder sends stay off in draft mode even when the worker returns a ready answer',async()=>{
+  let sends=0;const h=harness({folderSender:async()=>{sends++;return {status:'attempted'};}}),host=await folderReady(h,{auto:true});await h.command('START');await poll(h);host.done();await poll(h);assert.equal(sends,0);assert.equal((await h.command('GET')).folder.jobs[0].status,'accepted');
+});
+test('folder jobs persist across service-worker recreation and startup revokes automatic sending authority',async()=>{
+  const h=harness(),host=await folderReady(h,{auto:true,autoSend:true});await h.command('FOLDER_DRAFT',{key});host.done();
+  const recreated=createDialogMonitor({api:h.api,now:()=>h.time});assert.equal((await recreated.handle({type:'DIALOGS_FOLDER_POLL'},ui)).folder.jobs[0].status,'accepted');
+  await recreated.onStartup();const state=await recreated.handle({type:'DIALOGS_GET'},ui);assert.equal(state.folder.enabled,false);assert.equal(state.folder.autoSend,false);
+});
+test('marketplace scripts cannot submit, inspect, cancel or consume native folder jobs',async()=>{
+  const h=harness(),host=fakeFolder(h);for(const type of ['FOLDER_STATUS','FOLDER_SETTINGS','FOLDER_DRAFT','FOLDER_PRODUCT','FOLDER_POLL','FOLDER_RETRY','FOLDER_CANCEL'])assert.equal((await h.command(type,{enabled:true,key},{id:'test',url:urls['1688']})).ok,false);assert.equal(host.calls.length,0);assert.equal(h.reads,0);
+});
+
+test('folder status reports offline pause and resume keeps queued identifiers',async()=>{
+  const h=harness(),host=await folderReady(h);await h.command('FOLDER_DRAFT',{key});const native=h.api.runtime.sendNativeMessage;
+  h.api.runtime.sendNativeMessage=(name,message)=>message.action==='status'?Promise.resolve({ok:true,protocol:1,folder:'C:\\Jobs',worker:{running:true,status:'paused',pauseReason:'offline'},claude:{available:true}}):native(name,message);
+  const state=await h.command('FOLDER_POLL');assert.equal(state.folder.status,'paused');assert.equal(state.folder.worker.pauseReason,'offline');assert.match(state.folder.detail,/без интернета/);
+  await h.command('FOLDER_SETTINGS',{enabled:true});assert.equal(host.jobs.size,1);assert.equal((await h.command('GET')).folder.jobs[0].status,'queued');
+});
+test('STOP or folder cancellation while native polling waits prevents subsequent acceptance and send',async()=>{
+  for(const action of ['STOP','FOLDER_CANCEL']) {
+    let sends=0;const h=harness({folderSender:async()=>{sends++;return {status:'attempted'};}}),host=await folderReady(h,{auto:true,autoSend:true});await h.command('START');await poll(h);host.done();
+    const native=h.api.runtime.sendNativeMessage,entered=deferred(),gate=deferred();h.api.runtime.sendNativeMessage=async(name,message)=>{if(message.action==='poll'){entered.resolve();await gate.promise;}return native(name,message);};
+    const pending=h.command('FOLDER_POLL');await entered.promise;const stopped=h.command(action,{id:host.first.id});gate.resolve();await Promise.all([pending,stopped]);
+    const state=await h.command('GET');assert.equal(sends,0);assert.equal(state.state.conversations[key].draft,null);assert.equal(state.folder.jobs[0].status,'cancelled');
+  }
+});
+test('folder reply lists every processed product image and cannot mark missing pixels as analysed',async()=>{
+  const h=harness(),host=await folderReady(h);
+  const file={id:'photo',name:'product.png',kind:'image',mime:'image/png',status:'ready',text:'',contentHash:'a'.repeat(64),images:[{imageKey:'img:photo',mime:'image/png'}]};
+  await h.command('PRODUCT_SAVE',{product:{cardText:'Product drawing',files:[file]}});h.images.set('img:photo','data:image/png;base64,aGVsbG8=');
+  const before=await h.command('GET');const queued=await h.command('FOLDER_PRODUCT',{revision:before.state.product.revision,fingerprint:before.productFingerprint});assert.equal(queued.ok,true,queued.error);
+  assert.equal(host.first.images[0].data,'aGVsbG8=');assert.deepEqual(host.first.request.imageKeys,['img:photo']);host.done(JSON.stringify({keyPoints:'Drawing supplied',questions:'Confirm dimensions',warnings:''}));
+  const result=await h.command('FOLDER_POLL');assert.deepEqual(result.state.product.extraction.processedImageKeys,['img:photo']);assert.equal(result.state.product.approval,null);
+});
+
+test('quota deferred replies resume without new Claude inference and do not block another platform',async()=>{
+  const attempts=[];let h;
+  h=harness({folderSender:async options=>{attempts.push(options.request.key);if(options.request.key===key&&attempts.filter(value=>value===key).length===1)return {status:'deferred',retryAt:h.time+1200000};assert.equal((await options.reserve({attemptId:crypto.randomUUID(),platform:options.state.conversations[options.request.key].platform,at:h.time})).ok,true);return {status:'attempted'};},reserveDialogSendQuota:async()=>({ok:true})});
+  const host=await folderReady(h,{auto:true,autoSend:true});await h.command('BIND_TAB',{platform:'alibaba',tabId:2});await h.command('START');await poll(h);
+  for(const job of host.jobs.values())host.done('Thank you. Please quote 100 units.',job);
+  await poll(h);let response=await h.command('GET');assert.equal(response.folder.jobs.find(job=>job.key===key).status,'awaiting_limit');assert.equal(response.folder.jobs.find(job=>job.key!==key).status,'sent');assert.equal(JSON.stringify(h.storage.openlinksClaudeFolder).includes('Thank you. Please quote 100 units.'),false);
+  const total=host.calls.filter(call=>call.action==='submit').length;
+  h.advanceTime(1199000);await poll(h);assert.equal(attempts.filter(value=>value===key).length,1);
+  h.advanceTime(2000);await poll(h);response=await h.command('GET');assert.equal(response.folder.jobs.find(job=>job.key===key).status,'sent');assert.equal(attempts.filter(value=>value===key).length,2);assert.equal(host.calls.filter(call=>call.action==='submit').length,total);
+  await poll(h);assert.equal(attempts.filter(value=>value===key).length,2);
+});
+test('quota waiting response is discarded when its incoming context changes',async()=>{
+  let attempts=0;const h=harness({folderSender:async()=>{attempts++;return {status:'deferred',retryAt:h.time+60000};}}),host=await folderReady(h,{auto:true,autoSend:true});await h.command('START');await poll(h);host.done();await poll(h);
+  assert.equal((await h.command('GET')).folder.jobs[0].status,'awaiting_limit');h.advanceTime(61000);h.replies.get(1).conversations[0].messages.push({id:'new-message',direction:'inbound',text:'The quantity has changed.'});
+  await h.command('FOLDER_POLL');const result=await h.command('GET');assert.equal(result.folder.jobs[0].status,'stale');assert.equal(result.state.conversations[key].draft,null);assert.equal(attempts,1);
+});
+
+test('a missing folder image can be retried after its cached bytes become available',async()=>{
+  const h=harness(),host=await folderReady(h);
+  const file={id:'photo',name:'drawing.png',kind:'image',mime:'image/png',status:'ready',text:'',contentHash:'a'.repeat(64),images:[{imageKey:'img:retry',mime:'image/png'}]};
+  await h.command('PRODUCT_SAVE',{product:{cardText:'Drawing',files:[file]}});let before=await h.command('GET');assert.equal((await h.command('FOLDER_PRODUCT',{revision:before.state.product.revision,fingerprint:before.productFingerprint})).ok,false);
+  before=await h.command('GET');assert.equal(before.folder.jobs[0].status,'error');assert.equal(host.jobs.size,0);
+  h.images.set('img:retry','data:image/png;base64,aGVsbG8=');const retry=await h.command('FOLDER_RETRY',{id:before.folder.jobs[0].id});assert.equal(retry.ok,true,retry.error);assert.equal(host.jobs.size,1);assert.deepEqual(host.first.request.imageKeys,['img:retry']);
+});
+
+test('monitor start journal describes the actual folder sending mode',async()=>{
+  const h=harness();await folderReady(h,{auto:true,autoSend:true});const started=await h.command('START');const detail=started.state.events.filter(event=>event.type==='monitor_started').at(-1).detail;assert.match(detail,/Автоматическая отправка разрешена/);assert.doesNotMatch(detail,/Ввод и отправка сообщений отключены/);
+  await h.command('FOLDER_SETTINGS',{enabled:false});const paused=await h.command('START');assert.match(paused.state.events.filter(event=>event.type==='monitor_started').at(-1).detail,/Ввод и отправка сообщений отключены/);
+});
+
+test('a full folder queue does not pin traversal and previously read unanswered chats resume when capacity returns',async()=>{
+  const h=harness(),host=await folderReady(h,{auto:true});
+  h.replies.get(1).conversations.push(unreadRow('backlog',{unread:false,needsRead:false,orderReliable:true,tailKnown:true,messages:[{id:'backlog-message',direction:'inbound',text:'Please quote this product.'}]}));await h.command('SCAN');
+  const config=h.storage.openlinksClaudeFolder;config.jobs=Array.from({length:12},(_,index)=>({id:crypto.randomUUID(),kind:'product',key:'__product_extraction__',status:'queued',request:{revision:index,fingerprint:'old',imageKeys:[]},signature:index.toString(16).padStart(64,'0'),createdAt:h.time,at:h.time,attempts:1,configRevision:config.revision}));
+  await h.command('START',{readUnread:true});await poll(h);assert.equal(host.jobs.size,0);
+  h.storage.openlinksClaudeFolder.jobs=[];h.replies.get(1).conversations[0].messages.push({id:'answered',direction:'outbound',text:'We need 100 units.'});
+  await poll(h);assert.equal(opening(h).at(-1)?.conversationId,'backlog');assert.equal(host.jobs.size,0);
 });
