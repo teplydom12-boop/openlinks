@@ -12,20 +12,21 @@ function snapshot(platform='1688',extra={}) {
   return {platform,status:'ready',url:urls[platform],documentToken:'doc-1',frames:[],conversations:[{id:'supplier-1',title:'Supplier',identityReliable:true,active:true,unread:true,orderReliable:true,tailKnown:true,messages:[{id:'m1',direction:'inbound',text:'What quantity do you need?'}]}],...extra};
 }
 function harness({attachmentResolver,folderSender,testCleaner,testRecovery,pauseOutreachForTest,reserveDialogSendQuota,reorderStorage=false}={}) {
-  const storage={},calls=[],alarms=[],permissionRequests=[],tabs=new Map([[1,{id:1,url:urls['1688'],status:'complete'}],[2,{id:2,url:urls.alibaba}],[3,{id:3,url:urls.mic}]]);
+  const storage={},calls=[],alarms=[],permissionRequests=[],tabUpdates=[],tabs=new Map([[1,{id:1,url:urls['1688'],status:'complete'}],[2,{id:2,url:urls.alibaba}],[3,{id:3,url:urls.mic}]]);
   const replies=new Map([[1,snapshot()],[2,snapshot('alibaba')],[3,snapshot('mic')]]);
   const frameLists=new Map(),images=new Map();let reads=0,fetches=0,allowed=true,time=1000000,openAction=async message=>({ok:true,openedId:message.conversationId}),revealAction=async message=>({ok:true,revealedId:message.conversationId}),fetchAction=async()=>new Response(JSON.stringify({choices:[{message:{content:'We need 100 units. Could you share your WeChat?'}}]}));
   const listeners=()=>({list:[],addListener(fn){this.list.push(fn);}});
   const api={runtime:{id:'test',getURL:path=>'chrome-extension://test/'+path,getManifest:()=>({optional_host_permissions:['https://api.openai.com/*','https://api.anthropic.com/*']}),onMessage:listeners(),onStartup:listeners(),onInstalled:listeners()},
     storage:{local:{get:async name=>{reads++;return {[name]:structuredClone(storage[name])};},set:async data=>Object.assign(storage,reorderStorage?sortedJSON(structuredClone(data)):structuredClone(data)),setAccessLevel:async value=>calls.push({access:value})}},
     tabs:{get:async id=>{if(!tabs.has(id))throw new Error('No tab');return structuredClone(tabs.get(id));},query:async()=>[...tabs.values()],
+      update:async(id,patch)=>{if(!tabs.has(id))throw new Error('No tab');tabUpdates.push({id,...patch});Object.assign(tabs.get(id),patch);return structuredClone(tabs.get(id));},
       sendMessage:async(id,message,options)=>{calls.push({id,...structuredClone(message),frameId:options.frameId});if(message.type==='DIALOGS_OPEN_CONVERSATION')return openAction(message,id);if(message.type==='DIALOGS_REVEAL_LATEST')return revealAction(message,id);const value=replies.get(`${id}:${options.frameId}`) || replies.get(id);return typeof value==='function'?value(message):structuredClone(value);},onUpdated:listeners(),onRemoved:listeners()},
     webNavigation:{getAllFrames:async({tabId})=>frameLists.get(tabId) || [{frameId:0,parentFrameId:-1,url:tabs.get(tabId).url}]},
     alarms:{create:async(name,options)=>alarms.push({name,...options}),clear:async()=>true,onAlarm:listeners()},
     permissions:{contains:async request=>{permissionRequests.push(structuredClone(request));return typeof allowed==='function'?allowed(request):allowed;}},
   };
   const monitor=createDialogMonitor({api,now:()=>time,attachmentResolver,folderSender,testCleaner,testRecovery,pauseOutreachForTest,reserveDialogSendQuota,imageLoader:async key=>{if(!images.has(key))throw new Error('Файл изображения недоступен.');return images.get(key);},fetchImpl:async(...args)=>{fetches++;return fetchAction(...args);}});
-  return {api,monitor,storage,calls,alarms,permissionRequests,tabs,replies,frameLists,images,advanceTime:ms=>{time+=ms;},get time(){return time;},get reads(){return reads;},get fetches(){return fetches;},set allowed(value){allowed=value;},set fetchAction(value){fetchAction=value;},set openAction(value){openAction=value;},set revealAction(value){revealAction=value;},command:(type,extra={},sender=ui)=>monitor.handle({type:'DIALOGS_'+type,...extra},sender)};
+  return {api,monitor,storage,calls,alarms,permissionRequests,tabUpdates,tabs,replies,frameLists,images,advanceTime:ms=>{time+=ms;},get time(){return time;},get reads(){return reads;},get fetches(){return fetches;},set allowed(value){allowed=value;},set fetchAction(value){fetchAction=value;},set openAction(value){openAction=value;},set revealAction(value){revealAction=value;},command:(type,extra={},sender=ui)=>monitor.handle({type:'DIALOGS_'+type,...extra},sender)};
 }
 async function ready(h) {
   assert.equal((await h.command('BIND_TAB',{platform:'1688',tabId:1})).ok,true);
@@ -73,6 +74,89 @@ test('binding validates marketplace and rejects tabs still owned by outreach',as
   const h=harness();assert.equal((await h.command('BIND_TAB',{platform:'mic',tabId:1})).ok,false);
   h.storage.openlinksState={queue:[{status:'review',tabId:1}]};assert.equal((await h.command('BIND_TAB',{platform:'1688',tabId:1})).ok,false);
   h.storage.openlinksState.queue[0].status='sent';assert.equal((await h.command('BIND_TAB',{platform:'1688',tabId:1})).ok,true);
+});
+test('bound tabs stay resident without activation and restore only owned auto-discard changes',async()=>{
+  const h=harness();h.tabs.get(1).autoDiscardable=true;h.tabs.get(2).autoDiscardable=false;
+  await h.command('BIND_TAB',{platform:'1688',tabId:1});await h.command('BIND_TAB',{platform:'alibaba',tabId:2});
+  assert.deepEqual(h.tabUpdates,[{id:1,autoDiscardable:false}]);
+  assert.deepEqual(h.storage[DIALOGS_KEY].bindings['1688'].discardProtection,{status:'protected',original:true,changed:true});
+  assert.deepEqual(h.storage[DIALOGS_KEY].bindings.alibaba.discardProtection,{status:'protected',original:false,changed:false});
+  // A second bind and a service-worker recreation must retain restoration authority.
+  await h.command('BIND_TAB',{platform:'1688',tabId:1});
+  const restarted=createDialogMonitor({api:h.api});
+  assert.equal((await restarted.handle({type:'DIALOGS_UNBIND_TAB',platform:'1688'},ui)).ok,true);
+  await h.command('UNBIND_TAB',{platform:'alibaba'});
+  assert.deepEqual(h.tabUpdates,[{id:1,autoDiscardable:false},{id:1,autoDiscardable:true}]);
+  assert.equal(h.tabs.get(2).autoDiscardable,false);
+});
+test('replacing or navigating away releases the protected tab; unrelated tabs stay untouched',async()=>{
+  const h=harness();h.tabs.get(1).autoDiscardable=true;h.tabs.set(4,{id:4,url:urls['1688'],autoDiscardable:true});
+  await h.command('BIND_TAB',{platform:'1688',tabId:1});await h.command('BIND_TAB',{platform:'1688',tabId:4});
+  assert.deepEqual(h.tabUpdates,[{id:1,autoDiscardable:false},{id:1,autoDiscardable:true},{id:4,autoDiscardable:false}]);
+  h.tabs.get(4).url='https://example.com/';await h.monitor.onTabUpdated(4,{url:'https://example.com/'},h.tabs.get(4));
+  assert.deepEqual(h.tabUpdates.at(-1),{id:4,autoDiscardable:true});
+  assert.equal(h.storage[DIALOGS_KEY].bindings['1688'].tabId,null);
+  assert.equal(h.tabUpdates.some(update=>update.id===2||update.id===3),false);
+});
+test('protection failure is diagnosed once and does not invent restoration authority',async()=>{
+  for(const unsupported of [true,false]) {
+    const h=harness();let attempts=0;
+    if(!unsupported){h.tabs.get(1).autoDiscardable=true;h.api.tabs.update=async()=>{attempts++;throw new Error('not supported');};}
+    await h.command('BIND_TAB',{platform:'1688',tabId:1});await h.command('SCAN');await h.command('SCAN');
+    const state=h.storage[DIALOGS_KEY];assert.equal(state.bindings['1688'].discardProtection.status,unsupported?'unsupported':'failed');
+    assert.equal(state.events.filter(event=>event.type==='tab_discard_protection').length,1);
+    await h.command('UNBIND_TAB',{platform:'1688'});assert.equal(attempts,unsupported?0:1);
+  }
+});
+test('an external protection override is respected instead of fought on each scan',async()=>{
+  const h=harness();h.tabs.get(1).autoDiscardable=true;await h.command('BIND_TAB',{platform:'1688',tabId:1});
+  h.tabs.get(1).autoDiscardable=true;await h.command('SCAN');await h.command('SCAN');
+  assert.equal(h.tabUpdates.length,1);assert.equal(h.storage[DIALOGS_KEY].bindings['1688'].discardProtection.status,'overridden');
+  await h.command('UNBIND_TAB',{platform:'1688'});assert.equal(h.tabUpdates.length,1);
+});
+test('startup and extension update drop persisted protection authority without touching tabs',async()=>{
+  for(const update of [false,true]) {
+    const h=harness();h.tabs.get(1).autoDiscardable=true;await h.command('BIND_TAB',{platform:'1688',tabId:1});
+    if(update)await h.monitor.onInstalled({reason:'update'});else {h.tabs.get(1).url='https://personal.example/';await h.monitor.onStartup();}
+    assert.equal(h.tabUpdates.length,1);assert.equal(h.storage[DIALOGS_KEY].bindings['1688'].tabId,null);
+  }
+});
+test('an extension update before browser startup cannot restore settings on a reused same-platform tab ID',async()=>{
+  const h=harness();h.tabs.get(1).autoDiscardable=true;await h.command('BIND_TAB',{platform:'1688',tabId:1});
+  assert.equal(h.storage[DIALOGS_KEY].bindings['1688'].discardProtection.changed,true);
+  // New Chrome session: this happens to be another tab with the exact same URL
+  // and ID, whose owner has disabled auto-discard independently of OpenLinks.
+  h.tabs.set(1,{id:1,url:urls['1688'],autoDiscardable:false,status:'complete'});
+  const freshSession=createDialogMonitor({api:h.api});
+  await freshSession.onInstalled({reason:'update'});
+  await freshSession.onStartup();
+  assert.deepEqual(h.tabUpdates,[{id:1,autoDiscardable:false}]);
+  assert.equal(h.tabs.get(1).autoDiscardable,false);
+  assert.equal(h.storage[DIALOGS_KEY].bindings['1688'].tabId,null);
+  assert.equal(h.storage[DIALOGS_KEY].bindings['1688'].discardProtection,undefined);
+});
+test('discarded or frozen chats pause with actionable diagnostics and no reload, reading, or draft loss',async()=>{
+  for(const property of ['discarded','frozen']) {
+    const h=harness();await ready(h);await h.command('START');
+    const item=(await h.command('GET')).state.conversations[key];
+    assert.equal((await h.command('SAVE_DRAFT',{key,text:'Keep this unsent draft.',revision:item.revision,fingerprint:item.fingerprint})).ok,true);
+    const before=structuredClone(h.storage[DIALOGS_KEY].conversations[key]),calls=h.calls.length;
+    h.tabs.get(1)[property]=true;
+    const paused=await h.command('SCAN');assert.equal(paused.state.bindings['1688'].status,'paused');
+    assert.match(paused.state.bindings['1688'].detail,/Откройте её вручную/);
+    assert.equal(paused.state.conversations[key].draft.text,'Keep this unsent draft.');
+    assert.deepEqual(paused.state.conversations[key],before);assert.equal(h.calls.length,calls);assert.equal(h.tabUpdates.length,0);
+    await h.command('SCAN');assert.equal(h.storage[DIALOGS_KEY].events.filter(event=>event.type==='monitor_health'&&/Откройте её вручную/.test(event.detail)).length,1);
+    assert.equal((await h.command('GENERATE_DRAFT',{key})).ok,false);assert.equal(h.fetches,0);
+    h.tabs.get(1)[property]=false;assert.equal((await h.command('SCAN')).state.bindings['1688'].status,'ready');
+  }
+});
+test('a lifecycle event or suspension during snapshot invalidates the in-flight read',async()=>{
+  const h=harness();await ready(h);
+  await h.monitor.onTabUpdated(1,{frozen:true},{...h.tabs.get(1),frozen:true});
+  assert.equal(h.storage[DIALOGS_KEY].bindings['1688'].status,'paused');
+  h.replies.set(1,()=>{h.tabs.get(1).discarded=true;return snapshot();});
+  const result=await h.command('SCAN');assert.equal(result.state.bindings['1688'].status,'paused');assert.match(result.state.bindings['1688'].detail,/выгрузил/);
 });
 test('restart drops authority over reused IDs while preserving observed conversation history',async()=>{
   const h=harness();await ready(h);await h.command('START');await h.monitor.onStartup();

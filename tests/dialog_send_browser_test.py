@@ -48,6 +48,40 @@ with sync_playwright() as p:
         return page.evaluate("command('PREPARE',{dialogGuard:guard,dialogPreview:true})")
     def clear_preview():
         return page.evaluate("command('DIALOGS_CLEAR_PREVIEW',{token:cleanupToken})")
+    def prepare_1688():
+        load('1688')
+        page.evaluate("()=>{window.testClock=Date.now();Date.now=()=>testClock;}")
+        assert page.evaluate("command('CHAT_READY')")['waiting']
+        page.evaluate('testClock+=6000')
+        assert prepare()['needsNativeInput']
+        for stage in ['locate', 'focus']:
+            assert page.evaluate("stage=>command('NATIVE_INPUT',{dialogGuard:guard,expectedUrl:location.href,token:'native-test',stage})",stage)['ok']
+        page.keyboard.press('Space')
+        assert page.evaluate("command('NATIVE_INPUT',{dialogGuard:guard,expectedUrl:location.href,token:'native-test',stage:'space'})")['ok']
+        page.keyboard.press('Backspace')
+        assert page.evaluate("command('NATIVE_INPUT',{dialogGuard:guard,expectedUrl:location.href,token:'native-test',stage:'done'})")['ok']
+        assert prepare()['ok']
+    def suppress_page_timers():
+        # Reproduce background timer throttling without slowing this test or
+        # relying on headless Chromium's platform-specific occlusion behavior.
+        page.evaluate("""()=>{
+          window.timerRequests=0;window.pendingTimers=new Map();
+          window.setTimeout=(fn,ms)=>{const id=++timerRequests;pendingTimers.set(id,{fn,ms});return id};
+          window.clearTimeout=id=>pendingTimers.delete(id);
+          window.observerCount=0;
+          const NativeObserver=MutationObserver;
+          window.MutationObserver=class extends NativeObserver {
+            observe(...args){if(!this.counted){observerCount++;this.counted=true}return super.observe(...args)}
+            disconnect(){if(this.counted){observerCount--;this.counted=false}return super.disconnect()}
+          };
+        }""")
+    def begin_send():
+        page.evaluate("()=>{window.sendResult=null;window.sending=command('SEND',{dialogGuard:guard,expectedUrl:location.href,attemptId:guard.operation}).then(result=>window.sendResult=result)}")
+        page.wait_for_function('syntheticClicks===1',timeout=2000)
+    def completed_send():
+        page.wait_for_function('sendResult!==null',timeout=2000)
+        assert page.evaluate('observerCount===0 && pendingTimers.size===0')
+        return page.evaluate('sendResult')
 
     load()
     assert page.evaluate('OpenLinksDialogsReader.guardReply(guard).ok')
@@ -139,21 +173,71 @@ with sync_playwright() as p:
     assert prepare()['ok'] and send()['clicked'] and page.evaluate('syntheticClicks') == 1
     passed('the same recipient guard works inside the Made-in-China messenger')
 
-    load('1688')
-    page.evaluate("()=>{window.testClock=Date.now();Date.now=()=>testClock;}")
-    assert page.evaluate("command('CHAT_READY')")['waiting']
-    page.evaluate('testClock+=6000')
-    assert prepare()['needsNativeInput']
-    for stage in ['locate', 'focus']:
-        assert page.evaluate("stage=>command('NATIVE_INPUT',{dialogGuard:guard,expectedUrl:location.href,token:'native-test',stage})",stage)['ok']
-    page.keyboard.press('Space')
-    assert page.evaluate("command('NATIVE_INPUT',{dialogGuard:guard,expectedUrl:location.href,token:'native-test',stage:'space'})")['ok']
-    page.keyboard.press('Backspace')
-    assert page.evaluate("command('NATIVE_INPUT',{dialogGuard:guard,expectedUrl:location.href,token:'native-test',stage:'done'})")['ok']
-    assert prepare()['ok']
+    prepare_1688()
     result=send()
     assert result['clicked'] and result['accepted'] and page.evaluate('syntheticClicks') == 1, result
     passed('1688 Space/Backspace activation preserves guarded editor ownership through sending')
+
+    prepare_1688();suppress_page_timers();begin_send()
+    result=completed_send()
+    assert result['clicked'] and result['accepted'],result
+    assert page.evaluate('timerRequests===0')
+    assert send()['clicked'] is False and page.evaluate('syntheticClicks')==1
+    passed('1688 synchronous composer consumption completes without any page timer and still rejects duplicate SEND')
+
+    prepare_1688()
+    page.evaluate('()=>{document.querySelector("#send").onclick=()=>syntheticClicks++}')
+    suppress_page_timers();begin_send()
+    assert page.evaluate('sendResult===null && observerCount===1 && timerRequests===1')
+    page.evaluate("document.querySelector('pre.edit').textContent=''")
+    result=completed_send()
+    assert result['clicked'] and result['accepted'],result
+    assert send()['clicked'] is False and page.evaluate('syntheticClicks')==1
+    passed('1688 asynchronous DOM consumption completes and disconnects observers even when every page timer is blocked')
+
+    for event_type in ['input','change']:
+        prepare_1688()
+        # A value-backed editor can clear without changing its DOM tree.
+        page.evaluate("()=>{const editor=document.querySelector('pre.edit');editor.value=editor.innerText;document.querySelector('#send').onclick=()=>syntheticClicks++}")
+        suppress_page_timers();begin_send()
+        page.evaluate("type=>{const editor=document.querySelector('pre.edit');editor.value='';editor.dispatchEvent(new Event(type,{bubbles:true}))}",event_type)
+        result=completed_send()
+        assert result['clicked'] and result['accepted'],result
+    passed('input and change events confirm value-only consumption without DOM mutation or timer callbacks')
+
+    for invalidation in ['detached','hidden','captcha','recipient','navigation','pagehide']:
+        prepare_1688()
+        page.evaluate('()=>{document.querySelector("#send").onclick=()=>syntheticClicks++}')
+        suppress_page_timers();begin_send()
+        page.evaluate("""kind=>{
+          const editor=document.querySelector('pre.edit');editor.textContent='';
+          if(kind==='detached')editor.remove();
+          if(kind==='hidden')editor.style.display='none';
+          if(kind==='captcha')document.body.insertAdjacentHTML('beforeend','<div id=captcha style="width:200px;height:80px">Check</div>');
+          if(kind==='recipient')document.querySelector('[data-chat-root]').dataset.threadId='different-supplier';
+          if(kind==='navigation')location.hash='another-chat';
+          if(kind==='pagehide')dispatchEvent(new Event('pagehide'));
+        }""",invalidation)
+        result=completed_send()
+        assert result['clicked'] and result['accepted'] is False,(invalidation,result)
+        assert send()['clicked'] is False and page.evaluate('syntheticClicks')==1
+    passed('emptying a changed, hidden, detached, blocked or navigating chat remains an unknown outcome without automatic retries')
+
+    prepare_1688()
+    page.evaluate('()=>{document.querySelector("#send").onclick=()=>syntheticClicks++}')
+    suppress_page_timers();begin_send()
+    page.evaluate('()=>{window.afterDeadline=performance.now()+1500;performance.now=()=>afterDeadline;document.querySelector("pre.edit").textContent=""}')
+    result=completed_send()
+    assert result['clicked'] and result['accepted'] is False,result
+    assert send()['clicked'] is False and page.evaluate('syntheticClicks')==1
+    passed('a delayed mutation cannot extend the bounded confirmation window when timeout callbacks are throttled')
+
+    prepare_1688()
+    page.evaluate('()=>{document.querySelector("#send").onclick=()=>syntheticClicks++}')
+    result=send()
+    assert result['clicked'] and result['accepted'] is False,result
+    assert send()['clicked'] is False and page.evaluate('syntheticClicks')==1
+    passed('an unchanged 1688 draft times out locally and cannot trigger a second send')
 
     for platform in ['alibaba','mic']:
         load(platform)

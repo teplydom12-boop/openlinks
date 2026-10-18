@@ -23,6 +23,16 @@ test('bind validates platform domain and preserves only useful routing URL param
   assert.equal(state.bindings['1688'].url,'https://air.1688.com/chat?touid=cn123');
   assert.equal(state.bindings['1688'].status,'loading');unbindDialogTab(state,'1688',11);assert.equal(state.bindings['1688'].tabId,null);
 });
+test('auto-discard protection ownership persists only for validated bound tabs',()=>{
+  const state=initialDialogs();bindDialogTab(state,'1688',2,'https://air.1688.com/chat');
+  state.bindings['1688'].discardProtection={status:'protected',original:true,changed:true,extra:'discarded'};
+  assert.deepEqual(normalizeDialogs(state).bindings['1688'].discardProtection,{status:'protected',original:true,changed:true});
+  for(const value of [{status:'failed',original:true,changed:true},{status:'protected',original:false,changed:true},{status:'protected',original:'true',changed:true}]) {
+    state.bindings['1688'].discardProtection=value;assert.equal(normalizeDialogs(state).bindings['1688'].discardProtection.changed,false);
+  }
+  state.bindings['1688'].discardProtection={status:'anything',original:true,changed:true};assert.equal(normalizeDialogs(state).bindings['1688'].discardProtection,undefined);
+  unbindDialogTab(state,'1688');assert.equal(state.bindings['1688'].discardProtection,undefined);
+});
 test('a truncated supplier message never becomes an actionable reply target',()=>{
   const state=initialDialogs();observe(state,[msg('large','x'.repeat(6001))]);
   assert.equal(state.conversations[key].messages[0].text.length,6000);

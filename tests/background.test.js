@@ -7,7 +7,7 @@ import {domReply} from './debugger-harness.js';
 const listener=()=>{const list=[];return {list,addListener(fn){list.push(fn);}};};
 let stored,clicks,contactClicks,commands,requests,beforeClick,probeKind,sendResult,frameUrl,tabCount,opened,missing,obstacle,prepareOk,lookupPages,fetches,probeRoute,updated,probeKey,listedTabs,frameList,tabReplies,frameProbes,deliveries;
 let scheduled,removed,canClose,nativeRequired,debuggerFailure,debuggerCalls,nativeFailure,chatReady;
-let afterPrepare,querySendGuard;
+let afterPrepare,querySendGuard,createdTabs,windowReplies,lastNormalWindow,windowUpdates;
 let extraStorage={};
 const metadataFixture=readFileSync(new URL('./fixtures/1688-metadata.html',import.meta.url),'utf8');
 globalThis.fetch=async(url,options)=>{fetches.push({url,credentials:options.credentials});const html=lookupPages.get(url);if(html===undefined)throw new Error('No local metadata fixture');return new Response(html,{headers:{'content-type':'text/html'}});};
@@ -17,7 +17,7 @@ globalThis.chrome={runtime,alarms,storage:{local:{get:async keys=>{
  const all={...extraStorage,openlinksState:stored};
  return structuredClone(keys==null?all:Object.fromEntries((Array.isArray(keys)?keys:[keys]).map(key=>[key,all[key]])));
 },set:async data=>{if(Object.hasOwn(data,'openlinksState'))stored=structuredClone(data.openlinksState);for(const [key,value] of Object.entries(data))if(key!=='openlinksState')extraStorage[key]=structuredClone(value);},setAccessLevel:async()=>{}}},
- tabs:{onUpdated:listener(),onCreated:listener(),create:async data=>{opened.push(data.url);return {id:++tabCount};},update:async(id,data)=>{updated.push({id,...data});},query:async()=>structuredClone(listedTabs),get:async id=>tabReplies.get(id) || ({id,url:frameUrl}),
+ tabs:{onUpdated:listener(),onCreated:listener(),create:async data=>{opened.push(data.url);createdTabs.push(structuredClone(data));return {id:++tabCount,windowId:data.windowId};},update:async(id,data)=>{updated.push({id,...data});},query:async()=>structuredClone(listedTabs.map(tab=>({windowId:10,...tab}))),get:async id=>({windowId:10,...(tabReplies.get(id) || {id,url:frameUrl})}),
  remove:async id=>{removed.push(id);},
  sendMessage:async(tab,data,options)=>{
   deliveries.push({tabId:tab,frameId:options.frameId,type:data.type});
@@ -33,7 +33,7 @@ globalThis.chrome={runtime,alarms,storage:{local:{get:async keys=>{
   if(data.type==='CONTACT'){contactClicks++;return {ok:true,key:probeKey};}
   if(data.type==='DISMISS_CHALLENGE'){if(obstacle?.stuck)return {clicked:true,closed:false};obstacle=null;return {clicked:true,closed:true};}
   return {ok:true};
- }},webNavigation:{onCreatedNavigationTarget:listener(),getAllFrames:async()=>{if(missing)throw new Error('No tab');return frameList || [{frameId:0,url:frameUrl}];}},action:{onClicked:listener()},windows:{}};
+ }},webNavigation:{onCreatedNavigationTarget:listener(),getAllFrames:async()=>{if(missing)throw new Error('No tab');return frameList || [{frameId:0,url:frameUrl}];}},action:{onClicked:listener()},windows:{get:async id=>{if(!windowReplies.has(id))throw new Error('Window closed');return structuredClone(windowReplies.get(id));},getLastFocused:async()=>structuredClone(lastNormalWindow),update:async(id,data)=>{windowUpdates.push({id,...data});},create:async data=>{windowUpdates.push(data);}}};
 await import('../extension/background.js');
 chrome.debugger={
  attach:async target=>{debuggerCalls.push({type:'attach',target});if(debuggerFailure)throw new Error(debuggerFailure);},
@@ -45,7 +45,7 @@ const message=(type,extra={},sender=ui)=>new Promise(resolve=>{
  for(const listen of runtime.onMessage.list)listen({type,...extra},sender,resolve);
 });
 async function tick(){alarms.onAlarm.list[0]({name:'openlinks-tick'});await message('GET');}
-function reset(){afterPrepare=null;querySendGuard=false;stored=initialState();extraStorage={};stored.settings.message='Hello';clicks=0;contactClicks=0;commands=[];requests=[];beforeClick=null;probeKind='chat';sendResult=true;frameUrl='https://a.en.alibaba.com/chat';tabCount=0;opened=[];missing=false;obstacle=null;prepareOk=true;lookupPages=new Map();fetches=[];probeRoute=null;updated=[];probeKey='#contact';listedTabs=[];frameList=null;tabReplies=new Map();frameProbes=new Map();deliveries=[];scheduled=[];removed=[];canClose=true;nativeRequired=false;debuggerFailure=null;debuggerCalls=[];nativeFailure=null;chatReady=true;}
+function reset(){createdTabs=[];windowReplies=new Map([[10,{id:10,type:'normal'}]]);lastNormalWindow={id:10,type:'normal'};windowUpdates=[];afterPrepare=null;querySendGuard=false;stored=initialState();extraStorage={};stored.settings.message='Hello';clicks=0;contactClicks=0;commands=[];requests=[];beforeClick=null;probeKind='chat';sendResult=true;frameUrl='https://a.en.alibaba.com/chat';tabCount=0;opened=[];missing=false;obstacle=null;prepareOk=true;lookupPages=new Map();fetches=[];probeRoute=null;updated=[];probeKey='#contact';listedTabs=[];frameList=null;tabReplies=new Map();frameProbes=new Map();deliveries=[];scheduled=[];removed=[];canClose=true;nativeRequired=false;debuggerFailure=null;debuggerCalls=[];nativeFailure=null;chatReady=true;}
 async function review(url='https://a.en.alibaba.com/'){await message('IMPORT',{text:url});await message('START');await tick();await tick();}
 async function openingTimedOut(){stored.queue[0].chatOpening.at=Date.now()-21000;await tick();}
 
@@ -53,6 +53,53 @@ async function retryDue(){stored.queue.find(j=>j.id===stored.activeId).retryAt=D
 // Compatibility fixture for already-persisted manual/automatic interventions.
 function legacyUncertain(){stored.queue[0].status='uncertain';stored.activeId=stored.queue[0].id;stored.running=false;}
 async function fireClose(token){alarms.onAlarm.list[0]({name:'openlinks-close:'+token});await message('GET');}
+test('automatic outreach tabs stay inactive in the window bound at Start, even after focus changes',async()=>{
+ reset();windowReplies.set(22,{id:22,type:'normal'});
+ await message('IMPORT',{text:'https://a.en.alibaba.com/\nhttps://b.en.made-in-china.com/'});
+ await message('START',{}, {...ui,tab:{id:100,windowId:22}});
+ assert.equal(stored.queueWindowId,22);
+ lastNormalWindow={id:33,type:'normal'};windowReplies.set(33,lastNormalWindow);
+ await tick();
+ assert.deepEqual(createdTabs,[{url:'https://a.en.alibaba.com/',active:false,windowId:22}]);
+ await message('SKIP',{id:stored.activeId});await tick();
+ assert.equal(createdTabs.length,2);
+ assert.ok(createdTabs.every(tab=>tab.active===false && tab.windowId===22));
+ assert.ok(!updated.some(tab=>tab.active===true));assert.deepEqual(windowUpdates,[]);
+});
+test('popup dashboard binds a normal browser window and never creates outreach tabs in its popup',async()=>{
+ reset();windowReplies.set(20,{id:20,type:'popup'});
+ await message('IMPORT',{text:'https://a.en.alibaba.com/'});
+ assert.equal((await message('START',{}, {...ui,tab:{id:100,windowId:20}})).ok,true);
+ await tick();assert.equal(createdTabs[0].windowId,10);assert.equal(createdTabs[0].active,false);
+ assert.deepEqual(windowUpdates,[]);
+});
+test('closing the queue window pauses before spending a visit and never falls back to another window',async()=>{
+ reset();await message('IMPORT',{text:'https://a.en.alibaba.com/'});await message('START');
+ windowReplies.delete(10);lastNormalWindow={id:33,type:'normal'};windowReplies.set(33,lastNormalWindow);
+ await tick();
+ assert.equal(stored.running,false);assert.equal(stored.queue[0].status,'pending');
+ assert.equal(stored.slots.length,0);assert.equal(createdTabs.length,0);assert.equal(stored.activeId,null);
+ assert.match(stored.activity.detail,/Окно очереди закрыто/);
+ assert.equal((await message('START')).ok,true);await tick();
+ assert.equal(createdTabs[0].windowId,33);assert.equal(createdTabs[0].active,false);
+});
+test('Start without an available normal browser window does not start or create a window itself',async()=>{
+ reset();windowReplies.clear();lastNormalWindow=null;
+ await message('IMPORT',{text:'https://a.en.alibaba.com/'});
+ const result=await message('START');
+ assert.equal(result.ok,false);assert.match(result.error,/обычное окно браузера/);
+ assert.equal(stored.running,false);assert.deepEqual(createdTabs,[]);assert.deepEqual(windowUpdates,[]);
+});
+test('browser restart clears remembered window IDs before a future explicit Start',async()=>{
+ reset();stored.queueWindowId=10;
+ runtime.onStartup.list[0]();await message('GET');assert.equal(stored.queueWindowId,undefined);
+});
+test('explicit toolbar opening still focuses the existing interface window',async()=>{
+ reset();listedTabs=[{id:101,windowId:77,url:'chrome-extension://test/dashboard.html'}];
+ await chrome.action.onClicked.list[0]();
+ assert.deepEqual(updated,[{id:101,active:true}]);assert.deepEqual(windowUpdates,[{id:77,focused:true}]);
+});
+
 test('completed send schedules closure for 10 seconds later without delaying another platform',async t=>{
  reset();await review();await message('IMPORT',{text:'https://b.1688.com/'});await message('APPROVE');await tick();
  const closing=stored.pendingClosures[0],job=stored.queue[0];
@@ -431,6 +478,21 @@ test('a reused 1688 chat without opener is adopted only with a matching known re
  frameUrl=messenger1688;probeKind='chat';await tick();
  assert.equal(stored.queue[0].tabId,30);assert.equal(stored.queue[0].status,'review');assert.equal(stored.learning,null);
 });
+test('a matching 1688 chat in another browser window is not silently borrowed by the queue',async()=>{
+ await waitingFor1688Contact();const store=stored.queue[0].url;stored.chatRoutes[store]={url:messenger1688};
+ tabReplies.set(1,{id:1,url:store,windowId:10});listedTabs=[{id:30,windowId:33,url:messenger1688}];
+ await tick();assert.equal(stored.queue[0].tabId,1);assert.equal(stored.learning.field,'contact');
+ listedTabs.push({id:31,windowId:10,url:messenger1688});frameUrl=messenger1688;probeKind='chat';await tick();
+ assert.equal(stored.queue[0].tabId,31);assert.equal(stored.queue[0].status,'review');
+ assert.deepEqual(windowUpdates,[]);assert.ok(!updated.some(tab=>tab.active===true));
+});
+test('an identified marketplace popup can be adopted without focusing either browser window',async()=>{
+ await waitingFor1688Contact();
+ chrome.tabs.onCreated.list[0]({id:30,windowId:33,openerTabId:1,url:messenger1688,active:true});await message('GET');
+ assert.equal(stored.queue[0].tabId,30);assert.equal(stored.queue[0].windowId,33);assert.equal(stored.queueWindowId,10);
+ assert.deepEqual(windowUpdates,[]);assert.ok(!updated.some(tab=>Object.hasOwn(tab,'active')));
+});
+
 test('ambiguous or unrelated 1688 tabs never pick another supplier, including older tasks without supplierTabId',async()=>{
  await waitingFor1688Contact();delete stored.queue[0].supplierTabId;
  listedTabs=[{id:30,url:messenger1688}];await tick();assert.equal(stored.queue[0].tabId,1);assert.equal(stored.learning.field,'contact');

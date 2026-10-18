@@ -127,9 +127,60 @@ export function createDialogMonitor({api=globalThis.chrome, fetchImpl=globalThis
     const before=state.bindings[name],changed=before?.status!==status || before?.detail!==(detail || '');
     mergeDialogSnapshot(state,{platform:name,status,url:state.bindings[name]?.url || '',detail,conversations:[]},now());
     if(changed) {
-      const labels={ready:'Чат доступен для чтения',loading:'Ожидание загрузки',login:'Нужен вход в аккаунт',captcha:'Нужна проверка пользователя',unsupported:'Структура чата не распознана',error:'Ошибка чтения'};
-      log(state,'monitor_health',`${labels[status] || 'Статус мониторинга изменён'}${detail?': '+detail:'.'}`,{platform:name,level:['error','login','captcha'].includes(status)?'warning':'info'});
+      const labels={ready:'Чат доступен для чтения',loading:'Ожидание загрузки',login:'Нужен вход в аккаунт',captcha:'Нужна проверка пользователя',unsupported:'Структура чата не распознана',error:'Ошибка чтения',paused:'Чтение вкладки приостановлено'};
+      log(state,'monitor_health',`${labels[status] || 'Статус мониторинга изменён'}${detail?': '+detail:'.'}`,{platform:name,level:['error','login','captcha','paused'].includes(status)?'warning':'info'});
     }
+  }
+
+  async function protectBoundTab(state,name,tab) {
+    const binding=state.bindings[name],protection=binding.discardProtection;
+    if(protection) {
+      // Respect a later change by the user or another extension. Do not fight
+      // the browser setting on every poll, or claim ownership of their change.
+      if(protection.status==='protected'&&tab.autoDiscardable===true) {
+        binding.discardProtection={...protection,status:'overridden',changed:false};
+        log(state,'tab_discard_protection','Разрешение выгрузки вкладки изменено вне OpenLinks. Для постоянной работы отключите экономию памяти для площадки или привяжите вкладку заново.',{platform:name,level:'warning'});
+      }
+      return;
+    }
+    if(typeof tab.autoDiscardable!=='boolean'||typeof api.tabs.update!=='function') {
+      binding.discardProtection={status:'unsupported',original:null,changed:false};
+      log(state,'tab_discard_protection','Браузер не подтвердил управление выгрузкой вкладки. Добавьте площадку в исключения экономии памяти браузера.',{platform:name,level:'warning'});
+      return;
+    }
+    if(tab.autoDiscardable===false) {
+      binding.discardProtection={status:'protected',original:false,changed:false};
+      return;
+    }
+    try {
+      const updated=await api.tabs.update(tab.id,{autoDiscardable:false});
+      if(updated?.id!==tab.id||updated.autoDiscardable!==false)throw new Error('unconfirmed');
+      binding.discardProtection={status:'protected',original:true,changed:true};
+      log(state,'tab_discard_protection','Для привязанной вкладки отключена автоматическая выгрузка из памяти. Фокус окна не менялся.',{platform:name});
+    } catch {
+      binding.discardProtection={status:'failed',original:true,changed:false};
+      log(state,'tab_discard_protection','Не удалось подтвердить защиту вкладки от выгрузки. Добавьте площадку в исключения экономии памяти браузера.',{platform:name,level:'warning'});
+    }
+  }
+  async function releaseBoundTab(state,name) {
+    const binding=state.bindings[name],protection=binding.discardProtection;
+    if(protection?.changed!==true||protection.original!==true||typeof api.tabs.update!=='function')return;
+    try {
+      const tab=await api.tabs.get(binding.tabId);
+      if(tab.autoDiscardable===false)await api.tabs.update(tab.id,{autoDiscardable:true});
+    } catch {
+      log(state,'tab_discard_restore','Не удалось восстановить прежнее разрешение выгрузки отключаемой вкладки.',{platform:name,level:'warning'});
+    }
+  }
+  function unavailableTab(state,name,tab) {
+    if(tab.discarded!==true&&tab.frozen!==true)return false;
+    // Never reload a chat to recover from browser suspension: its composer may
+    // contain an unsent user draft or a test preview. Keep all stored history.
+    state.traversal[name].pending=null;
+    markHealth(state,name,'paused',tab.discarded===true
+      ?'Chrome выгрузил вкладку из памяти. Откройте её вручную и дождитесь загрузки; затем чтение продолжится. Автоматическое восстановление страницы отключено для сохранности черновика.'
+      :'Chrome заморозил вкладку. Откройте её вручную и исключите площадку из экономии памяти/энергии; после разморозки чтение продолжится.');
+    return true;
   }
 
   async function scanPlatform(state,name) {
@@ -139,8 +190,11 @@ export function createDialogMonitor({api=globalThis.chrome, fetchImpl=globalThis
     try { tab=await api.tabs.get(binding.tabId); }
     catch { unbindDialogTab(state,name,now());log(state,'tab_closed','Вкладка закрыта. Привяжите открытую вкладку повторно.',{platform:name,level:'error'});return []; }
     if(dialogPlatform(tab.url)!==name || (tab.pendingUrl && dialogPlatform(tab.pendingUrl)!==name)) {
+      await releaseBoundTab(state,name);
       unbindDialogTab(state,name,now());log(state,'tab_left_platform','Вкладка ушла с площадки. Привязка снята.',{platform:name,level:'error'});return [];
     }
+    await protectBoundTab(state,name,tab);
+    if(unavailableTab(state,name,tab))return [];
     if(tab.status==='loading' || tab.pendingUrl) { markHealth(state,name,'loading','Страница загружается.');return []; }
     let frames;
     try { frames=await timeout(api.webNavigation.getAllFrames({tabId:tab.id})); }
@@ -158,6 +212,7 @@ export function createDialogMonitor({api=globalThis.chrome, fetchImpl=globalThis
     // Navigation during a scan invalidates the complete snapshot, including stale frame replies.
     try {
       const latest=await api.tabs.get(tab.id);
+      if(unavailableTab(state,name,latest))return [];
       if(latest.url!==tab.url || latest.pendingUrl || latest.status==='loading') { markHealth(state,name,'loading','Вкладка изменилась во время чтения; повторю проверку.');return []; }
     } catch { unbindDialogTab(state,name,now());return []; }
     const byFrame=new Map(frames.map((frame,index)=>[frame.frameId,{frame,reply:replies[index]}]));
@@ -197,6 +252,7 @@ export function createDialogMonitor({api=globalThis.chrome, fetchImpl=globalThis
     }
     try {
       const latest=await api.tabs.get(tab.id);
+      if(unavailableTab(state,name,latest))return [];
       if(latest.url!==tab.url || latest.pendingUrl || latest.status==='loading'){markHealth(state,name,'loading','Вкладка изменилась во время чтения; повторю проверку.');return [];}
     } catch {unbindDialogTab(state,name,now());return [];}
     const newObstacle=valid.find(reply=>['captcha','login'].includes(reply.status));
@@ -877,10 +933,20 @@ export function createDialogMonitor({api=globalThis.chrome, fetchImpl=globalThis
           if(dialogPlatform(tab.url)!==name || (tab.pendingUrl && dialogPlatform(tab.pendingUrl)!==name))throw new Error('Эта вкладка не относится к выбранной площадке.');
           const outreach=(await api.storage.local.get('openlinksState')).openlinksState;
           if(outreach?.queue?.some(job=>!['sent','attempted','attempt_unknown','skipped','failed'].includes(job.status) && [job.tabId,job.supplierTabId].includes(tab.id)))throw new Error('Вкладка занята очередью рассылки. Выберите отдельную вкладку для мониторинга.');
-          cancel();bindDialogTab(state,name,tab.id,tab.url,now());await save(state);return publicState(state);
+          cancel();
+          const previous=state.bindings[name];
+          const protection=previous.tabId===tab.id?previous.discardProtection:null;
+          if(previous.tabId!==tab.id)await releaseBoundTab(state,name);
+          bindDialogTab(state,name,tab.id,tab.url,now());
+          // Rebinding the same tab must not forget which setting we changed.
+          if(protection?.status==='protected'&&tab.autoDiscardable===false)state.bindings[name].discardProtection=protection;
+          await protectBoundTab(state,name,tab);unavailableTab(state,name,tab);
+          await save(state);return publicState(state);
         });
       }
-      case 'DIALOGS_UNBIND_TAB': cancel();unbindDialogTab(state,platform(message.platform),now());break;
+      case 'DIALOGS_UNBIND_TAB': {
+        const name=platform(message.platform);cancel();await releaseBoundTab(state,name);unbindDialogTab(state,name,now());break;
+      }
       case 'DIALOGS_START':
         if(!Object.values(state.bindings).some(binding=>Number.isInteger(binding.tabId)))throw new Error('Сначала привяжите вкладки площадок.');
         if(folder.enabled || !apiAutoAvailable())state.settings.autoDraft=false;
@@ -980,7 +1046,13 @@ export function createDialogMonitor({api=globalThis.chrome, fetchImpl=globalThis
   };
   const resetBindings=()=>exclusive(async()=>{
     cancel();const state=await load(),folder=await loadFolder();state.running=false;await folderCancelPending(folder);folder.enabled=false;folder.auto=false;folder.autoSend=false;if(folder.test.enabled&&!['completed','paused'].includes(folder.test.phase)){folder.test.phase='blocked';folder.test.detail='Chrome перезапущен. Тест остановлен; проверьте вкладки и начните цикл явно.';}await saveFolder(folder);
-    for(const name of PLATFORMS)if(Number.isInteger(state.bindings[name]?.tabId))unbindDialogTab(state,name,now());
+    for(const name of PLATFORMS)if(Number.isInteger(state.bindings[name]?.tabId)) {
+      // An extension update may be delivered at browser startup before
+      // onStartup. Neither event proves that persisted IDs still identify our
+      // old tabs, so never mutate a tab here. Protection can remain until its
+      // old tab closes; explicit unbind/rebind still restores verified ownership.
+      unbindDialogTab(state,name,now());
+    }
     log(state,'bindings_reset','После перезапуска Chrome или обновления расширения привяжите вкладки заново.');
     await clearAlarm();await save(state);
   });
@@ -990,9 +1062,12 @@ export function createDialogMonitor({api=globalThis.chrome, fetchImpl=globalThis
     if(changed)await save(state);
   });
   const onTabUpdated=(tabId,change,tab)=>exclusive(async()=>{
-    if(!change.url)return;
+    if(!change.url&&change.discarded!==true&&change.frozen!==true)return;
     const state=await load();let changed=false;
-    for(const name of PLATFORMS)if(state.bindings[name]?.tabId===tabId && dialogPlatform(change.url || tab?.url)!==name){cancel();unbindDialogTab(state,name,now());changed=true;}
+    for(const name of PLATFORMS)if(state.bindings[name]?.tabId===tabId) {
+      if(change.url&&dialogPlatform(change.url)!==name){cancel();await releaseBoundTab(state,name);unbindDialogTab(state,name,now());changed=true;}
+      else if(unavailableTab(state,name,{...tab,...change})){changed=true;}
+    }
     if(changed)await save(state);
   });
   return {handle,onAlarm,onStartup:resetBindings,onInstalled:details=>details?.reason==='update'?resetBindings():Promise.resolve(),onTabRemoved,onTabUpdated};

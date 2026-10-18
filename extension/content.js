@@ -314,6 +314,48 @@
     const invalid=[...send.form.elements].filter(el=>el.willValidate && !el.validity.valid && visible(el));
     return invalid.length ? 'На форме есть незаполненные или неверные обязательные поля. Заполните их вручную.' : '';
   }
+  function composerConsumed(found,request) {
+    // Observe only local draft consumption, never delivery/read receipts. Hidden
+    // tabs throttle timers, so an emptied editor must not wait for a timer tick.
+    return new Promise(resolve=>{
+      const deadline=performance.now()+1200;
+      let settled=false,timer;
+      const finish=accepted=>{
+        if(settled)return;
+        settled=true;
+        observer.disconnect();clearTimeout(timer);
+        found.editor.removeEventListener('input',check);
+        found.editor.removeEventListener('change',check);
+        removeEventListener('pagehide',navigating);
+        removeEventListener('hashchange',check);
+        removeEventListener('popstate',check);
+        resolve(accepted);
+      };
+      const check=()=>{
+        if(settled)return;
+        try {
+          if(performance.now()>deadline || location.href!==request.expectedUrl || obstacle() || !found.editor.isConnected || !visible(found.editor))return finish(false);
+          // Sending itself may change history. Recheck document and recipient
+          // without requiring the pre-send history fingerprint to stay equal.
+          if(request.dialogGuard && !globalThis.OpenLinksDialogsReader?.guardPreviewCleanup(request.dialogGuard)?.ok)return finish(false);
+          if(!textOf(found.editor))finish(true);
+        }catch{finish(false);}
+      };
+      const navigating=()=>finish(false);
+      const observer=new MutationObserver(check);
+      check();
+      if(settled)return;
+      observer.observe(document.documentElement,{subtree:true,childList:true,characterData:true,attributes:true});
+      // Document observers do not cross shadow roots.
+      if(found.editor.getRootNode()!==document)observer.observe(found.editor,{subtree:true,childList:true,characterData:true,attributes:true});
+      found.editor.addEventListener('input',check);
+      found.editor.addEventListener('change',check);
+      addEventListener('pagehide',navigating);
+      addEventListener('hashchange',check);
+      addEventListener('popstate',check);
+      timer=setTimeout(()=>finish(false),1200);
+    });
+  }
   async function prepare(request) {
     const context=guardedReply(request);if(!context.ok)return context;
     const operation=request.dialogGuard?.operation;
@@ -514,13 +556,7 @@
       sentOps.add(operation);
       found.send.click();
       if(site!=='1688')return {clicked:true};
-      // Check only the local composer consuming the draft, not delivery/read
-      // receipts. A missing editor/navigation is not proof that sending worked.
-      for(let i=0;i<12;i++) {
-        await new Promise(resolve=>setTimeout(resolve,100));
-        if(location.href!==request.expectedUrl || obstacle())break;
-        if(found.editor.isConnected && visible(found.editor) && !textOf(found.editor))return {clicked:true,accepted:true};
-      }
+      if(await composerConsumed(found,request))return {clicked:true,accepted:true};
       return {clicked:true,accepted:false,reason:'После нажатия редактор 1688 не очистился либо чат изменился. Проверьте сообщение вручную; очередь остановлена, автоматического повтора нет.'};
     })();
     return {ok:false,reason:'Неизвестная команда'};

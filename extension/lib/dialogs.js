@@ -13,6 +13,12 @@ const clean = (value,max=1000) => typeof value === 'string' ? value.replace(/[\u
 const time = value => typeof value === 'number' && Number.isFinite(value) && value >= 0 && value <= 8640000000000000 ? value : null;
 const platformOK = value => DIALOG_PLATFORMS.includes(value);
 const integer = value => Number.isSafeInteger(value) && value >= 0 ? value : null;
+function discardProtection(value) {
+  const input=object(value);
+  if(!['protected','unsupported','failed','overridden'].includes(input.status))return null;
+  const original=typeof input.original==='boolean'?input.original:null;
+  return {status:input.status,original,changed:input.status==='protected'&&original===true&&input.changed===true};
+}
 
 function digest(text) {
   let a=2166136261,b=2246822507;
@@ -425,6 +431,8 @@ export function normalizeDialogs(saved) {
     const binding=object(object(input.bindings)[platform]),url=safeURL(binding.url,platform),tabId=integer(binding.tabId);
     if(url && tabId!==null) {
       state.bindings[platform]={tabId,url,status:HEALTH.has(binding.status)?binding.status:'loading',checkedAt:time(binding.checkedAt),detail:clean(binding.detail,1200)};
+      const protection=discardProtection(binding.discardProtection);
+      if(protection)state.bindings[platform].discardProtection=protection;
       const traversal=object(object(input.traversal)[platform]),pending=object(traversal.pending);
       try {
         conversationKey(platform,pending.id);
