@@ -203,7 +203,7 @@
     if(!request.dialogGuard)return {ok:true};
     const guard=request.dialogGuard;
     if(typeof guard.operation!=='string' || !guard.operation || typeof request.message!=='string' || !request.message.trim() || request.message.length>6000)return {ok:false,reason:'Некорректное разрешение на ответ.'};
-    if(guard.purpose==='wechat'&&request.dialogPreview!==true)return {ok:false,reason:'Приглашение в WeChat разрешено только как тест без отправки.'};
+    if(guard.purpose==='wechat')return {ok:false,reason:'Продолжить переписку можно только после ответа поставщика на ваше обращение.'};
     const verified=globalThis.OpenLinksDialogsReader?.guardReply(guard,{preview:request.dialogPreview===true});
     if(!verified?.ok)return {ok:false,reason:verified?.reason || 'Проверка получателя недоступна. Обновите расширение и вкладку чата.'};
     if(!found)return verified;

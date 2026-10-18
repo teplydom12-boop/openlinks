@@ -1,4 +1,4 @@
-import {draftRequest,contactAssessment} from './lib/dialogs.js';
+import {draftRequest} from './lib/dialogs.js';
 import {withTabOwnership} from './lib/tab-ownership.js';
 import {activate1688} from './lib/native-input.js';
 
@@ -25,6 +25,7 @@ async function bounded(promise,ms) {
  */
 export async function sendDialogReply({api=globalThis.chrome,state,request,text,source,profile={},enabled=false,reserve,dryRun=false,previewOperation,reservePreview,shouldContinue=()=>true,now=()=>Date.now(),wait=sleep,activate=activate1688,timeoutMs=10000}={}) {
   if(enabled!==true)return blocked('Автоматическая отправка выключена.');
+  if(request?.purpose==='wechat')return blocked('Продолжить переписку можно только после ответа поставщика на ваше обращение.');
   if(dryRun ? typeof reservePreview!=='function'||typeof previewOperation!=='string'||!previewOperation : typeof reserve!=='function')return blocked(dryRun?'Нет сохранения тестового цикла перед заполнением.':'Нет сохранения попытки и общего лимита отправки.');
   if(typeof text!=='string' || !text.trim() || text.length>6000)return blocked('Ответ должен содержать от 1 до 6000 символов.');
   if(!Number.isInteger(source?.tabId) || source.tabId<0 || !Number.isInteger(source?.frameId) || source.frameId<0 || typeof source.documentToken!=='string' || !source.documentToken || typeof source.replyFingerprint!=='string' || !source.replyFingerprint)return blocked('Не подтверждён текущий документ переписки.');
@@ -36,7 +37,7 @@ export async function sendDialogReply({api=globalThis.chrome,state,request,text,
         if(state?.running!==true)throw new Error('Мониторинг остановлен.');
         const current=draftRequest(state,request?.key);
         if(REQUEST_FIELDS.some(field=>current[field]!==request[field]))throw new Error('История, товар или правила изменились. Ответ не отправлен.');
-        if(current.purpose==='wechat'&&!dryRun)throw new Error('Приглашение в WeChat из прочитанного чата пока доступно только в тестовом режиме без отправки.');
+        if(current.purpose==='wechat')throw new Error('Продолжить переписку можно только после ответа поставщика на ваше обращение.');
         const item=state.conversations[current.key];
         if(state.bindings?.[item.platform]?.tabId!==source.tabId || !samePlatform(source.sourceUrl,item.platform))throw new Error('Привязка вкладки или площадка изменились.');
         return item;
@@ -44,7 +45,6 @@ export async function sendDialogReply({api=globalThis.chrome,state,request,text,
       const item=await assertCurrent(),platform=item.platform;
       attemptId=dryRun?previewOperation:crypto.randomUUID();
       const guard={platform,id:item.id,documentToken:source.documentToken,sourceUrl:source.sourceUrl,replyFingerprint:source.replyFingerprint,operation:attemptId};
-      if(request.purpose==='wechat')guard.purpose='wechat';
       if(dryRun)cleanupToken={operation:attemptId,platform,id:item.id,documentToken:source.documentToken,sourceUrl:source.sourceUrl,text};
       // The shared quota callback runs in the outreach worker's command queue.
       // Reserve BEFORE acquiring tab ownership: that queue can itself be waiting
@@ -68,13 +68,11 @@ export async function sendDialogReply({api=globalThis.chrome,state,request,text,
         const active=Array.isArray(snapshot?.conversations)?snapshot.conversations.filter(row=>row.active):[];
         if(snapshot?.status!=='ready' || snapshot.platform!==platform || snapshot.url!==source.sourceUrl || snapshot.documentToken!==source.documentToken || active.length!==1 || active[0].id!==item.id || active[0].identityReliable!==true || active[0].replyFingerprint!==source.replyFingerprint)throw new Error('Получатель, документ или история изменились. Ответ не отправлен.');
         const row=active[0];
-        const lastDirection=row.messages?.filter(message=>message.direction!=='system').at(-1)?.direction;
-        const contactPreview=dryRun&&request.purpose==='wechat';
-        if((row.historyOrderReliable??row.orderReliable)!==true || (row.historyTailKnown??row.tailKnown)!==true || !Array.isArray(row.messages) || row.messages.some(message=>message.direction==='unknown') || !(contactPreview?['inbound','outbound'].includes(lastDirection):lastDirection==='inbound'))throw new Error('Последние сообщения и порядок истории не подтверждены.');
-        if(contactPreview) {
-          const fresh={...item,...row,archivedMessages:item.archivedMessages,coverage:row.coverage??item.coverage};
-          if(contactAssessment(state,fresh).status!=='not_found')throw new Error('Проверка истории WeChat изменилась. Проверьте диалог перед подготовкой тестового приглашения.');
-        }
+        const messages=Array.isArray(row.messages)?row.messages.filter(message=>message.direction!=='system'):[];
+        if((row.historyOrderReliable??row.orderReliable)!==true || (row.historyTailKnown??row.tailKnown)!==true || !Array.isArray(row.messages) || row.messages.some(message=>message.direction==='unknown') || messages.at(-1)?.direction!=='inbound')throw new Error('Последние сообщения и порядок истории не подтверждены.');
+        // Only freshly read, ordered messages prove that the supplier answered
+        // our earlier outreach. Cached or archived history cannot grant access.
+        if(!messages.slice(0,-1).some(message=>message.direction==='outbound'))throw new Error('Не подтверждён ответ поставщика после вашего первичного обращения.');
         if(initial && busy(snapshot.busy))throw new Error('В чате есть ручной черновик или пользователь работает с редактором.');
         await assertCurrent();
       };

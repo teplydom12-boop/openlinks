@@ -9,7 +9,7 @@ function harness(platform='alibaba') {
   const state=initialDialogs(),id='account:buyer/thread:supplier',key=conversationKey(platform,id),calls=[],reservations=[],events=[];
   saveProduct(state,{keyPoints:'Ask for price and lead time.'},1);approveProduct(state,productFingerprint(state),2);state.running=true;
   bindDialogTab(state,platform,4,url,3);
-  const snapshot={platform,status:'ready',url,documentToken:'document-1',busy:{hasDraft:false,userEditing:false,recentUserInput:false},conversations:[{id,active:true,identityReliable:true,orderReliable:true,tailKnown:true,replyFingerprint:'reply-1',messages:[{id:'message-1',text:'Which quantity do you need?',direction:'inbound'}]}]};
+  const snapshot={platform,status:'ready',url,documentToken:'document-1',busy:{hasDraft:false,userEditing:false,recentUserInput:false},conversations:[{id,active:true,identityReliable:true,orderReliable:true,tailKnown:true,replyFingerprint:'reply-1',messages:[{id:'buyer-initial',text:'Please send a quotation for 100 units.',direction:'outbound'},{id:'message-1',text:'Which quantity do you need?',direction:'inbound'}]}]};
   mergeDialogSnapshot(state,snapshot,4);const request=draftRequest(state,key);
   const source={tabId:4,frameId:2,sourceUrl:url,documentToken:snapshot.documentToken,replyFingerprint:'reply-1'};
   let action=async message=>message.type==='DIALOGS_SNAPSHOT'?structuredClone(snapshot):message.type==='SEND'?{clicked:true,accepted:true}:{ok:true,pageUrl:url};
@@ -33,7 +33,7 @@ test('manual drafts or active user editing prevent even inserting reply text',as
   for(const flag of ['hasDraft','userEditing','recentUserInput']){const h=harness();h.snapshot.busy[flag]=true;assert.equal((await h.send()).status,'blocked');assert.deepEqual(h.events,['RESERVE','DIALOGS_SNAPSHOT']);assert.equal(h.reservations.length,1);}
 });
 test('changed recipient, document, fingerprint, captcha and unsupported histories block preparation',async()=>{
-  for(const change of [h=>h.snapshot.conversations[0].id='other',h=>h.snapshot.documentToken='new',h=>h.snapshot.conversations[0].replyFingerprint='new',h=>h.snapshot.status='captcha',h=>h.snapshot.conversations[0].orderReliable=false,h=>h.snapshot.conversations[0].tailKnown=false,h=>h.snapshot.conversations[0].messages[0].direction='outbound',h=>h.snapshot.conversations.push({...h.snapshot.conversations[0]})]){
+  for(const change of [h=>h.snapshot.conversations[0].id='other',h=>h.snapshot.documentToken='new',h=>h.snapshot.conversations[0].replyFingerprint='new',h=>h.snapshot.status='captcha',h=>h.snapshot.conversations[0].orderReliable=false,h=>h.snapshot.conversations[0].tailKnown=false,h=>h.snapshot.conversations[0].messages.at(-1).direction='outbound',h=>h.snapshot.conversations.push({...h.snapshot.conversations[0]})]){
     const h=harness();change(h);assert.equal((await h.send()).status,'blocked');assert.ok(!h.calls.some(item=>item.type==='PREPARE'));assert.equal(h.reservations.length,1);
   }
 });
@@ -128,34 +128,40 @@ test('dry-run stop while intent is persisted prevents preparation',async()=>{
   const result=await h.send({dryRun:true,previewOperation:'test-cycle',shouldContinue:()=>continued,reservePreview:async()=>{continued=false;return {ok:true};}});
   assert.equal(result.status,'blocked');assert.ok(result.cleanupToken);assert.deepEqual(h.calls,[]);assert.deepEqual(h.reservations,[]);
 });
-function wechatHarness() {
-  const h=harness();
-  setDialogSettings(h.state,{...h.state.settings,wechat:'buyer-wx-123',scanRead:true},5);
-  approveProduct(h.state,productFingerprint(h.state),6);
-  h.snapshot.conversations[0].unread=false;
-  h.snapshot.conversations[0].messages.push({id:'buyer-last',text:'Thank you for the quotation.',direction:'outbound'});
-  mergeDialogSnapshot(h.state,h.snapshot,7);
-  h.options.request=draftRequest(h.state,h.key);
-  const base=h.action;h.action=async message=>({...await base(message),...(message.type==='PREPARE'?{preview:true}:{})});
-  return h;
-}
-test('a read chat ending in buyer text permits only a guarded WeChat preview',async()=>{
-  const h=wechatHarness();assert.equal(h.options.request.purpose,'wechat');
-  const result=await h.send({dryRun:true,previewOperation:'wechat-test',reservePreview:async()=>({ok:true})});
-  assert.equal(result.status,'previewed');assert.equal(result.clicked,false);
-  assert.equal(h.calls.find(call=>call.type==='PREPARE').dialogGuard.purpose,'wechat');
-  assert.ok(!h.calls.some(call=>call.type==='SEND'));assert.deepEqual(h.reservations,[]);
-});
-test('WeChat invitation cannot reserve or send outside test mode',async()=>{
-  const h=wechatHarness();const result=await h.send();assert.equal(result.status,'blocked');
-  assert.match(result.reason,/тестовом режиме/);assert.deepEqual(h.calls,[]);assert.deepEqual(h.reservations,[]);
-});
-test('fresh outbound contact, lost history or changed purpose blocks WeChat insertion',async()=>{
-  for(const change of [h=>h.snapshot.conversations[0].messages.at(-1).text='My WeChat is buyer-wx-123',h=>h.snapshot.conversations[0].tailKnown=false,h=>h.snapshot.conversations[0].messages[0].direction='unknown',h=>h.options.request={...h.options.request,purpose:undefined}]) {
-    const h=wechatHarness();change(h);
-    const result=await h.send({dryRun:true,previewOperation:'wechat-test',reservePreview:async()=>({ok:true})});
-    assert.equal(result.status,'blocked');assert.ok(!h.calls.some(call=>['PREPARE','SEND'].includes(call.type)));assert.deepEqual(h.reservations,[]);
+test('a read chat without a supplier answer never enters the editor, including dry-run',async()=>{
+  for(const dryRun of [false,true]) {
+    const h=harness();
+    setDialogSettings(h.state,{...h.state.settings,wechat:'buyer-wx-123',scanRead:true},5);
+    approveProduct(h.state,productFingerprint(h.state),6);
+    h.snapshot.conversations[0].unread=false;
+    h.snapshot.conversations[0].messages.push({id:'buyer-last',text:'Thank you for the quotation.',direction:'outbound'});
+    mergeDialogSnapshot(h.state,h.snapshot,7);
+    const result=await h.send({dryRun,previewOperation:'waiting-test',reservePreview:async()=>assert.fail('waiting for supplier saved a preview')});
+    assert.equal(result.status,'blocked');assert.deepEqual(h.calls,[]);assert.deepEqual(h.reservations,[]);
   }
+});
+test('obsolete WeChat purpose is refused before reservation even with a valid supplier answer',async()=>{
+  for(const dryRun of [false,true]) {
+    const h=harness();h.options.request={...h.request,purpose:'wechat'};
+    const result=await h.send({dryRun,previewOperation:'obsolete-test',reservePreview:async()=>assert.fail('obsolete invitation saved a preview')});
+    assert.equal(result.status,'blocked');assert.match(result.reason,/только после ответа поставщика/);
+    assert.deepEqual(h.calls,[]);assert.deepEqual(h.reservations,[]);
+  }
+});
+test('fresh history must contain our outreach before the supplier answer for send and preview',async()=>{
+  for(const dryRun of [false,true])for(const history of ['no-outreach','buyer-last','unknown-outreach']) {
+    const h=harness(),row=h.snapshot.conversations[0];
+    if(history==='no-outreach')row.messages.shift();
+    else if(history==='buyer-last')row.messages.reverse();
+    else row.messages[0].direction='unknown';
+    const result=await h.send({dryRun,previewOperation:'fresh-test',reservePreview:async()=>({ok:true})});
+    assert.equal(result.status,'blocked',history);assert.ok(!h.calls.some(call=>['PREPARE','NATIVE_INPUT','SEND'].includes(call.type)),history);
+  }
+});
+test('fresh history losing initial outreach during preparation prevents the final click',async()=>{
+  const h=harness(),base=h.action;
+  h.action=async message=>{const result=await base(message);if(message.type==='PREPARE')h.snapshot.conversations[0].messages.shift();return result;};
+  assert.equal((await h.send()).status,'blocked');assert.ok(!h.calls.some(call=>call.type==='SEND'));
 });
 function cleanupFixture() {
   const h=harness(),token={operation:'test-cycle',platform:'alibaba',id:h.snapshot.conversations[0].id,documentToken:h.source.documentToken,sourceUrl:h.source.sourceUrl,text:h.options.text};

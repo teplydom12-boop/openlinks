@@ -441,17 +441,17 @@
       requestModelEvidence(result);return result;
     } catch {return {...result,status:'error',detail:'Не удалось прочитать структуру чата. Отправка и ввод не выполнялись.',conversations:[]};}
   }
-  function guardReply(expected,options={}) {
+  function guardReply(expected) {
     const invalid=reason=>({ok:false,reason});
     if(!expected || expected.documentToken!==DOCUMENT_TOKEN || expected.platform!==platform() || expected.sourceUrl!==location.href || typeof expected.id!=='string' || typeof expected.replyFingerprint!=='string' || !expected.replyFingerprint)return invalid('Страница или разрешение на ответ изменились.');
-    const contactPreview=expected.purpose==='wechat'&&options?.preview===true;
-    if(expected.purpose==='wechat'&&!contactPreview)return invalid('Обращение с WeChat доступно только как тестовый черновик без отправки.');
+    if(expected.purpose==='wechat')return invalid('Продолжить переписку можно только после ответа поставщика на ваше обращение.');
     const current=snapshot(),active=current.conversations.filter(row=>row.active);
     if(current.status!=='ready' || active.length!==1)return invalid('Не подтверждён один открытый диалог без ограничений площадки.');
     const row=active[0];
     if(row.id!==expected.id || row.replyFingerprint!==expected.replyFingerprint || !row.identityReliable)return invalid('Получатель, история или вложения изменились. Ответ остановлен.');
-    const last=row.messages.filter(message=>message.direction!=='system').at(-1)?.direction;
-    if((row.historyOrderReliable??row.orderReliable)!==true || (row.historyTailKnown??row.tailKnown)!==true || row.messages.some(message=>message.direction==='unknown') || (last!=='inbound'&&!(contactPreview&&last==='outbound')))return invalid('Последнее сообщение и порядок истории не подтверждены.');
+    const messages=row.messages.filter(message=>message.direction!=='system');
+    if((row.historyOrderReliable??row.orderReliable)!==true || (row.historyTailKnown??row.tailKnown)!==true || row.messages.some(message=>message.direction==='unknown') || messages.at(-1)?.direction!=='inbound')return invalid('Последнее сообщение и порядок истории не подтверждены.');
+    if(!messages.slice(0,-1).some(message=>message.direction==='outbound'))return invalid('Не подтверждён ответ поставщика после вашего первичного обращения.');
     return {ok:true,busy:current.busy};
   }
   function guardPreviewCleanup(expected) {

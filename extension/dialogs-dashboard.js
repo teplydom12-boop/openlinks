@@ -1,6 +1,7 @@
 import {displayTime} from './lib/time.js';
 import {setupProductUI} from './dialogs-product.js';
-import {canPrepareDraft, contactAssessment, draftRequest, mayPrepareWechat} from './lib/dialogs.js';
+import {canPrepareDraft, contactAssessment, draftRequest, supplierReplyAssessment} from './lib/dialogs.js';
+import {setupJointModeUI} from './joint-mode-ui.js';
 
 const $=selector=>document.querySelector(selector);
 const PLATFORMS={'1688':'1688',alibaba:'Alibaba',mic:'Made-in-China'};
@@ -26,15 +27,14 @@ async function refresh(){if(loading)return;loading=true;try{adopt(await command(
 async function act(name,payload={},message=''){const result=await command(name,payload);if(result.state||result.folder)adopt(result);else await refresh();if(message)feedback(message);return result;}
 function action(selector,handler){$(selector).addEventListener('click',async()=>{if(busy.has(selector))return;busy.add(selector);$(selector).disabled=true;try{await handler();}catch(error){feedback(error.message,true);}finally{busy.delete(selector);$(selector).disabled=false;if(state)render();}});}
 function makeButton(label,handler,className='button secondary'){const button=node('button',label,className);button.type='button';button.addEventListener('click',async()=>{button.disabled=true;try{await handler();}catch(error){feedback(error.message,true);}finally{if(button.isConnected)button.disabled=false;}});return button;}
-function threadFlags(conversation){const result=[];const test=testState();if(test.enabled&&((test.key===conversation.key&&test.phase==='completed')||(test.completed||[]).some(item=>item.key===conversation.key)))result.push(['Тест: без отправки','test']);if(conversation.takeover)result.push(['Под вашим управлением','']);if(conversation.paused)result.push(['На паузе','']);if(conversation.unanswered)result.push(['Требует ответа','warn']);if(conversation.unread===true||Number(conversation.unread)>0)result.push(['Непрочитано на площадке','warn']);if(conversation.needsRead)result.push([conversation.messages?.length||readerDetail(conversation)?'Нужна проверка истории':'Нужно открыть историю','']);if(state.settings?.scanRead){const contact=contactAssessment(state,conversation);if(contact.status==='shared')result.push(['WeChat уже передан','good']);else if(contact.status==='blocked_capacity')result.push(['WeChat: память проверок заполнена','warn']);else if(contact.status==='not_found'&&mayPrepareWechat(state,conversation))result.push(['Приглашение в WeChat · тест','test']);}if(conversation.autoDraft?.status==='pending')result.push(['ИИ готовит черновик','']);if(conversation.autoDraft?.status==='error')result.push(['Ошибка черновика','warn']);if(conversation.draft)result.push([conversation.draft.status==='stale'?'Черновик устарел':'Есть черновик',conversation.draft.status==='stale'?'warn':'good']);return result;}
-function draftPurpose(conversation){try{return draftRequest(state,conversation.key).purpose||'reply';}catch{return conversation?.draft?.purpose||'';}}
-function isWechatDraft(conversation){return draftPurpose(conversation)==='wechat'||!conversation?.unanswered&&mayPrepareWechat(state,conversation);}
-function canDraft(conversation){return !!conversation&&(conversation.unanswered||mayPrepareWechat(state,conversation))&&conversation.identityReliable&&conversation.orderReliable&&conversation.tailKnown&&conversation.contentReady!==false&&!conversation.needsRead&&!conversation.paused&&!conversation.takeover&&(!isWechatDraft(conversation)||testState().enabled);}
+function threadFlags(conversation){const result=[];const test=testState();if(test.enabled&&((test.key===conversation.key&&test.phase==='completed')||(test.completed||[]).some(item=>item.key===conversation.key)))result.push(['Тест: без отправки','test']);if(conversation.takeover)result.push(['Под вашим управлением','']);if(conversation.paused)result.push(['На паузе','']);const reply=supplierReplyAssessment(state,conversation);if(reply.allowed)result.push(['Требует ответа','warn']);else if(reply.status==='waiting_supplier')result.push(['Ждём ответа поставщика','']);else if(reply.status==='no_initial_outreach')result.push(['Первичное обращение не найдено','warn']);if(conversation.unread===true||Number(conversation.unread)>0)result.push(['Непрочитано на площадке','warn']);if(conversation.needsRead)result.push([conversation.messages?.length||readerDetail(conversation)?'Нужна проверка истории':'Нужно открыть историю','']);if(state.settings?.scanRead){const contact=contactAssessment(state,conversation);if(contact.status==='shared')result.push(['WeChat уже передан','good']);else if(contact.status==='blocked_capacity')result.push(['WeChat: память проверок заполнена','warn']);}if(conversation.autoDraft?.status==='pending')result.push(['ИИ готовит черновик','']);if(conversation.autoDraft?.status==='error')result.push(['Ошибка черновика','warn']);if(conversation.draft)result.push([conversation.draft.status==='stale'?'Черновик устарел':'Есть черновик',conversation.draft.status==='stale'?'warn':'good']);return result;}
+function isWechatDraft(conversation){return conversation?.draft?.purpose==='wechat';}
+function canDraft(conversation){return !!conversation&&!isWechatDraft(conversation)&&supplierReplyAssessment(state,conversation).allowed;}
 function wechatAssessmentText(conversation){
   const assessment=contactAssessment(state,conversation);
   if(assessment.status==='shared')return 'Ваш WeChat найден в исходящем сообщении. Повторное приглашение не требуется.';
-  if(assessment.status==='blocked_capacity')return assessment.detail||'Память проверок WeChat заполнена. Приглашение приостановлено; сохранённые подтверждения не удаляются.';
-  if(assessment.status==='not_found')return 'В доступной истории WeChat не найден. Более ранние сообщения могут быть недоступны; приглашение проверяется только в тестовом режиме без отправки.';
+  if(assessment.status==='blocked_capacity')return assessment.detail||'Память проверок WeChat заполнена; сохранённые подтверждения не удаляются.';
+  if(assessment.status==='not_found')return 'В доступной истории WeChat не найден. Более ранние сообщения могут быть недоступны. Контакт можно предложить в ответе поставщику по вашим правилам.';
   if(assessment.status==='no_contact')return 'Сохраните ваш WeChat в разделе «Контекст переговоров и WeChat» в шаге 2.';
   return assessment.detail||'Пока нельзя проверить, передавался ли ваш WeChat: история не прочитана полностью или автор сообщения не определён.';
 }
@@ -46,13 +46,13 @@ function draftBlockReason(conversation){
   if(!conversation.identityReliable)return readerDetail(conversation)||'Пока не удалось надёжно определить поставщика.';
   if(conversation.contentReady===false)return readerDetail(conversation)||'Не все сообщения или вложения прочитаны. Причины показаны в истории переписки.';
   if(!conversation.orderReliable||!conversation.tailKnown||conversation.needsRead)return readerDetail(conversation)||'Нужна достоверная последняя часть переписки. Откройте её во вкладке мониторинга и повторите проверку.';
-  if(!conversation.unanswered&&!mayPrepareWechat(state,conversation))return state.settings?.scanRead?wechatAssessmentText(conversation):'В доступной истории нет подтверждённого сообщения продавца, требующего ответа.';
-  if(isWechatDraft(conversation)&&!testState().enabled)return 'Приглашение в WeChat по доступной истории можно проверить только в тестовом режиме. Включите его в шаге 3; реальная отправка недоступна.';
+  if(isWechatDraft(conversation))return 'Это старый черновик приглашения. Удалите его; новый ответ возможен после сообщения поставщика на ваше первичное обращение.';
+  const reply=supplierReplyAssessment(state,conversation);if(!reply.allowed)return reply.detail;
   if(testState().enabled&&testState().phase==='completed')return 'Цикл выполнен — сообщение не отправлено. Для продолжения нажмите «Проверить следующий цикл» в шаге 3.';
   if(testState().enabled&&['paused','blocked'].includes(testState().phase))return testState().phase==='blocked'?'Тест приостановлен. Проверьте причину в шаге 3.':'Запустите первый тестовый цикл в шаге 3.';
   if(!productUI?.isApproved())return 'Сохраните и согласуйте информацию о товаре в блоке выше. Она применяется ко всем наблюдаемым поставщикам.';
   if(settingsDirty)return 'Сначала сохраните контекст переговоров.';
-  if(testState().enabled)return isWechatDraft(conversation)?'В доступной истории WeChat не найден. Claude подготовит приглашение с вашим сохранённым контактом. Тест введёт текст в чат без отправки.':'Тестовый цикл читает переписку, получает ответ Claude и вводит текст в чат. Сообщение поставщику не отправляется.';
+  if(testState().enabled)return 'Тестовый цикл читает переписку, получает ответ Claude и вводит текст в чат. Сообщение поставщику не отправляется.';
   if(conversation.draft?.testSessionId)return 'Это ответ из тестового сеанса. Для настоящей отправки удалите тестовый черновик и подготовьте новый ответ.';
   if(conversation.draft)return conversation.draft.status==='stale'?'Черновик устарел. Сохраните нужные правки отдельно и удалите его перед подготовкой нового ответа.':'Ответ готов. Проверьте текст, при необходимости отредактируйте и нажмите «Отправить».';
   if(!folderState.enabled)return 'Подключите Claude в шаге 1.';
@@ -95,8 +95,8 @@ function renderBindings(){
     container.append(card);
   }
 }
-function filteredConversations(){const query=$('#dialogs-search').value.trim().toLocaleLowerCase(),filter=$('#dialogs-filter').value;return Object.values(state?.conversations||{}).filter(item=>{if(filter==='unanswered'&&!item.unanswered)return false;if(filter==='unread'&&!(item.unread===true||Number(item.unread)>0))return false;if(filter==='takeover'&&!item.takeover)return false;if(filter==='paused'&&!item.paused)return false;const haystack=[item.title,item.platform,PLATFORMS[item.platform],item.url,item.preview,...(item.messages||[]).map(m=>m.text)].filter(Boolean).join(' ').toLocaleLowerCase();return !query||haystack.includes(query);}).sort((a,b)=>Number(b.unanswered)-Number(a.unanswered)||(b.updatedAt||0)-(a.updatedAt||0)||a.key.localeCompare(b.key));}
-function renderList(){const conversations=filteredConversations(),all=Object.values(state?.conversations||{}),list=$('#dialogs-list');$('#dialogs-count').textContent=all.length+' · требуют ответа: '+all.filter(c=>c.unanswered).length;list.replaceChildren();for(const conversation of conversations){const button=node('button',undefined,'dialogs-thread'+(conversation.key===selectedKey?' selected':''));button.type='button';button.dataset.key=conversation.key;button.setAttribute('aria-pressed',String(conversation.key===selectedKey));button.append(node('strong',conversation.title||'Поставщик не определён'),node('p',(PLATFORMS[conversation.platform]||conversation.platform)+' · '+date(conversation.updatedAt),'hint'));const last=(conversation.messages||[]).at(-1);button.append(node('div',last?.text||conversation.preview||'История ещё не прочитана','dialogs-preview'));const flags=node('div',undefined,'dialogs-thread-flags');for(const [label,tone] of threadFlags(conversation))flags.append(node('span',label,'dialogs-status '+tone));button.append(flags);button.addEventListener('click',()=>{selectedKey=conversation.key;historySignature='';renderList();renderDetail();});list.append(button);}$('#dialogs-empty').hidden=conversations.length>0;$('#dialogs-empty').textContent=all.length?'Переписок с такими условиями нет.':'Откройте чаты площадок и запустите мониторинг. Здесь появятся прочитанные переписки и доступный список чатов.';}
+function filteredConversations(){const query=$('#dialogs-search').value.trim().toLocaleLowerCase(),filter=$('#dialogs-filter').value;return Object.values(state?.conversations||{}).filter(item=>{if(filter==='unanswered'&&!supplierReplyAssessment(state,item).allowed)return false;if(filter==='unread'&&!(item.unread===true||Number(item.unread)>0))return false;if(filter==='takeover'&&!item.takeover)return false;if(filter==='paused'&&!item.paused)return false;const haystack=[item.title,item.platform,PLATFORMS[item.platform],item.url,item.preview,...(item.messages||[]).map(m=>m.text)].filter(Boolean).join(' ').toLocaleLowerCase();return !query||haystack.includes(query);}).sort((a,b)=>Number(b.unanswered)-Number(a.unanswered)||(b.updatedAt||0)-(a.updatedAt||0)||a.key.localeCompare(b.key));}
+function renderList(){const conversations=filteredConversations(),all=Object.values(state?.conversations||{}),list=$('#dialogs-list');$('#dialogs-count').textContent=all.length+' · требуют ответа: '+all.filter(c=>supplierReplyAssessment(state,c).allowed).length;list.replaceChildren();for(const conversation of conversations){const button=node('button',undefined,'dialogs-thread'+(conversation.key===selectedKey?' selected':''));button.type='button';button.dataset.key=conversation.key;button.setAttribute('aria-pressed',String(conversation.key===selectedKey));button.append(node('strong',conversation.title||'Поставщик не определён'),node('p',(PLATFORMS[conversation.platform]||conversation.platform)+' · '+date(conversation.updatedAt),'hint'));const last=(conversation.messages||[]).at(-1);button.append(node('div',last?.text||conversation.preview||'История ещё не прочитана','dialogs-preview'));const flags=node('div',undefined,'dialogs-thread-flags');for(const [label,tone] of threadFlags(conversation))flags.append(node('span',label,'dialogs-status '+tone));button.append(flags);button.addEventListener('click',()=>{selectedKey=conversation.key;historySignature='';renderList();renderDetail();});list.append(button);}$('#dialogs-empty').hidden=conversations.length>0;$('#dialogs-empty').textContent=all.length?'Переписок с такими условиями нет.':'Откройте чаты площадок и запустите мониторинг. Здесь появятся прочитанные переписки и доступный список чатов.';}
 function renderHistory(conversation){
   const signature=JSON.stringify([conversation.key,conversation.messages,conversation.archivedMessages,readerDetail(conversation)]);
   if(signature===historySignature)return;
@@ -179,16 +179,16 @@ function renderDetail(){
   const isSending=sending.has(conversation.key);
   $('#dialogs-generate-hint').textContent=draftBlockReason(conversation);
   $('#dialogs-folder-draft').disabled=scanReadBusy||!ready||!folderState.enabled||folderDirty||folderPausing||pending||isSending||!!edit||!!draft||test.enabled&&test.phase!=='ready';
-  $('#dialogs-folder-draft').textContent=isWechatDraft(conversation)?'Подготовить приглашение в WeChat':'Подготовить ответ';
+  $('#dialogs-folder-draft').textContent='Подготовить ответ';
   $('#dialogs-folder-draft').title=test.enabled?'Ответ будет введён в чат без отправки. Один тестовый цикл, затем пауза.':folderState.autoSend?'Ответ может быть отправлен автоматически после проверки контекста.':'Ответ будет сохранён для вашего одобрения.';
   $('#dialogs-save-draft').disabled=!ready||!edit?.text.trim()||stale||isSending;
   $('#dialogs-discard-draft').disabled=(!edit&&!draft)||isSending;
   $('#dialogs-draft-text').disabled=!canDraft(conversation)||isSending;
-  const unsafeWechat=!test.enabled&&isWechatDraft(conversation);
+  const unsafeWechat=isWechatDraft(conversation);
   $('#dialogs-send-draft').disabled=scanReadBusy||!ready||!state.running||!text.trim()||stale||!edit&&draft?.status==='stale'||!!receipt||folderPausing||modeBusy||isSending||testOriginBlocked||unsafeWechat||test.enabled&&test.phase!=='ready';
   $('#dialogs-send-draft').textContent=isSending?(test.enabled?'Проверка…':'Отправка…'):test.enabled?'Проверить без отправки':'Отправить';
   $('#dialogs-send-note').textContent=testOriginBlocked?'Тестовый ответ нельзя отправить настоящему поставщику. Удалите этот черновик и подготовьте новый ответ после выхода из тестового режима.':test.enabled?(test.phase==='completed'?'Проверка завершена. Переход к следующему циклу доступен в шаге 3.':test.phase==='blocked'?'Тест приостановлен. Проверьте причину в шаге 3.':test.phase==='paused'?'Сначала нажмите «Проверить первый цикл» в шаге 3.':'Кнопка проверит адресата и введёт этот текст в поле чата. Отправка не выполняется.') :receipt?(receipt.status==='unknown'?'Исход предыдущей отправки неизвестен. Проверьте чат: повторная отправка заблокирована.':receipt.status==='sending'?'Отправка уже выполняется.':'Кнопка отправки уже нажата. Повторная отправка этого ответа заблокирована.'):!state.running?'Для отправки запустите мониторинг и откройте эту переписку во вкладке мониторинга.':'Откройте эту переписку во вкладке площадки и нажмите «Проверить сейчас». «Отправить» одобряет показанный текст; адресат и новые сообщения проверяются повторно.';
-  if(unsafeWechat&&!testOriginBlocked)$('#dialogs-send-note').textContent='Для приглашения в WeChat по доступной истории включите тестовый режим. Реальная отправка этого приглашения недоступна.';
+  if(unsafeWechat&&!testOriginBlocked)$('#dialogs-send-note').textContent='Старый черновик приглашения недоступен для отправки. Удалите его и дождитесь ответа поставщика на первичное обращение.';
   for(const id of busy)if($(id))$(id).disabled=true;
 }
 function renderSettings(){
@@ -196,7 +196,7 @@ function renderSettings(){
   $('#dialogs-save-settings').disabled=!settingsDirty||busy.has('#dialogs-save-settings');
   $('#dialogs-scan-read').checked=scanReadRequested??state.settings?.scanRead===true;
   $('#dialogs-scan-read').disabled=scanReadBusy||modeBusy||folderPausing||settingsDirty||testInProgress();
-  $('#dialogs-scan-read-note').textContent=scanReadBusy?'Сохраняю настройку проверки прочитанных чатов…':!state.settings?.wechat?.trim()?'Для проверки прочитанных чатов сохраните ваш WeChat в разделе «Контекст переговоров и WeChat» в шаге 2.':state.settings?.scanRead?'Проверка включена: расширение открывает доступные прочитанные чаты и ищет ваш сохранённый WeChat в исходящих сообщениях. Отсутствие контакта в доступной истории не доказывает, что его не было раньше. Приглашения пока проверяются только в тестовом режиме.':'При включении расширение проверит также доступные прочитанные чаты. Используется сохранённый WeChat из шага 2; уже переданный контакт не предлагается повторно.';
+  $('#dialogs-scan-read-note').textContent=scanReadBusy?'Сохраняю настройку чтения ответов…':state.settings?.scanRead?'Проверка включена: расширение открывает также прочитанные ответы. Ответ готовится только после вашего первичного сообщения и последующего сообщения поставщика в доступной истории. Если WeChat сохранён, учитывается его предыдущая передача.':'При включении проверяются также прочитанные ответы поставщиков на ваши первичные обращения. Отсутствие WeChat не запускает отдельное сообщение.';
 }
 
 function renderEvents(){const events=state.events||[],list=$('#dialogs-events');list.replaceChildren();for(const event of [...events].slice(-100).reverse()){const item=node('li'),at=event.at??event.time;item.append(node('time',date(at)),node('span',[(PLATFORMS[event.platform]||event.platform),event.detail||event.message||event.type||event.event].filter(Boolean).join(' · ')));list.append(item);}$('#dialogs-events-empty').hidden=events.length>0;}
@@ -319,10 +319,9 @@ $('#dialogs-scan-read').addEventListener('change',async()=>{
   reviewEpoch++;scanReadBusy=true;scanReadRequested=enabled;render();
   try{
     if(settingsDirty)throw new Error('Сначала сохраните контекст переговоров в шаге 2.');
-    if(enabled&&!state.settings?.wechat?.trim())throw new Error('Сначала сохраните ваш WeChat в разделе «Контекст переговоров и WeChat» в шаге 2.');
     await pauseFolderOnEdit(false,true);
     adopt(await command('SETTINGS',{settings:{scanRead:enabled,autoDraft:false}}));
-    feedback(enabled?'Проверка прочитанных чатов включена. Приглашения в WeChat доступны в тестовом режиме без отправки. Запуск цикла выполняется отдельно.':'Проверка прочитанных чатов выключена. Настройка чтения новых сообщений сохранена.');
+    feedback(enabled?'Проверка прочитанных ответов включена. Ответ готовится после первичного обращения и сообщения поставщика. Запуск выполняется отдельно.':'Проверка прочитанных чатов выключена. Настройка чтения новых сообщений сохранена.');
   }catch(error){feedback(error.message,true);}finally{scanReadBusy=false;scanReadRequested=null;render();}
 });
 action('#dialogs-stop',()=>{reviewEpoch++;return act('STOP',{},'Мониторинг остановлен.');});
@@ -349,16 +348,16 @@ action('#dialogs-save-draft',async()=>{await saveEditedDraft(chosen());feedback(
 action('#dialogs-send-draft',async()=>{
   const item=chosen();
   if(!testState().enabled&&(edits.get(item?.key)?.testSessionId||item?.draft?.testSessionId))throw new Error('Удалите тестовый черновик и подготовьте новый ответ для настоящей отправки.');
-  if(!testState().enabled&&isWechatDraft(item))throw new Error('Приглашение в WeChat по доступной истории доступно только в тестовом режиме без отправки.');
+  if(isWechatDraft(item))throw new Error('Удалите старый черновик приглашения. Ответ доступен только после сообщения поставщика на первичное обращение.');
   const reviewed=reviewedDraft(item),intent=reviewEpoch,modeIntent=testModeIntent();
   if(sending.has(item.key))return;
   sending.add(item.key);renderDetail();
   try{
     if(folderPausePromise)await folderPausePromise;
     if(draftEditingPending.has(item.key))await draftEditingPending.get(item.key);
-    if(intent!==reviewEpoch||!sameTestIntent(modeIntent)||!productUI?.isApproved()||!state.running||!modeIntent.testMode&&isWechatDraft(state.conversations[item.key]))throw new Error('Отправка отменена после изменения режима или задания. Проверьте текст и нажмите «Отправить» снова.');
+    if(intent!==reviewEpoch||!sameTestIntent(modeIntent)||!productUI?.isApproved()||!state.running||!canDraft(state.conversations[item.key]))throw new Error('Отправка отменена после изменения режима или задания. Проверьте текст и нажмите «Отправить» снова.');
     await saveEditedDraft(item);
-    if(intent!==reviewEpoch||!sameTestIntent(modeIntent)||!productUI?.isApproved()||!state.running||!modeIntent.testMode&&isWechatDraft(state.conversations[item.key]))throw new Error('Отправка отменена после изменения режима или задания. Проверьте текст и нажмите «Отправить» снова.');
+    if(intent!==reviewEpoch||!sameTestIntent(modeIntent)||!productUI?.isApproved()||!state.running||!canDraft(state.conversations[item.key]))throw new Error('Отправка отменена после изменения режима или задания. Проверьте текст и нажмите «Отправить» снова.');
     // Keep the exact reviewed text and context even if storage refreshes during saving.
     const {request,...payload}=reviewed;
     const result=await command('SEND_DRAFT',{...payload,...modeIntent});adopt(result);
@@ -447,3 +446,11 @@ chrome.storage.onChanged.addListener((changes,area)=>{if(area==='local'&&Object.
 refresh();
 setInterval(()=>{if(!document.hidden)refresh();},5000);
 document.addEventListener('visibilitychange',()=>{if(!document.hidden)refresh();});
+setupJointModeUI({beforeStart:async()=>{
+  if(settingsDirty||productUI?.isDirty())throw new Error('Сначала сохраните изменения товара и контекста.');
+  if(folderDirty)throw new Error('Сначала сохраните выбранную модель Claude.');
+  if(edits.size)throw new Error('Сначала сохраните или удалите несохранённые черновики.');
+  if(testState().enabled)throw new Error('Совместная работа запускает первичную очередь с настоящими сообщениями. Сейчас включён тест без отправки. Для общего запуска требуется рабочий режим; тестовый режим автоматически не отключается.');
+  if(openingChats||modeBusy||folderPausing||scanReadBusy)throw new Error('Дождитесь завершения изменения режима или подключения чатов.');
+  reviewEpoch++;
+},afterChange:refresh});

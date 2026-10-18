@@ -7,6 +7,7 @@ window.chrome={
     const {initialState,parseList,validateSettings}=await corePromise;
     state ||= initialState();
     if(message.type==='GET') return {ok:true,state:structuredClone(state)};
+    if(message.type==='DIALOGS_JOINT_GET') return {ok:true,joint:{enabled:false,testMode:false,phase:'independent',allowDialogs:true,detail:'Раздельная работа',nextAt:null,pending:state.queue.length,quotaPlatforms:[]}};
     let result={ok:true};
     if(message.type==='SETTINGS') state.settings=validateSettings(message.settings);
     if(message.type==='IMPORT') {

@@ -62,12 +62,19 @@
           <p id="dialogs-test-detail" class="hint"></p>
           <div id="dialogs-test-result" class="dialogs-test-result" hidden><p id="dialogs-test-recipient"></p><p id="dialogs-test-time" class="hint"></p><pre id="dialogs-test-text"></pre><p id="dialogs-test-result-note" class="hint">Текст введён в чат для проверки. Записи об отправке в истории переписки нет.</p></div>
           <div class="actions"><button id="dialogs-test-next" class="button primary" type="button" disabled>Проверить первый цикл</button><span id="dialogs-test-count" class="hint"></span></div>
-          <p class="hint">После одного ответа проверка останавливается на всех площадках. «Следующий цикл» учитывает предыдущий ответ только в тестовом режиме и переходит к следующему подходящему чату, в том числе уже прочитанному, если включена проверка WeChat.</p>
+          <p class="hint">После одного ответа проверка останавливается на всех площадках. «Следующий цикл» учитывает предыдущий ответ только в тестовом режиме и переходит к следующему подходящему чату, в том числе уже прочитанному, если включено чтение прочитанных ответов.</p>
         </div>
       </div>
+      <section id="joint-mode" class="joint-mode" aria-labelledby="joint-mode-heading">
+        <div class="panel-heading"><div><h3 id="joint-mode-heading">Очередь и диалоги вместе</h3><p class="hint">Сначала первичные обращения. Во время ожидания квот — переписка с поставщиками.</p></div><span id="joint-mode-status" class="dialogs-status" role="status">Загрузка…</span></div>
+        <p id="joint-mode-detail" class="hint" role="status" aria-live="polite"></p><p id="joint-mode-next" class="hint" hidden></p>
+        <div class="actions"><button id="joint-mode-start" class="button primary" type="button" disabled>Запустить вместе</button><button id="joint-mode-pause" class="button secondary" type="button" disabled>Пауза обоих блоков</button><a class="link-button" href="dashboard.html">Открыть очередь →</a></div>
+        <p id="joint-mode-note" class="hint">Как только квота восстановится, первичная очередь продолжится. После завершения очереди работают диалоги. Сохраняются ваши подтверждения отправки. Переписка начинается только после ответа продавца на первичное обращение. Для отдельной работы используйте обычные кнопки каждого блока. Совместный запуск требует рабочего режима: первичная очередь отправляет реальные обращения.</p>
+        <p id="joint-mode-feedback" class="hint" role="status" hidden></p>
+      </section>
       <div class="actions"><button id="dialogs-start" class="button primary" type="button" disabled>Начать мониторинг</button><button id="dialogs-stop" class="button secondary" type="button" disabled>Остановить мониторинг</button><button id="dialogs-scan" class="button secondary" type="button" disabled>Проверить сейчас</button></div>
-      <label class="check"><input id="dialogs-scan-read" type="checkbox" disabled> Проверять прочитанные чаты, где ещё не передан WeChat</label>
-      <p id="dialogs-scan-read-note" class="hint" role="status">Используется ваш WeChat из шага 2. Проверяется доступная история, включая ваши исходящие сообщения. Если ранняя история недоступна, приглашение можно проверить только в тестовом режиме без отправки.</p>
+      <label class="check"><input id="dialogs-scan-read" type="checkbox" disabled> Проверять также прочитанные ответы поставщиков</label>
+      <p id="dialogs-scan-read-note" class="hint" role="status">Ответ готовится только после вашего первичного сообщения и последующего ответа поставщика в доступной истории. Если WeChat сохранён в шаге 2, его предыдущая передача учитывается.</p>
       <details class="dialogs-inline-details"><summary>Как читаются сообщения</summary><label class="check"><input id="dialogs-read-unread" type="checkbox" checked> Открывать диалоги с новыми сообщениями для чтения</label><p class="hint">Открытие переписки может снять отметку «непрочитано». Проверка прочитанных чатов не зависит от этой настройки. Если история или автор сообщения не распознаны, ответ приостанавливается до проверки.</p></details>
     </section>
 

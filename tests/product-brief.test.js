@@ -2,13 +2,13 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import {initialDialogs,normalizeDialogs,saveProduct,approveProduct,productFingerprint,productExtractionRequest,buildProductExtractionPrompt,acceptProductExtraction,mergeDialogSnapshot,conversationKey,draftRequest,acceptDraft,setDialogSettings,buildDraftPrompt} from '../extension/lib/dialogs.js';
 const key=conversationKey('alibaba','buyer:A/supplier:B');
-function observed(){const state=initialDialogs();mergeDialogSnapshot(state,{platform:'alibaba',status:'ready',conversations:[{id:'buyer:A/supplier:B',identityReliable:true,orderReliable:true,tailKnown:true,messages:[{id:'one',direction:'inbound',text:'Do you need model A?'}]}]},1);return state;}
+function observed(){const state=initialDialogs();mergeDialogSnapshot(state,{platform:'alibaba',status:'ready',conversations:[{id:'buyer:A/supplier:B',identityReliable:true,orderReliable:true,tailKnown:true,messages:[{id:'initial-request',direction:'outbound',text:'Please send the specification for model A.'},{id:'one',direction:'inbound',text:'Do you need model A?'}]}]},1);return state;}
 function approved(){const state=observed();saveProduct(state,{cardText:'Model A supports 220 V.',characteristics:'Need 50 units.',keyPoints:'Buyer requires 50 units of model A. Listing claims 220 V; ask seller to confirm.',questions:'Lead time?',rules:'Keep the reply short.'},2);approveProduct(state,productFingerprint(state),3);return state;}
 const file=(patch={})=>({id:'file-1',name:'spec.txt',mime:'text/plain',size:100,status:'ready',text:'Model A specification',contentHash:'abc',...patch});
 const sortedJSON=value=>Array.isArray(value)?value.map(sortedJSON):value&&typeof value==='object'?Object.fromEntries(Object.keys(value).sort().map(key=>[key,sortedJSON(value[key])])):value;
 test('migration preserves conversation/settings but requires explicit product approval',()=>{
   const state=observed();state.settings.brief='Existing procurement context';delete state.product;
-  const restored=normalizeDialogs(state);assert.equal(restored.settings.brief,state.settings.brief);assert.equal(restored.conversations[key].messages.length,1);assert.equal(restored.product.approval,null);assert.throws(()=>draftRequest(restored,key),/утвердите/);
+  const restored=normalizeDialogs(state);assert.equal(restored.settings.brief,state.settings.brief);assert.equal(restored.conversations[key].messages.length,2);assert.equal(restored.product.approval,null);assert.throws(()=>draftRequest(restored,key),/утвердите/);
 });
 test('editing any product source or instructions invalidates accepted and pending drafts',()=>{
   for(const patch of [{cardText:'Other specification'},{sourceUrl:'https://example.com/product'},{characteristics:'Need 100 units'},{keyPoints:'Different product'},{questions:'New question'},{rules:'New rules'},{warnings:'Conflicting source'},{files:[file()]}]){
@@ -66,7 +66,7 @@ test('reordered persisted approval still rejects altered facts, extra or missing
 });
 test('draft prompt retains all observed context and separates approved buyer facts from supplier assertions',()=>{
   const state=approved(),conversation=state.conversations[key];mergeDialogSnapshot(state,{platform:'alibaba',status:'ready',conversations:[{id:conversation.id,identityReliable:true,orderReliable:true,tailKnown:true,messages:[...conversation.messages,...Array.from({length:40},(_,i)=>({id:`next-${i}`,text:`Observed ${i}`,direction:i===39?'inbound':'outbound'}))]}]});
-  const prompt=buildDraftPrompt(state,draftRequest(state,key)),data=JSON.parse(prompt.user);assert.equal(data.messages.length,41);assert.equal(data.approvedProduct.rules,'Keep the reply short.');assert.match(prompt.system,/не задавайте уже отвеченные вопросы/);assert.match(prompt.system,/не давайте ложного ответа/);assert.match(prompt.system,/языке последнего сообщения/);
+  const prompt=buildDraftPrompt(state,draftRequest(state,key)),data=JSON.parse(prompt.user);assert.equal(data.messages.length,42);assert.equal(data.approvedProduct.rules,'Keep the reply short.');assert.match(prompt.system,/не задавайте уже отвеченные вопросы/);assert.match(prompt.system,/не давайте ложного ответа/);assert.match(prompt.system,/языке последнего сообщения/);
 });
 test('automatic draft attempts survive reload with bounded retries and stable signature',()=>{
   const state=approved();state.conversations[key].autoDraft={fingerprint:JSON.stringify(draftRequest(state,key)),status:'error',at:10,attempts:15,retryAt:5000,error:'Provider unavailable',providerRevision:2};

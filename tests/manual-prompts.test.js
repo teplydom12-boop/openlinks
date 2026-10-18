@@ -69,13 +69,19 @@ test('dialog TXT keeps the full approved context, recipient language rules and o
   assert.deepEqual(result.request,request);assert.deepEqual(state,before);
 });
 
-test('manual WeChat test export preserves purpose, saved contact and limited-history context',()=>{
+test('manual export rejects obsolete WeChat invitations and chats still waiting for the supplier',()=>{
   const state=dialog();setDialogSettings(state,{...state.settings,wechat:'buyer-contact',scanRead:true});approveProduct(state,productFingerprint(state),3);
+  const request=draftRequest(state,key);
+  assert.throws(()=>buildManualDialogPrompt(state,{...request,purpose:'wechat'},{now}),/изменились/);
   observe(state,[...state.conversations[key].messages,{id:'buyer-2',direction:'outbound',text:'Thank you for the offer.'}],{unread:false});
-  const request=draftRequest(state,key),result=buildManualDialogPrompt(state,request,{now});
-  assert.equal(request.purpose,'wechat');assert.deepEqual(result.request,request);
-  assert.match(result.text,/buyer-contact/);assert.match(result.text,/available_history/);assert.match(result.text,/wechat_invitation_test/);
-  assert.throws(()=>buildManualDialogPrompt(state,{...request,purpose:undefined},{now}),/изменились/);
+  assert.throws(()=>buildManualDialogPrompt(state,request,{now}));
+  assert.throws(()=>buildManualDialogPrompt(state,{...request,purpose:'wechat'},{now}));
+});
+
+test('manual export requires an observed buyer message before the current supplier answer',()=>{
+  const state=dialog(),request=draftRequest(state,key);
+  state.conversations[key].messages=state.conversations[key].messages.filter(message=>message.direction==='inbound');
+  assert.throws(()=>buildManualDialogPrompt(state,request,{now}));
 });
 
 test('manual dialog export preserves approval, stale context and unread-history guards',()=>{
@@ -84,13 +90,13 @@ test('manual dialog export preserves approval, stale context and unread-history 
   const changed=dialog(),oldRequest=draftRequest(changed,key);observe(changed,[...changed.conversations[key].messages,{id:'seller-2',direction:'inbound',text:'New offer'}]);
   assert.throws(()=>buildManualDialogPrompt(changed,oldRequest,{now}),/изменились/);
   const unread=dialog(),readRequest=draftRequest(unread,key);observe(unread,[],{needsRead:true,tailKnown:false});
-  assert.throws(()=>buildManualDialogPrompt(unread,readRequest,{now}),/прочитанного диалога/);
+  assert.throws(()=>buildManualDialogPrompt(unread,readRequest,{now}),/подтвердить адресата, порядок и последние сообщения/);
 });
 
 test('dialog attachments require actual resolution and include extracted text after it succeeds',()=>{
   const state=dialog(),request=draftRequest(state,key),attachment={type:'file',name:'offer.pdf',url:'https://cdn.example.com/offer.pdf?signature=PRIVATE'};
   observe(state,[...state.conversations[key].messages,{id:'file-message',direction:'inbound',text:'Offer attached',attachments:[attachment]}],{historyOrderReliable:true,historyTailKnown:true,tailKnown:false,needsRead:true,coverage:{attachments:1,unreadAttachments:1}});
-  assert.throws(()=>buildManualDialogPrompt(state,request,{now}),/прочитанного диалога/);
+  assert.throws(()=>buildManualDialogPrompt(state,request,{now}),/подтвердить адресата, порядок и последние сообщения/);
   const message=state.conversations[key].messages.find(message=>message.id==='file-message');
   resolveConversationAttachments(state,key,[{messageKey:message.key,sourceFingerprint:attachmentSourceFingerprint(attachment),status:'ready',text:'Model X, EUR 250 per unit, 220 V.'}],4);
   const result=buildManualDialogPrompt(state,draftRequest(state,key),{now});

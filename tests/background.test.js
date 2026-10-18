@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {readFileSync} from 'node:fs';
-import {initialState} from '../extension/lib/core.js';
+import {initialState,WINDOW_MS} from '../extension/lib/core.js';
 import {initialDialogs,bindDialogTab} from '../extension/lib/dialogs.js';
 import {domReply} from './debugger-harness.js';
 const listener=()=>{const list=[];return {list,addListener(fn){list.push(fn);}};};
@@ -938,4 +938,134 @@ test('content send-mode guard is authenticated, read-only and independent of the
 test('content send-mode guard fails closed when trusted storage is unavailable',async t=>{
  reset();t.mock.method(chrome.storage.local,'get',async()=>{throw new Error('Storage unavailable');});
  assert.deepEqual(await message('OPENLINKS_TEST_SEND_GUARD',{}, {id:'test',tab:{id:7},url:frameUrl}),{ok:false,canSend:false});assert.equal(clicks,0);
+});
+
+const coordination=await import('../extension/background.js');
+function exhaustPrimary(platform,kind='send',at=Date.now()) {
+  stored.slots.push(...Array.from({length:platform==='1688'?7:3},()=>({platform,kind,at,jobId:crypto.randomUUID()})));
+}
+async function jointQueue(urls='https://a.en.alibaba.com/') {
+  await message('IMPORT',{text:urls});
+  const dialogs=initialDialogs();dialogs.running=true;extraStorage.openlinksDialogs=dialogs;
+  return coordination.startOutreachForJoint(ui);
+}
+test('joint start preserves approval and Claude settings and gives ready outreach priority',async()=>{
+  reset();extraStorage.openlinksClaudeFolder={enabled:true,auto:false,autoSend:false,test:{enabled:false}};
+  const folder=structuredClone(extraStorage.openlinksClaudeFolder),status=await jointQueue();
+  assert.equal(status.phase,'outreach');assert.equal(status.allowDialogs,false);assert.equal(stored.running,true);
+  assert.equal(stored.settings.review,true);assert.equal(extraStorage.openlinksWorkCoordinator.enabled,true);
+  assert.deepEqual(extraStorage.openlinksClaudeFolder,folder);
+  let ran=false;const turn=await coordination.withDialogTurn(()=>{ran=true;});assert.equal(turn.allowed,false);assert.equal(ran,false);
+  const reserved=await coordination.reserveDialogSendQuota({platform:'mic',jobId:crypto.randomUUID(),attemptId:crypto.randomUUID()});
+  assert.equal(reserved.ok,false);assert.equal(reserved.coordination,true);assert.equal(stored.slots.length,0);
+  await tick();assert.equal(createdTabs.length,1);assert.equal(createdTabs[0].active,false);assert.equal(clicks,0);
+});
+test('joint start in test mode changes neither outreach state nor the saved mode',async()=>{
+  reset();await message('IMPORT',{text:'https://a.en.alibaba.com/'});
+  extraStorage.openlinksClaudeFolder={test:{enabled:true}};
+  const previous=structuredClone({stored,extraStorage});
+  await assert.rejects(coordination.startOutreachForJoint(ui),/тестовый режим/);
+  assert.deepEqual({stored,extraStorage},previous);assert.equal(createdTabs.length,0);assert.equal(clicks,0);
+});
+test('joint start rechecks test mode after Chrome window validation',async t=>{
+  reset();await message('IMPORT',{text:'https://a.en.alibaba.com/'});
+  const before=structuredClone(stored);
+  t.mock.method(chrome.windows,'getLastFocused',async()=>{extraStorage.openlinksClaudeFolder={test:{enabled:true}};return {id:10,type:'normal'};});
+  await assert.rejects(coordination.startOutreachForJoint(ui),/тестовый режим/);
+  assert.deepEqual(stored,before);assert.equal(extraStorage.openlinksWorkCoordinator,undefined);assert.equal(createdTabs.length,0);
+});
+test('joint start restores previous outreach and coordinator if scheduling fails after commit',async t=>{
+  reset();await message('IMPORT',{text:'https://a.en.alibaba.com/'});
+  stored.running=true;extraStorage.openlinksDialogs={running:true};
+  extraStorage.openlinksWorkCoordinator={version:1,enabled:false,startedAt:17};
+  const before=structuredClone(stored),mode=structuredClone(extraStorage.openlinksWorkCoordinator);
+  t.mock.method(chrome.alarms,'create',async()=>{assert.equal(extraStorage.openlinksWorkCoordinator.enabled,true);throw new Error('Alarm storage failed');});
+  await assert.rejects(coordination.startOutreachForJoint(ui),/Alarm storage failed/);
+  assert.deepEqual(stored,before);assert.deepEqual(extraStorage.openlinksWorkCoordinator,mode);
+  assert.equal(createdTabs.length,0);assert.equal(clicks,0);
+});
+test('joint start rolls back a failed final status read before a queued tick may run',async t=>{
+  reset();await message('IMPORT',{text:'https://a.en.alibaba.com/'});extraStorage.openlinksDialogs={running:true};
+  extraStorage.openlinksWorkCoordinator={version:1,enabled:false,startedAt:null};
+  const before=structuredClone(stored),mode=structuredClone(extraStorage.openlinksWorkCoordinator),originalGet=chrome.storage.local.get;
+  let failOnce=true;
+  t.mock.method(chrome.storage.local,'get',async keys=>{
+    if(failOnce&&Array.isArray(keys)&&keys.includes('openlinksWorkCoordinator')&&extraStorage.openlinksWorkCoordinator.enabled) {
+      failOnce=false;alarms.onAlarm.list[0]({name:'openlinks-tick'});throw new Error('Status storage failed');
+    }
+    return originalGet(keys);
+  });
+  await assert.rejects(coordination.startOutreachForJoint(ui),/Status storage failed/);await message('GET');
+  assert.deepEqual(stored,before);assert.deepEqual(extraStorage.openlinksWorkCoordinator,mode);
+  assert.equal(createdTabs.length,0);assert.equal(clicks,0);
+});
+test('quota handoff uses the shared send limit without deadlocking its serializer',async()=>{
+  reset();await jointQueue();exhaustPrimary('alibaba');
+  assert.equal((await coordination.getWorkCoordination()).phase,'dialogs_quota_wait');
+  let timer;
+  try {
+    const turn=await Promise.race([
+      coordination.withDialogTurn(async()=>({
+        denied:await coordination.reserveDialogSendQuota({platform:'alibaba',jobId:crypto.randomUUID(),attemptId:crypto.randomUUID()}),
+        allowed:await coordination.reserveDialogSendQuota({platform:'mic',jobId:crypto.randomUUID(),attemptId:crypto.randomUUID()})
+      })),
+      new Promise((_,reject)=>{timer=setTimeout(()=>reject(new Error('Joint lease deadlocked with shared reservation')),1000);})
+    ]);
+    assert.equal(turn.allowed,true);assert.equal(turn.value.denied.ok,false);assert.ok(turn.value.denied.retryAt>Date.now());
+    assert.equal(turn.value.allowed.ok,true);
+  } finally {clearTimeout(timer);}
+  assert.equal(stored.slots.filter(slot=>slot.dialogAttemptId).length,1);assert.equal(clicks,0);
+});
+test('quota recovery waits for the current dialogue action then resumes outreach without overlap',async t=>{
+  reset();await jointQueue();const now=Date.now();exhaustPrimary('alibaba','send',now-WINDOW_MS+500);
+  let release,entered;const holding=new Promise(resolve=>{release=resolve;}),ready=new Promise(resolve=>{entered=resolve;});
+  const turn=coordination.withDialogTurn(async()=>{entered();await holding;return 'finished';});
+  await ready;
+  try {
+    const overlap=await coordination.withDialogTurn(()=>assert.fail('Overlapping dialogue action'));
+    assert.equal(overlap.allowed,false);
+    t.mock.method(Date,'now',()=>now+2000);
+    await tick();assert.equal(createdTabs.length,0);
+    const quota=await coordination.reserveDialogSendQuota({platform:'mic',jobId:crypto.randomUUID(),attemptId:crypto.randomUUID()});
+    assert.equal(quota.ok,false);assert.equal(quota.coordination,true);
+  } finally {release();}
+  assert.equal((await turn).value,'finished');await tick();assert.equal(createdTabs.length,1);assert.equal(clicks,0);
+});
+test('failed dialogue action releases its turn so primary work can continue',async()=>{
+  reset();await jointQueue();exhaustPrimary('alibaba');
+  await assert.rejects(coordination.withDialogTurn(()=>{throw new Error('Reader failure');}),/Reader failure/);
+  stored.slots=[];await tick();assert.equal(createdTabs.length,1);
+});
+test('independent start or pause exits joint mode without changing the other block',async()=>{
+  reset();await jointQueue();
+  assert.equal((await message('PAUSE')).ok,true);assert.equal(extraStorage.openlinksWorkCoordinator.enabled,false);
+  assert.equal(extraStorage.openlinksDialogs.running,true);assert.equal(stored.running,false);
+  await coordination.startOutreachForJoint(ui);
+  assert.equal((await message('START')).ok,true);assert.equal(extraStorage.openlinksWorkCoordinator.enabled,false);
+  assert.equal(extraStorage.openlinksDialogs.running,true);assert.equal(stored.running,true);
+  await coordination.startOutreachForJoint(ui);await coordination.disableJointWork();
+  assert.equal(stored.running,true);assert.equal(extraStorage.openlinksDialogs.running,true);
+});
+test('joint pause does not erase current work or approved dialogue settings',async()=>{
+  reset();await jointQueue();await tick();
+  const active=structuredClone(stored.queue[0]);await coordination.pauseOutreachForJoint();
+  assert.equal(stored.running,false);assert.equal(stored.waiting,null);assert.equal(extraStorage.openlinksWorkCoordinator.enabled,false);
+  assert.deepEqual(stored.queue[0],active);assert.equal(stored.activeId,active.id);assert.equal(clicks,0);
+});
+test('worker reconstruction respects both saved running flags and browser restart disables joint mode',async()=>{
+  reset();await jointQueue();exhaustPrimary('alibaba');
+  assert.equal((await coordination.getWorkCoordination()).phase,'dialogs_quota_wait');
+  extraStorage.openlinksDialogs.running=false;
+  assert.equal((await coordination.getWorkCoordination()).phase,'needs_attention');
+  stored.slots=[];await tick();assert.equal(createdTabs.length,0);exhaustPrimary('alibaba');
+  extraStorage.openlinksDialogs.running=true;
+  assert.equal((await coordination.getWorkCoordination()).phase,'dialogs_quota_wait');
+  runtime.onStartup.list[0]();await message('GET');
+  assert.equal(extraStorage.openlinksWorkCoordinator.enabled,false);assert.equal(stored.running,false);
+});
+test('entering test mode disables joint coordination and pauses outreach without new operations',async()=>{
+  reset();await jointQueue();extraStorage.openlinksClaudeFolder={test:{enabled:true}};
+  await coordination.pauseOutreachForTest();
+  assert.equal(extraStorage.openlinksWorkCoordinator.enabled,false);assert.equal(stored.running,false);
+  await tick();assert.equal(createdTabs.length,0);assert.equal(clicks,0);assert.equal(stored.slots.length,0);
 });

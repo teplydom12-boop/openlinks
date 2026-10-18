@@ -42,6 +42,7 @@ HARNESS = r"""
   window.chrome={storage:{onChanged:{addListener:f=>listeners.push(f)}},permissions:{request:async data=>{permissionCalls.push(structuredClone(data));return allowPermission;}},runtime:{sendMessage:async message=>{
     calls.push(structuredClone(message));const t=message.type;core=await coreModule();state??=core.initialDialogs();
     try {
+      if(t==='DIALOGS_JOINT_GET')return {ok:true,joint:{enabled:false,phase:'independent',detail:'Раздельная работа',nextAt:null,pending:0,quotaPlatforms:[],allowDialogs:true}};
       if(t==='DIALOGS_GET')return failGet?{ok:false,error:'Временная ошибка чтения'}:publicState();
       if(t==='DIALOGS_OPEN_CHATS'){
         if(window.failOpenRequest)throw new Error('Не удалось открыть окно площадок.');
@@ -157,7 +158,7 @@ try:
         expect(ui.locator('#dialogs-start')).to_be_disabled()
         expect(ui.locator('#dialogs-read-unread')).to_be_checked()
         expect(ui.locator('#dialogs-scan-read')).not_to_be_checked()
-        assert ui.evaluate("calls.every(c=>c.type==='DIALOGS_GET')")
+        assert ui.evaluate("calls.every(c=>['DIALOGS_GET','DIALOGS_JOINT_GET'].includes(c.type))")
         assert ui.evaluate('permissionCalls.length') == 0
         removed = '#dialogs-provider,#dialogs-api-key,#dialogs-model,#dialogs-clear-key,#dialogs-auto-draft,#dialogs-folder-auto,#dialogs-product-extract,#dialogs-product-export,#dialogs-generate,#dialogs-export-draft,#dialogs-prompt-panel'
         expect(ui.locator(removed)).to_have_count(0)
@@ -167,12 +168,13 @@ try:
         expect(ui.locator('input[id^=dialogs-folder-][type=checkbox]')).to_have_count(1)
         expect(ui.locator('#dialogs-folder-send')).not_to_be_checked()
         passed('folder-only UI exposes model choices and one send-mode checkbox; render requests no permissions or AI')
-        ui.locator('#dialogs-scan-read').click()
-        expect(ui.locator('#dialogs-feedback')).to_contain_text('Сначала сохраните ваш WeChat')
-        expect(ui.locator('#dialogs-scan-read')).not_to_be_checked()
-        expect(ui.locator('#dialogs-scan-read-note')).to_contain_text('сохраните ваш WeChat')
-        assert not ui.evaluate("calls.some(c=>['DIALOGS_SETTINGS','DIALOGS_CONTEXT_EDITING','DIALOGS_START','DIALOGS_SEND_DRAFT'].includes(c.type))")
-        passed('read-chat checking is opt-in and cannot be enabled without a saved buyer WeChat')
+        ui.locator('#dialogs-scan-read').check()
+        expect(ui.locator('#dialogs-feedback')).to_contain_text('Проверка прочитанных ответов включена')
+        expect(ui.locator('#dialogs-scan-read')).to_be_checked()
+        expect(ui.locator('#dialogs-scan-read-note')).to_contain_text('последующего сообщения поставщика')
+        assert not ui.evaluate("calls.some(c=>['DIALOGS_START','DIALOGS_SEND_DRAFT','DIALOGS_FOLDER_DRAFT'].includes(c.type))")
+        ui.locator('#dialogs-scan-read').uncheck()
+        passed('already-read replies can be enabled without WeChat and never start monitoring, drafting or sending')
         expect(ui.locator('#dialogs-diagnostics')).to_have_attribute('href','diagnostics.html')
         expect(ui.locator('#dialogs-diagnostics')).to_have_attribute('target','_blank')
         assert not ui.evaluate("calls.some(c=>/DIAGNOSTIC/.test(c.type))")
@@ -436,7 +438,7 @@ try:
         assert ui.locator('#dialogs-history img,#dialogs-history a').count() == 0
         ui.evaluate('(messages)=>changeDialog({messages,contentReady:true,needsRead:false,detail:"",coverage:null})',original_messages)
         archived = {'key':'old-wrapper','direction':'unknown','text':'Old observation <img src=x onerror=alert(1)>','at':None,'archivedAt':1792314600000,'reason':'reader-correction','attachments':[]}
-        nonread_before = ui.evaluate("calls.filter(c=>c.type!=='DIALOGS_GET').length")
+        nonread_before = ui.evaluate("calls.filter(c=>!['DIALOGS_GET','DIALOGS_JOINT_GET'].includes(c.type)).length")
         ui.evaluate('(message)=>changeDialog({archivedMessages:[message]})',archived)
         archive = ui.locator('.dialogs-history-archive')
         expect(archive.locator('summary')).to_have_text('Исправленные записи истории (1)')
@@ -446,7 +448,7 @@ try:
         ui.evaluate('(message)=>changeDialog({archivedMessages:[message,{...message,key:"second",text:"Another corrected observation"}]})',archived)
         expect(archive).to_have_attribute('open','')
         expect(archive.locator('summary')).to_have_text('Исправленные записи истории (2)')
-        assert ui.evaluate("calls.filter(c=>c.type!=='DIALOGS_GET').length") == nonread_before
+        assert ui.evaluate("calls.filter(c=>!['DIALOGS_GET','DIALOGS_JOINT_GET'].includes(c.type)).length") == nonread_before
         passed('attachment failures and corrected-history archive remain safe read-only evidence without network or generation')
 
         ui.evaluate("changeDialog({url:'javascript:alert(1)',title:'<img src=x onerror=alert(1)>'})")
@@ -857,76 +859,71 @@ try:
         read_ui.evaluate("changeDialog({unanswered:false,unread:false,draft:null,messages:[...dialogState().conversations['alibaba:alpha'].messages,{key:'m3',id:'m3',direction:'outbound',text:'Thank you, please confirm the machine lead time.',at:Date.now()}]})")
         expect(read_ui.locator('#dialogs-wechat-assessment')).to_contain_text('В доступной истории WeChat не найден')
         expect(read_ui.locator('#dialogs-wechat-assessment')).to_contain_text('Более ранние сообщения могут быть недоступны')
-        expect(read_ui.locator('#dialogs-folder-draft')).to_have_text('Подготовить приглашение в WeChat')
+        expect(read_ui.locator('#dialogs-folder-draft')).to_have_text('Подготовить ответ')
         expect(read_ui.locator('#dialogs-folder-draft')).to_be_disabled()
         expect(read_ui.locator('#dialogs-send-draft')).to_be_disabled()
-        expect(read_ui.locator('#dialogs-generate-hint')).to_contain_text('только в тестовом режиме')
-        read_ui.locator('#dialogs-send-draft').dispatch_event('click')
-        expect(read_ui.locator('#dialogs-feedback')).to_contain_text('только в тестовом режиме без отправки')
-        assert not read_ui.evaluate("calls.some(c=>c.type==='DIALOGS_SEND_DRAFT')")
-        passed('already-read outbound tail is eligible for a WeChat test without claiming full-history coverage, but cannot send outside test mode')
+        expect(read_ui.locator('#dialogs-generate-hint')).to_contain_text('поставщика')
+        read_ui.locator('#dialogs-folder-draft').dispatch_event('click')
+        assert not read_ui.evaluate("calls.some(c=>c.type==='DIALOGS_FOLDER_DRAFT')")
+        passed('buyer-last chat waits for the supplier instead of proposing an unsolicited WeChat invitation')
 
         read_ui.locator('#dialogs-test-mode').check()
         read_ui.locator('#dialogs-test-next').click()
         read_ui.wait_for_function('folderState().test.phase==="ready"')
-        expect(read_ui.locator('#dialogs-test-status')).to_contain_text('Ищу чат для одного цикла')
+        expect(read_ui.locator('#dialogs-folder-draft')).to_be_disabled()
+        expect(read_ui.locator('#dialogs-send-draft')).to_be_disabled()
+        read_ui.locator('#dialogs-folder-draft').dispatch_event('click')
+        assert not read_ui.evaluate("calls.some(c=>c.type==='DIALOGS_FOLDER_DRAFT')")
+        passed('test mode also waits for a real supplier reply; missing WeChat does not bypass eligibility')
+
+        read_ui.evaluate("changeDialog({unanswered:true,messages:[{key:'first-inbound',id:'first-inbound',direction:'inbound',text:'Hello, are you interested?',at:Date.now()}]})")
+        expect(read_ui.locator('#dialogs-folder-draft')).to_be_disabled()
+        expect(read_ui.locator('#dialogs-conversation-status')).to_contain_text('Первичное обращение не найдено')
+        read_ui.locator('#dialogs-send-draft').dispatch_event('click')
+        assert not read_ui.evaluate("calls.some(c=>c.type==='DIALOGS_SEND_DRAFT')")
+        passed('incoming-only chat cannot receive a reply until initial buyer outreach is observed')
+
+        read_ui.evaluate("changeDialog({unanswered:true,messages:[{key:'buyer',id:'buyer',direction:'outbound',text:'Hello, I need this machine.',at:Date.now()-1000},{key:'seller',id:'seller',direction:'inbound',text:'What quantity do you need?',at:Date.now()}]})")
         expect(read_ui.locator('#dialogs-folder-draft')).to_be_enabled()
-        expect(read_ui.locator('#dialogs-scan-read')).to_be_disabled()
         read_ui.locator('#dialogs-folder-draft').click()
         read_ui.wait_for_function('folderState().jobs.some(job=>job.kind==="dialog")')
-        read_ui.evaluate("deliverDraft('Please add my WeChat: buyer-wechat-42 to discuss the machine.')")
+        read_ui.evaluate("deliverDraft('Please quote 10 machines. My WeChat is buyer-wechat-42.')")
         expect(read_ui.locator('#dialogs-send-draft')).to_be_enabled()
-        read_ui.locator('#dialogs-draft-text').fill('For machine details, my WeChat is buyer-wechat-42.')
+        read_ui.locator('#dialogs-draft-text').fill('Please quote 10 machines; my WeChat is buyer-wechat-42.')
         read_ui.locator('#dialogs-send-draft').click()
         read_ui.wait_for_function('previewedTexts.length===1')
-        proactive_preview = read_ui.evaluate("calls.filter(c=>c.type==='DIALOGS_SEND_DRAFT').at(-1)")
-        assert proactive_preview['testMode'] is True
-        assert proactive_preview['purpose'] == 'wechat'
-        assert proactive_preview['settingsFingerprint']
+        reply_preview = read_ui.evaluate("calls.filter(c=>c.type==='DIALOGS_SEND_DRAFT').at(-1)")
+        assert reply_preview['testMode'] is True
+        assert not reply_preview.get('purpose')
+        assert reply_preview['settingsFingerprint']
         assert read_ui.evaluate('sentTexts.length+folderState().sendReceipts.length') == 0
         expect(read_ui.locator('#dialogs-test-status')).to_contain_text('сообщение не отправлено')
-        expect(read_ui.locator('#dialogs-test-panel')).to_contain_text('следующему подходящему чату')
-        passed('read-chat invitation can be edited and previewed only in a frozen test cycle; purpose and settings are included and no send receipt is created')
+        passed('already-read supplier reply after buyer outreach can be edited and previewed with no real-send receipt')
 
         read_ui.locator('#dialogs-test-next').click()
         read_ui.wait_for_function('folderState().test.phase==="ready"')
-        read_ui.evaluate("changeDialog({draft:null,messages:[...dialogState().conversations['alibaba:alpha'].messages,{key:'m4',id:'m4',direction:'outbound',text:'My WeChat: buyer-wechat-42',at:Date.now()}]})")
+        read_ui.evaluate("changeDialog({unanswered:false,draft:null,messages:[...dialogState().conversations['alibaba:alpha'].messages,{key:'m4',id:'m4',direction:'outbound',text:'My WeChat: buyer-wechat-42',at:Date.now()}]})")
         expect(read_ui.locator('#dialogs-wechat-assessment')).to_contain_text('Ваш WeChat найден в исходящем сообщении')
         expect(read_ui.locator('#dialogs-conversation-status')).to_contain_text('WeChat уже передан')
         expect(read_ui.locator('#dialogs-folder-draft')).to_be_disabled()
-        expect(read_ui.locator('#dialogs-send-draft')).to_be_disabled()
         read_ui.evaluate("changeDialog({unanswered:true,messages:[...dialogState().conversations['alibaba:alpha'].messages,{key:'m5',id:'m5',direction:'inbound',text:'What voltage do you need?',at:Date.now()}]})")
         expect(read_ui.locator('#dialogs-folder-draft')).to_be_enabled()
-        expect(read_ui.locator('#dialogs-folder-draft')).to_have_text('Подготовить ответ')
-        passed('outgoing own WeChat suppresses duplicate invitations while a later supplier question still permits an ordinary reply')
+        passed('own WeChat stays visible while buyer-last waits and a subsequent supplier question allows a reply')
 
-        read_ui.evaluate("changeDialog({unanswered:false,draft:null,messages:[{key:'s1',id:'s1',direction:'inbound',text:'Is buyer-wechat-42 your contact?',at:Date.now()-1000},{key:'s2',id:'s2',direction:'outbound',text:'Please confirm the voltage first.',at:Date.now()}]})")
+        read_ui.evaluate("changeDialog({unanswered:true,draft:null,messages:[{key:'s1',id:'s1',direction:'outbound',text:'Please confirm the voltage.',at:Date.now()-1000},{key:'s2',id:'s2',direction:'inbound',text:'Is buyer-wechat-42 your contact?',at:Date.now()}]})")
         expect(read_ui.locator('#dialogs-wechat-assessment')).to_contain_text('В доступной истории WeChat не найден')
-        expect(read_ui.locator('#dialogs-folder-draft')).to_be_enabled()
-        preceding_capacity_calls = read_ui.evaluate("calls.filter(c=>['DIALOGS_FOLDER_DRAFT','DIALOGS_SEND_DRAFT'].includes(c.type)).length")
         read_ui.evaluate("changeContactLedger({saturated:true,records:{...dialogState().contactLedger.records,'abcdef:6':{wechatEvidence:[{contactFingerprint:'123abc:6',messageKeyFingerprint:'456def:6',at:1}],readScan:null,overflow:false}}})")
         capacity_records = read_ui.evaluate('JSON.stringify(dialogState().contactLedger.records)')
         expect(read_ui.locator('#dialogs-wechat-assessment')).to_contain_text('Память проверок WeChat заполнена')
-        expect(read_ui.locator('#dialogs-wechat-assessment')).to_contain_text('сохранённые подтверждения не удаляются')
         expect(read_ui.locator('#dialogs-conversation-status')).to_contain_text('WeChat: память проверок заполнена')
-        expect(read_ui.locator('#dialogs-generate-hint')).to_contain_text('Память проверок WeChat заполнена')
-        expect(read_ui.locator('#dialogs-folder-draft')).to_be_disabled()
-        expect(read_ui.locator('#dialogs-send-draft')).to_be_disabled()
-        expect(read_ui.locator('#dialogs-draft-text')).to_be_disabled()
-        read_ui.locator('#dialogs-folder-draft').dispatch_event('click')
-        read_ui.locator('#dialogs-send-draft').dispatch_event('click')
-        assert read_ui.evaluate("calls.filter(c=>['DIALOGS_FOLDER_DRAFT','DIALOGS_SEND_DRAFT'].includes(c.type)).length") == preceding_capacity_calls
-        assert read_ui.evaluate('JSON.stringify(dialogState().contactLedger.records)') == capacity_records
-        assert read_ui.evaluate('sentTexts.length+folderState().sendReceipts.length') == 0
-        read_ui.evaluate('changeContactLedger({saturated:false})')
         expect(read_ui.locator('#dialogs-folder-draft')).to_be_enabled()
-        passed('full WeChat check memory displays its cause and blocks proactive drafting and preview without discarding remembered contacts')
+        assert read_ui.evaluate('JSON.stringify(dialogState().contactLedger.records)') == capacity_records
+        passed('WeChat ledger capacity remains visible and preserves records without blocking an ordinary eligible supplier reply')
         read_ui.evaluate("changeDialog({messages:[...dialogState().conversations['alibaba:alpha'].messages,{key:'u1',id:'u1',direction:'unknown',text:'Unrecognized author',at:Date.now()}],contentReady:false})")
-        expect(read_ui.locator('#dialogs-wechat-assessment')).to_contain_text('Приглашение заблокировано')
         expect(read_ui.locator('#dialogs-folder-draft')).to_be_disabled()
         expect(read_ui.locator('#dialogs-send-draft')).to_be_disabled()
         assert read_ui.evaluate('sentTexts.length+folderState().sendReceipts.length') == 0
-        passed('supplier-only contact mentions are not buyer sharing evidence and unreadable history blocks invitation preview')
+        passed('supplier contact mention is not buyer sharing evidence and unreadable history blocks replies')
 
         settings_ui = prepared_page()
         settings_ui.locator('#dialogs-start').click()

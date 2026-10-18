@@ -593,23 +593,29 @@ with sync_playwright() as p:
     current=active();expected={'platform':'1688','sourceUrl':page.url,'documentToken':snapshot()['documentToken'],'id':current['id'],'replyFingerprint':current['replyFingerprint'],'purpose':'wechat'}
     assert not page.evaluate('(e)=>OpenLinksDialogsReader.guardReply(e)',expected)['ok']
     assert not page.evaluate('(e)=>OpenLinksDialogsReader.guardReply(e,{preview:false})',expected)['ok']
-    assert page.evaluate('(e)=>OpenLinksDialogsReader.guardReply(e,{preview:true})',expected)['ok']
+    assert not page.evaluate('(e)=>OpenLinksDialogsReader.guardReply(e,{preview:true})',expected)['ok']
     normal={key:value for key,value in expected.items() if key!='purpose'}
     assert not page.evaluate('(e)=>OpenLinksDialogsReader.guardReply(e,{preview:true})',normal)['ok']
-    page.evaluate('document.querySelector(".message-item").textContent="Changed buyer message."')
-    assert not page.evaluate('(e)=>OpenLinksDialogsReader.guardReply(e,{preview:true})',expected)['ok']
-    current=active();expected['replyFingerprint']=current['replyFingerprint']
-    assert page.evaluate('(e)=>OpenLinksDialogsReader.guardReply(e,{preview:true})',expected)['ok']
-    page.evaluate('document.querySelector("[data-chat-root]").setAttribute("data-thread-id","other-recipient")')
-    assert not page.evaluate('(e)=>OpenLinksDialogsReader.guardReply(e,{preview:true})',expected)['ok']
-    passed('WeChat purpose permits a last-outbound TEST preview only; purpose alone, normal replies, changed history and recipient remain blocked')
+    passed('a buyer message without a supplier answer cannot authorize either an ordinary reply or an obsolete WeChat preview')
 
     load();current=active();expected={'platform':'1688','sourceUrl':page.url,'documentToken':snapshot()['documentToken'],'id':current['id'],'replyFingerprint':current['replyFingerprint'],'purpose':'wechat'}
     assert not page.evaluate('(e)=>OpenLinksDialogsReader.guardReply(e)',expected)['ok']
-    assert page.evaluate('(e)=>OpenLinksDialogsReader.guardReply(e,{preview:true})',expected)['ok']
+    assert not page.evaluate('(e)=>OpenLinksDialogsReader.guardReply(e,{preview:true})',expected)['ok']
     normal={key:value for key,value in expected.items() if key!='purpose'}
     assert page.evaluate('(e)=>OpenLinksDialogsReader.guardReply(e)',normal)['ok']
-    passed('WeChat is preview-only even with last inbound; ordinary inbound reply guard retains its existing contract')
+    assert page.evaluate('(e)=>OpenLinksDialogsReader.guardReply(e,{preview:true})',normal)['ok']
+    passed('obsolete WeChat purpose remains blocked with a valid supplier reply; ordinary reply and preview accept buyer-before-supplier history')
+
+    for html in [
+        '<div class="message-item incoming" data-message-id="supplier-first">Supplier greeting.</div>',
+        '<div class="message-item incoming" data-message-id="supplier-first">Supplier greeting.</div><div class="message-item outgoing" data-message-id="buyer-last">Buyer initial outreach.</div>',
+        '<div class="message-item" data-message-id="unknown-first">Unknown author.</div><div class="message-item incoming" data-message-id="supplier-last">Supplier greeting.</div>'
+    ]:
+        load();set_history(html);current=active()
+        expected={'platform':'1688','sourceUrl':page.url,'documentToken':snapshot()['documentToken'],'id':current['id'],'replyFingerprint':current['replyFingerprint']}
+        assert not page.evaluate('(e)=>OpenLinksDialogsReader.guardReply(e)',expected)['ok']
+        assert not page.evaluate('(e)=>OpenLinksDialogsReader.guardReply(e,{preview:true})',expected)['ok']
+    passed('fresh guards reject seller-only history, unanswered buyer outreach and unknown initial authors in live and test mode')
 
     assert not errors, errors
     browser.close()

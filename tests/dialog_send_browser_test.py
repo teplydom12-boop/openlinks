@@ -253,21 +253,38 @@ with sync_playwright() as p:
         assert send()['clicked'] is False
     passed('test previews fill real synthetic composers, permanently forbid SEND and clean only owned text on both platforms')
 
-    for platform in ['alibaba','mic']:
-        load(platform)
-        page.evaluate("""()=>{
-          const history=document.querySelector('[data-message-history]');
-          history.insertAdjacentHTML('beforeend','<div class=message-item data-direction=outbound data-message-id=buyer-last><span data-message-text>Thank you for the quotation.</span></div>');
-          const row=OpenLinksDialogsReader.snapshot().conversations.find(item=>item.active);
-          guard.replyFingerprint=row.replyFingerprint;guard.purpose='wechat';
-        }""")
-        assert not prepare()['ok']
-        assert page.locator('textarea').input_value()==''
-        result=preview();assert result['ok'] and result['preview'],result
-        assert send()['clicked'] is False
-        assert page.evaluate('syntheticClicks')==0
-        assert clear_preview()['cleared']
-    passed('read chats ending in buyer text allow WeChat test previews but reject live preparation and SEND')
+    for platform in ['alibaba','mic','1688']:
+        for waiting in [True,False]:
+            load(platform)
+            page.evaluate("""waiting=>{
+              const history=document.querySelector('[data-message-history]');
+              if(waiting)history.insertAdjacentHTML('beforeend','<div class=message-item data-direction=outbound data-message-id=buyer-last><span data-message-text>Thank you for the quotation.</span></div>');
+              const row=OpenLinksDialogsReader.snapshot().conversations.find(item=>item.active);
+              guard.replyFingerprint=row.replyFingerprint;guard.purpose='wechat';
+            }""",waiting)
+            assert not prepare()['ok']
+            assert not preview()['ok']
+            assert send()['clicked'] is False
+            assert page.evaluate('syntheticClicks')==0
+            assert page.evaluate("document.querySelector('textarea')?.value ?? document.querySelector('pre.edit').textContent")==''
+    passed('obsolete WeChat invitations cannot fill or send in live or test mode, even when a supplier has replied')
+
+    for platform in ['alibaba','mic','1688']:
+        for history in ['no-outreach','buyer-last','outreach-unknown']:
+            load(platform)
+            page.evaluate("""kind=>{
+              const history=document.querySelector('[data-message-history]'),buyer=history.querySelector('.message-item.outgoing');
+              if(kind==='no-outreach')buyer.remove();
+              else if(kind==='buyer-last')history.append(buyer);
+              else buyer.dataset.direction='unknown';
+              guard.replyFingerprint=OpenLinksDialogsReader.snapshot().conversations.find(item=>item.active).replyFingerprint;
+            }""",history)
+            assert not prepare()['ok'],(platform,history)
+            assert not preview()['ok'],(platform,history)
+            assert send()['clicked'] is False
+            assert page.evaluate('syntheticClicks')==0
+            assert page.evaluate("document.querySelector('textarea')?.value ?? document.querySelector('pre.edit').textContent")==''
+    passed('fresh DOM must show an identified buyer outreach followed by a supplier answer before any reply or preview')
 
     load();assert preview()['ok']
     page.evaluate("document.querySelector('[data-message-history]').insertAdjacentHTML('beforeend','<div class=message-item data-direction=inbound data-message-id=new><span data-message-text>New supplier reply</span></div>')")

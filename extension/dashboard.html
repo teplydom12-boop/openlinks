@@ -19,6 +19,13 @@
     <div id="toast" role="status" hidden></div>
     <section id="queue-view" class="view">
       <div class="intro"><p>Один текст. Все поставщики.<br><span>Очередь учитывает лимиты и останавливается, если нужна ваша помощь.</span></p><div class="actions"><button id="pause" class="button secondary">Пауза</button><button id="start" class="button primary">▶ Запустить очередь</button></div></div>
+      <section id="joint-mode" class="panel joint-mode" aria-labelledby="joint-mode-heading">
+        <div class="panel-heading"><div><h2 id="joint-mode-heading">Очередь и диалоги вместе</h2><p class="hint">Сначала первичные обращения. Во время ожидания квот — переписка с поставщиками.</p></div><span id="joint-mode-status" class="dialogs-status" role="status">Загрузка…</span></div>
+        <p id="joint-mode-detail" class="hint" role="status" aria-live="polite"></p><p id="joint-mode-next" class="hint" hidden></p>
+        <div class="actions"><button id="joint-mode-start" class="button primary" type="button" disabled>Запустить вместе</button><button id="joint-mode-pause" class="button secondary" type="button" disabled>Пауза обоих блоков</button><a class="link-button" href="dialogs.html#dialogs-monitor">Настроить диалоги →</a></div>
+        <p id="joint-mode-note" class="hint">Как только квота восстановится, первичная очередь продолжится. После завершения очереди работают диалоги. Сохраняются ваши подтверждения отправки. Переписка начинается только после ответа продавца на первичное обращение. Для отдельной работы используйте обычные кнопки каждого блока. Совместный запуск требует рабочего режима: первичная очередь отправляет реальные обращения.</p>
+        <p id="joint-mode-feedback" class="hint" role="status" hidden></p>
+      </section>
       <div id="platform-cards" class="platform-cards"></div>
       <div class="notice">По одному магазину за раз, только сообщения в чат. При исчерпании квоты обрабатываются доступные площадки, затем очередь возвращается к отложенным. Пауза — между соседними магазинами одной площадки; при смене площадки её нет. Лимиты за 20 минут сохраняются.</div>
       <section class="panel activity-panel" aria-live="polite"><div class="panel-heading"><h2>Что происходит сейчас</h2><button id="show-log" class="link-button">Открыть подробный лог →</button></div><strong id="activity-stage">Очередь ещё не запущена</strong><p id="activity-detail">Добавьте ссылки и сохраните сообщение.</p><p id="waiting-detail" class="hint" hidden></p></section>

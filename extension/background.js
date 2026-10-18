@@ -6,6 +6,7 @@ import {activate1688} from './lib/native-input.js';
 import {localTimestamp} from './lib/time.js';
 import {installDialogMonitor,isMonitoredTab} from './dialog-monitor.js';
 import {withTabOwnership} from './lib/tab-ownership.js';
+import {WORK_COORDINATOR_KEY,normalizeWorkCoordinator,assessWorkCoordination} from './lib/work-coordinator.js';
 const {makeRule,mergeRule}=globalThis.OpenLinksRules;
 const routes1688=globalThis.OpenLinks1688;
 const supplierChat=globalThis.OpenLinksSupplierChat;
@@ -15,6 +16,7 @@ const CHAT_LOAD_MS = 30000;
 const MAX_ERRORS=3, RETRY_MS=10000, READY_TIMEOUT_MS=60000;
 const CLOSE_PREFIX='openlinks-close:';
 let serial = Promise.resolve();
+let dialogTurn=null;
 const exclusive = task => {
   const result = serial.then(task);
   serial = result.catch(error => console.error('OpenLinks:', error.message));
@@ -22,11 +24,83 @@ const exclusive = task => {
 };
 async function load() { return migrateState((await chrome.storage.local.get(KEY))[KEY]); }
 async function save(state) { await chrome.storage.local.set({[KEY]:state}); }
+async function readWorkCoordination(state) {
+  const values=await chrome.storage.local.get([WORK_COORDINATOR_KEY,'openlinksDialogs','openlinksClaudeFolder',...(state?[]:[KEY])]);
+  const mode=normalizeWorkCoordinator(values[WORK_COORDINATOR_KEY]);
+  return assessWorkCoordination(state || migrateState(values[KEY]),{enabled:mode.enabled,dialogsRunning:values.openlinksDialogs?.running===true,testMode:values.openlinksClaudeFolder?.test?.enabled===true},Date.now());
+}
+// UI status is a read-only snapshot and may be requested while the monitor
+// owns a tab lock. Waiting for the outreach queue here could deadlock against
+// an outreach operation that is itself waiting to claim that same tab.
+export function getWorkCoordination() {return readWorkCoordination();}
+async function disableJoint(state,detail) {
+  const mode=normalizeWorkCoordinator((await chrome.storage.local.get(WORK_COORDINATOR_KEY))[WORK_COORDINATOR_KEY]);
+  if(!mode.enabled)return;
+  await chrome.storage.local.set({[WORK_COORDINATOR_KEY]:{version:1,enabled:false,startedAt:null}});
+  if(state){event(state,'joint_stopped',null,detail || 'Совместный режим выключен. Блоки можно запускать отдельно.','decision');await save(state);}
+}
+export function disableJointWork() {return exclusive(async()=>{await disableJoint(await load());return readWorkCoordination();});}
+
+// Acquire only the decision while holding the outreach serializer. Browser
+// work runs outside it: a guarded dialogue send must be able to reserve quota
+// through that same serializer. Outreach never waits for the monitor's queue.
+export async function withDialogTurn(task) {
+  const claim=await exclusive(async()=>{
+    const status=await readWorkCoordination();
+    if(!status.allowDialogs)return {allowed:false,status};
+    if(dialogTurn)return {allowed:false,status:{...status,allowDialogs:false,detail:'Предыдущее действие переписки ещё выполняется.'}};
+    const token=crypto.randomUUID();dialogTurn=token;
+    return {allowed:true,status,token};
+  });
+  if(!claim.allowed)return claim;
+  try {return {allowed:true,status:claim.status,value:await task()};}
+  finally {
+    // Releasing does not wait behind the outreach queue (or tab ownership).
+    if(dialogTurn===claim.token)dialogTurn=null;
+    await alarm(Date.now()+1000).catch(()=>{});
+  }
+}
+export function startOutreachForJoint(sender={}) {
+  return exclusive(async()=>{
+    if(await dialogTestEnabled())throw new Error(TEST_MODE_MESSAGE);
+    if(dialogTurn)throw new Error('Дождитесь завершения текущего действия переписки и повторите совместный запуск.');
+    const state=await load(),job=state.queue.find(item=>item.id===state.activeId);
+    if(!state.settings.message.trim())throw new Error('Сначала сохраните текст первого сообщения поставщикам.');
+    if(job&&['blocked','uncertain','sending'].includes(job.status))throw new Error('Сначала разрешите ситуацию с текущим поставщиком первичной очереди.');
+    const previousState=structuredClone(state);
+    const previousMode=normalizeWorkCoordinator((await chrome.storage.local.get(WORK_COORDINATOR_KEY))[WORK_COORDINATOR_KEY]);
+    await bindQueueWindow(state,sender,job);
+    // Check again after asynchronous window validation; test mode can be set by
+    // the separate monitor queue while this operation is waiting for Chrome.
+    if(await dialogTestEnabled())throw new Error(TEST_MODE_MESSAGE);
+    state.running=true;
+    event(state,'joint_started',null,'Совместный режим: сначала первичные обращения. Переписка получает очередь, когда исчерпаны лимиты всех оставшихся площадок или первичная очередь завершена. Общие лимиты отправки сохраняются.','decision');
+    try {
+      await chrome.storage.local.set({[KEY]:state,[WORK_COORDINATOR_KEY]:{version:1,enabled:true,startedAt:Date.now()}});
+      await alarm(Date.now()+1000);return await readWorkCoordination(state);
+    } catch(error) {
+      // Keep the serializer until the previous intent is restored. An alarm
+      // queued just before failure cannot observe a half-started joint run.
+      await chrome.storage.local.set({[KEY]:previousState,[WORK_COORDINATOR_KEY]:previousMode});
+      throw error;
+    }
+  });
+}
+export function pauseOutreachForJoint() {
+  return exclusive(async()=>{
+    const state=await load(),job=state.queue.find(item=>item.id===state.activeId);
+    await stopLearning(state,job);state.running=false;state.waiting=null;
+    event(state,'joint_paused',null,'Оба блока совместной работы приостановлены. Уже начатое нажатие не отменяется.','decision');
+    await chrome.storage.local.set({[KEY]:state,[WORK_COORDINATOR_KEY]:{version:1,enabled:false,startedAt:null}});
+    return readWorkCoordination(state);
+  });
+}
 const TEST_MODE_MESSAGE='Включён тестовый режим диалогов. Настоящая отправка и основная очередь приостановлены.';
 async function dialogTestEnabled() {
   return (await chrome.storage.local.get('openlinksClaudeFolder')).openlinksClaudeFolder?.test?.enabled===true;
 }
 async function pauseForDialogTest(state) {
+  await disableJoint(state,'Совместная работа выключена: включён тестовый режим без отправки.');
   const job=state.queue.find(item=>item.id===state.activeId);
   const changed=state.running || state.waiting || state.learning || job?.approved;
   await stopLearning(state,job);
@@ -45,6 +119,8 @@ export function reserveDialogSendQuota({platform,jobId,attemptId}={}) {
     if(await dialogTestEnabled())return {ok:false,reason:TEST_MODE_MESSAGE};
     const state=await load(),at=Date.now();
     if(state.slots.some(slot=>slot.dialogAttemptId===attemptId))return {ok:false,unknown:true,reason:'Попытка уже зарегистрирована. Повторное нажатие запрещено.'};
+    const coordination=await readWorkCoordination(state);
+    if(coordination.enabled&&!coordination.allowDialogs)return {ok:false,retryAt:coordination.nextAt || at+1000,reason:coordination.detail,coordination:true};
     const allowed=eligibility(state,platform,'send',at);
     if(allowed.at>at)return {ok:false,retryAt:allowed.at,reason:allowed.reasons.join('; ')};
     state.slots.push({platform,kind:'send',at,jobId:'dialog:'+jobId,dialogAttemptId:attemptId});
@@ -426,6 +502,9 @@ async function performSend(state, job) {
 async function tick() {
   const state = await load();
   if(await dialogTestEnabled()){await pauseForDialogTest(state);return;}
+  if(dialogTurn){if(state.running)await alarm(Date.now()+1000);return;}
+  const coordination=await readWorkCoordination(state);
+  if(coordination.enabled&&coordination.phase==='needs_attention'){if(state.running)await alarm();return;}
   let job = state.queue.find(j => j.id === state.activeId);
   if(supplierChat.supports(job?.platform) && watchingSupplierChat(state,job)) {
     const results=await probe(job).catch(()=>[]);
@@ -717,7 +796,7 @@ async function dispatch(message, sender) {
   const state = await load();
   const job = state.queue.find(j => j.id === state.activeId);
   switch (message.type) {
-    case 'GET': return {ok:true, state};
+    case 'GET': return {ok:true, state,joint:await readWorkCoordination(state)};
     case 'IMPORT': {
       if (state.queue.length > 5000 || String(message.text).length > 2000000) throw new Error('Список слишком большой; используйте партии до 5000 ссылок');
       const parsed = parseList(String(message.text), state.queue);
@@ -735,8 +814,10 @@ async function dispatch(message, sender) {
       if (!state.settings.message.trim()) throw new Error('Сначала сохраните текст сообщения');
       if (job && ['blocked','uncertain'].includes(job.status)) throw new Error('Сначала разрешите ситуацию с текущим поставщиком');
       await bindQueueWindow(state,sender,job);
+      await disableJoint(state,'Первичная очередь запущена отдельно. Текущий режим переписки не изменён.');
       state.running=true; event(state,'start',null,'Очередь запущена: только чат; интервал между соседними магазинами одной площадки. При исчерпании квоты перехожу к доступной площадке и затем возвращаюсь; лимиты 7/20 и 3/20 сохраняются.'); await save(state); await alarm(Date.now()+1000); return {ok:true};
     case 'PAUSE':
+      await disableJoint(state,'Первичная очередь приостановлена отдельно. Текущий режим переписки не изменён.');
       await stopLearning(state,job);
       state.running=false; state.waiting=null; event(state,'pause',null,'Пауза пользователя; уже начатое нажатие не отменяется'); await save(state); return {ok:true};
     case 'APPROVE':
@@ -973,6 +1054,7 @@ chrome.webNavigation.onCreatedNavigationTarget.addListener(details=>exclusive(as
 }));
 chrome.runtime.onStartup.addListener(()=>exclusive(async()=>{
   const state=await load();
+  await disableJoint(state,'Chrome перезапущен. Совместную работу нужно запустить явно.');
   // Window IDs are session-local too. A future explicit Start binds a fresh one.
   delete state.queueWindowId;await save(state);
   // Tab IDs may be reused after a browser restart. Old closure timers lose authority.
@@ -991,6 +1073,7 @@ chrome.runtime.onStartup.addListener(()=>exclusive(async()=>{
 }));
 chrome.runtime.onInstalled.addListener((details={})=>exclusive(async()=>{
   const state=await load();
+  if(details.reason==='update')await disableJoint(state,'Расширение обновлено. Совместную работу нужно запустить явно.');
   state.pendingClosures=[];
   if(details.reason==='update') {
     state.settings.review=true;
@@ -1009,4 +1092,4 @@ chrome.action.onClicked.addListener(async()=>{
   if(tabs[0]) { await chrome.tabs.update(tabs[0].id,{active:true}); await chrome.windows.update(tabs[0].windowId,{focused:true}); }
   else await chrome.windows.create({url,type:'popup',width:1240,height:900});
 });
-installDialogMonitor(chrome,{reserveDialogSendQuota,pauseOutreachForTest});
+installDialogMonitor(chrome,{reserveDialogSendQuota,pauseOutreachForTest,getWorkCoordination,withDialogTurn,startOutreachForJoint,pauseOutreachForJoint,disableJointWork});

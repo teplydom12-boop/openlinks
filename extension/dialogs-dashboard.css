@@ -58,6 +58,12 @@ details.panel > summary { cursor: pointer; font-size: 14px; font-weight: 650; co
 .dialogs-mode .dialogs-mode-check { margin: 0; color: #254636; font-weight: 600; flex-shrink: 0; max-width: 300px; }
 .dialogs-mode-check input { width: 19px; height: 19px; flex-shrink: 0; }
 .dialogs-mode #dialogs-monitor-note { color: #6a7b85; }
+.joint-mode { padding: 18px 20px; margin: 20px 0; border: 1px solid #cbded7; border-radius: 9px; background: #f7fbf9; }
+.joint-mode .panel-heading { flex-wrap: wrap; align-items: center; gap: 12px; margin-bottom: 10px; }
+.joint-mode .panel-heading h2, .joint-mode .panel-heading h3 { margin: 0; }
+.joint-mode .hint { margin: 7px 0; overflow-wrap: anywhere; }
+.joint-mode .actions { margin: 12px 0; flex-wrap: wrap; }
+.joint-mode #joint-mode-feedback.error { color: #99574f; }
 .dialogs-filters { display: grid; grid-template-columns: minmax(210px, .8fr) 1.2fr; gap: 18px; margin-bottom: 22px; }
 .dialogs-filters label { margin-top: 0; }
 .dialogs-filters select { width: 100%; background: #fbfcfd; min-height: 42px; }

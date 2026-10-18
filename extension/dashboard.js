@@ -2,6 +2,7 @@ import {PLATFORMS, STATUS, EVENT_LABELS, FINAL, makePlan, WINDOW_MS, scheduleTex
 import {getFolder,rememberFolder,writeFile,writeLog,writeExcel,download} from './lib/files.js';
 import {reportExcel,EXCEL_MIME} from './lib/excel.js';
 import {displayTime,timeZone} from './lib/time.js';
+import {setupJointModeUI} from './joint-mode-ui.js';
 import './routes-1688-shared.js';
 const $=selector=>document.querySelector(selector);
 let state, folder, settingsDirty=false, fileWrites=Promise.resolve(), toastTimer, selectedResult=null;
@@ -264,3 +265,4 @@ try {
   folder=await getFolder(); if(folder) syncFiles();
 } catch(error) { toast(error.message,true); }
 setInterval(()=>{render();syncFiles();},30000);
+setupJointModeUI({beforeStart:async()=>{if(settingsDirty)throw new Error('Сначала сохраните изменения настроек очереди.');},afterChange:async()=>{state=(await command('GET')).state;render();}});
