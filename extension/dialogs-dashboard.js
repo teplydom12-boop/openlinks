@@ -4,12 +4,12 @@ import {canPrepareDraft, draftRequest} from './lib/dialogs.js';
 
 const $=selector=>document.querySelector(selector);
 const PLATFORMS={'1688':'1688',alibaba:'Alibaba',mic:'Made-in-China'};
-const STATUS={unbound:['Не выбрана',''],ready:['Чат доступен','good'],ok:['Чат доступен','good'],observing:['Мониторинг','good'],scanning:['Проверка…',''],loading:['Загрузка…',''],unsupported:['Страница не распознана','warn'],partial:['Прочитана часть данных','warn'],closed:['Вкладка закрыта','bad'],missing:['Вкладка не найдена','bad'],error:['Ошибка проверки','bad'],blocked:['Нужно вмешательство','warn'],login:['Нужен вход','warn'],captcha:['Проверка площадки','warn'],paused:['Мониторинг остановлен',''],stale:['Данные устарели','warn'],idle:['Ожидает проверки','']};
+const STATUS={unbound:['Чат не открыт',''],ready:['Чат доступен','good'],ok:['Чат доступен','good'],observing:['Мониторинг','good'],scanning:['Проверка…',''],loading:['Загрузка…',''],unsupported:['Страница не распознана','warn'],partial:['Прочитана часть данных','warn'],closed:['Вкладка закрыта','bad'],missing:['Вкладка не найдена','bad'],error:['Ошибка проверки','bad'],blocked:['Нужно вмешательство','warn'],login:['Нужен вход','warn'],captcha:['Проверка площадки','warn'],paused:['Мониторинг остановлен',''],stale:['Данные устарели','warn'],idle:['Ожидает проверки','']};
 const FOLDER_STATUS={disabled:['Выключено',''],idle:['Ожидание задания',''],ready:['Подключено','good'],connected:['Подключено','good'],waiting:['Обработчик не запущен','warn'],claude_missing:['Claude Code не найден','warn'],pending:['В очереди',''],preparing:['Подготовка задания',''],queued:['В очереди',''],running:['Claude обрабатывает',''],paused:['Приостановлено','warn'],offline:['Нет соединения с Claude','warn'],needslogin:['Нужен вход в Claude Code','warn'],needs_login:['Нужен вход в Claude Code','warn'],authentication_required:['Нужен вход в Claude Code','warn'],subscription_auth_required:['Нужен вход через подписку Claude','warn'],subscription_auth_unverified:['Не удалось проверить вход в Claude Code','warn'],usage_limit:['Достигнут лимит Claude','warn'],missing:['Локальный модуль не найден','warn'],unavailable:['Обработчик недоступен','warn'],error:['Ошибка','bad'],stale:['Контекст изменился','warn'],done:['Обработано','good'],accepted:['Результат принят','good'],cancelled:['Отменено',''],awaiting_limit:['Ответ готов · ожидание лимита площадки','warn'],sending:['Отправка поставщику','warn'],sent:['Кнопка отправки нажата','good'],send_unknown:['Отправка не подтверждена — проверьте чат','warn'],unknown:['Результат операции неизвестен','warn'],previewed:['Тест завершён · без отправки','test'],test_completed:['Тест завершён · без отправки','test']};
 const FOLDER_PAUSE={offline:'Нет соединения с Claude. Подключите интернет и нажмите «Возобновить обработку».',authentication_required:'Войдите в Claude Code через вашу подписку, затем нажмите «Возобновить обработку».',subscription_auth_required:'Войдите в Claude Code через аккаунт с подпиской Claude, затем нажмите «Возобновить обработку».',subscription_auth_unverified:'Не удалось проверить вход в Claude Code. Проверьте его установку и авторизацию, затем нажмите «Возобновить обработку».',usage_limit:'Достигнут лимит подписки Claude. Возобновите обработку после восстановления лимита.',claude_update_required:'Обновите Claude Code, затем возобновите обработку.',claude_failed:'Claude завершил задание с ошибкой. Проверьте журнал обработчика перед возобновлением.',invalid_claude_output:'Ответ Claude не удалось прочитать. Проверьте журнал обработчика перед возобновлением.'};
 let folderState={enabled:false,auto:false,autoSend:false,model:'haiku',status:'disabled',jobs:[]},folderDirty=false,folderPausing=false,folderPausePromise=null,modeBusy=false,modeRequested=null,testRequested=null;
-let state=null, productFingerprint='', productUI, tabs=[], selectedKey=null, settingsDirty=false, readUnreadDirty=false, loading=false, historySignature='', reviewEpoch=0;
-const tabChoices=new Map(), edits=new Map(), busy=new Set(), sending=new Set(), draftEditingPending=new Map();
+let state=null, productFingerprint='', productUI, openingChats=false, openingPlatform=null, selectedKey=null, settingsDirty=false, readUnreadDirty=false, loading=false, historySignature='', reviewEpoch=0;
+const edits=new Map(), busy=new Set(), sending=new Set(), draftEditingPending=new Map();
 
 function node(tag,text,className){const el=document.createElement(tag);if(text!==undefined)el.textContent=text;if(className)el.className=className;return el;}
 function feedback(text,error=false){const el=$('#dialogs-feedback');el.textContent=text;el.classList.toggle('error',error);el.hidden=!text;}
@@ -35,7 +35,7 @@ function draftBlockReason(conversation){
   if(conversation.paused)return 'Переписка на паузе.';
   if(!conversation.identityReliable)return readerDetail(conversation)||'Пока не удалось надёжно определить поставщика.';
   if(conversation.contentReady===false)return readerDetail(conversation)||'Не все сообщения или вложения прочитаны. Причины показаны в истории переписки.';
-  if(!conversation.orderReliable||!conversation.tailKnown||conversation.needsRead)return readerDetail(conversation)||'Нужна достоверная последняя часть переписки. Откройте её в выбранной вкладке и повторите проверку.';
+  if(!conversation.orderReliable||!conversation.tailKnown||conversation.needsRead)return readerDetail(conversation)||'Нужна достоверная последняя часть переписки. Откройте её во вкладке мониторинга и повторите проверку.';
   if(!conversation.unanswered)return 'В доступной истории нет подтверждённого сообщения продавца, требующего ответа.';
   if(testState().enabled&&testState().phase==='completed')return 'Цикл выполнен — сообщение не отправлено. Для продолжения нажмите «Проверить следующий цикл» в шаге 3.';
   if(testState().enabled&&['paused','blocked'].includes(testState().phase))return testState().phase==='blocked'?'Тест приостановлен. Проверьте причину в шаге 3.':'Запустите первый тестовый цикл в шаге 3.';
@@ -49,9 +49,43 @@ function draftBlockReason(conversation){
   return folderState.autoSend?'Claude подготовит и отправит ответ при актуальной истории и доступном лимите площадки.':'Claude подготовит ответ. Проверьте текст и нажмите «Отправить», когда он вас устроит.';
 }
 
-function renderBindings(){const container=$('#dialogs-bindings');container.replaceChildren();for(const [platform,label] of Object.entries(PLATFORMS)){const binding=state?.bindings?.[platform]||{},card=node('section',undefined,'panel dialogs-platform'),heading=node('div',undefined,'panel-heading');card.dataset.platform=platform;const [status,tone]=STATUS[binding.status]||['Статус проверки: '+(binding.status||'ожидание'),'warn'];heading.append(node('h3',label),node('span',status,'dialogs-status '+tone));const select=node('select');select.id='dialogs-tab-'+platform;select.setAttribute('aria-label','Вкладка '+label);select.append(new Option('Выберите открытую вкладку',''));const options=tabs.filter(tab=>tab.platform===platform);if(binding.tabId!=null&&!options.some(tab=>tab.id===binding.tabId))options.unshift({id:binding.tabId,title:'Сохранённая вкладка',url:binding.url});for(const tab of options)select.append(new Option((tab.title||tab.url||'Вкладка')+' · '+(tab.url||''),String(tab.id)));const choice=tabChoices.get(platform);select.value=choice!=null&&options.some(tab=>String(tab.id)===choice)?choice:(binding.tabId==null?'':String(binding.tabId));select.addEventListener('change',()=>tabChoices.set(platform,select.value));const controls=node('div',undefined,'actions');const bind=makeButton('Выбрать',async()=>{reviewEpoch++;const value=select.value;if(!value)throw new Error('Сначала выберите открытую вкладку '+label+'.');await act('BIND_TAB',{platform,tabId:Number(value)},'Вкладка '+label+' выбрана.');});const scan=makeButton('Проверить',()=>act('SCAN',{platform},'Проверка '+label+' завершена.'));const remove=makeButton('Отвязать',async()=>{reviewEpoch++;tabChoices.delete(platform);await act('UNBIND_TAB',{platform},'Вкладка '+label+' отключена от мониторинга.');},'link-button');bind.disabled=!state;scan.disabled=!state||binding.tabId==null||testState().enabled;remove.disabled=binding.tabId==null;controls.append(bind,scan,remove);card.append(heading,select,controls,node('p',binding.detail||(binding.tabId==null?'Выберите вкладку центра сообщений.':'Ожидание проверки выбранной вкладки.'),'hint'),node('p','Последняя проверка: '+(binding.checkedAt==null?'ещё не выполнялась':date(binding.checkedAt)),'hint'));container.append(card);}}
+async function openChats(platform){
+  if(openingChats)return;
+  openingChats=true;openingPlatform=platform||null;reviewEpoch++;render();
+  feedback(platform?'Открываю чат '+PLATFORMS[platform]+'…':'Последовательно открываю чаты площадок…');
+  try{
+    const result=await command('OPEN_CHATS',platform?{platform}:{});
+    adopt(result);
+    const failures=(result.launchErrors||[]).map(item=>(PLATFORMS[item.platform]||item.platform)+': '+item.error);
+    feedback(failures.length?'Не все чаты удалось открыть. '+failures.join(' '):'Чаты открываются в фоне. Готовность и запросы на вход показаны в карточках площадок.',failures.length>0);
+  }finally{openingChats=false;openingPlatform=null;render();}
+}
+function renderBindings(){
+  const container=$('#dialogs-bindings');container.replaceChildren();
+  const bindings=Object.values(state?.bindings||{}),ready=bindings.filter(binding=>binding.tabId!=null&&['ready','ok','observing'].includes(binding.status)).length,pending=bindings.some(binding=>binding.managed?.pending);
+  $('#dialogs-open-chats').disabled=!state||openingChats||modeBusy||testInProgress();
+  $('#dialogs-open-chats').textContent=openingChats?'Открываю чаты…':'Открыть чаты площадок';
+  $('#dialogs-open-status').textContent=openingChats?(openingPlatform?'Открываю чат '+PLATFORMS[openingPlatform]+'…':'Последовательно открываю 1688, Alibaba и Made-in-China…'):(pending?'Чаты загружаются. ':'')+'Чаты готовы к чтению: '+ready+' из 3. При запросе входа нажмите «Показать чат» и войдите в аккаунт.';
+  container.setAttribute('aria-busy',String(openingChats||pending));
+  for(const [platform,label] of Object.entries(PLATFORMS)){
+    const binding=state?.bindings?.[platform]||{},card=node('section',undefined,'panel dialogs-platform'),heading=node('div',undefined,'panel-heading');
+    card.dataset.platform=platform;
+    const [status,tone]=STATUS[binding.status||'unbound']||['Статус проверки: '+binding.status,'warn'];
+    heading.append(node('h3',label),node('span',status,'dialogs-status '+tone));
+    const controls=node('div',undefined,'actions');
+    const open=makeButton(binding.managed&&binding.tabId!=null?'Проверить подключение':'Открыть чат',()=>openChats(platform));
+    open.dataset.action='open-chat';open.disabled=!state||openingChats||modeBusy||testInProgress();
+    const show=makeButton('Показать чат',()=>act('SHOW_CHAT',{platform}),'link-button');
+    show.dataset.action='show-chat';show.disabled=!binding.managed||binding.tabId==null||openingChats;
+    const remove=makeButton('Отключить',async()=>{if(openingChats)return;reviewEpoch++;await act('UNBIND_TAB',{platform},'Чат '+label+' отключён от мониторинга.');},'link-button');
+    remove.dataset.action='disconnect-chat';remove.disabled=binding.tabId==null||openingChats||testInProgress();
+    controls.append(open,show,remove);
+    card.append(heading,controls,node('p',binding.detail||(binding.tabId==null?'Расширение откроет сайт площадки и её центр сообщений.':'Проверяю доступность центра сообщений…'),'hint'),node('p','Последняя проверка: '+(binding.checkedAt==null?'ещё не выполнялась':date(binding.checkedAt)),'hint'));
+    container.append(card);
+  }
+}
 function filteredConversations(){const query=$('#dialogs-search').value.trim().toLocaleLowerCase(),filter=$('#dialogs-filter').value;return Object.values(state?.conversations||{}).filter(item=>{if(filter==='unanswered'&&!item.unanswered)return false;if(filter==='unread'&&!(item.unread===true||Number(item.unread)>0))return false;if(filter==='takeover'&&!item.takeover)return false;if(filter==='paused'&&!item.paused)return false;const haystack=[item.title,item.platform,PLATFORMS[item.platform],item.url,item.preview,...(item.messages||[]).map(m=>m.text)].filter(Boolean).join(' ').toLocaleLowerCase();return !query||haystack.includes(query);}).sort((a,b)=>Number(b.unanswered)-Number(a.unanswered)||(b.updatedAt||0)-(a.updatedAt||0)||a.key.localeCompare(b.key));}
-function renderList(){const conversations=filteredConversations(),all=Object.values(state?.conversations||{}),list=$('#dialogs-list');$('#dialogs-count').textContent=all.length+' · требуют ответа: '+all.filter(c=>c.unanswered).length;list.replaceChildren();for(const conversation of conversations){const button=node('button',undefined,'dialogs-thread'+(conversation.key===selectedKey?' selected':''));button.type='button';button.dataset.key=conversation.key;button.setAttribute('aria-pressed',String(conversation.key===selectedKey));button.append(node('strong',conversation.title||'Поставщик не определён'),node('p',(PLATFORMS[conversation.platform]||conversation.platform)+' · '+date(conversation.updatedAt),'hint'));const last=(conversation.messages||[]).at(-1);button.append(node('div',last?.text||conversation.preview||'История ещё не прочитана','dialogs-preview'));const flags=node('div',undefined,'dialogs-thread-flags');for(const [label,tone] of threadFlags(conversation))flags.append(node('span',label,'dialogs-status '+tone));button.append(flags);button.addEventListener('click',()=>{selectedKey=conversation.key;historySignature='';renderList();renderDetail();});list.append(button);}$('#dialogs-empty').hidden=conversations.length>0;$('#dialogs-empty').textContent=all.length?'Переписок с такими условиями нет.':'Выберите вкладки и запустите проверку. Здесь появятся прочитанные переписки и доступный список чатов.';}
+function renderList(){const conversations=filteredConversations(),all=Object.values(state?.conversations||{}),list=$('#dialogs-list');$('#dialogs-count').textContent=all.length+' · требуют ответа: '+all.filter(c=>c.unanswered).length;list.replaceChildren();for(const conversation of conversations){const button=node('button',undefined,'dialogs-thread'+(conversation.key===selectedKey?' selected':''));button.type='button';button.dataset.key=conversation.key;button.setAttribute('aria-pressed',String(conversation.key===selectedKey));button.append(node('strong',conversation.title||'Поставщик не определён'),node('p',(PLATFORMS[conversation.platform]||conversation.platform)+' · '+date(conversation.updatedAt),'hint'));const last=(conversation.messages||[]).at(-1);button.append(node('div',last?.text||conversation.preview||'История ещё не прочитана','dialogs-preview'));const flags=node('div',undefined,'dialogs-thread-flags');for(const [label,tone] of threadFlags(conversation))flags.append(node('span',label,'dialogs-status '+tone));button.append(flags);button.addEventListener('click',()=>{selectedKey=conversation.key;historySignature='';renderList();renderDetail();});list.append(button);}$('#dialogs-empty').hidden=conversations.length>0;$('#dialogs-empty').textContent=all.length?'Переписок с такими условиями нет.':'Откройте чаты площадок и запустите мониторинг. Здесь появятся прочитанные переписки и доступный список чатов.';}
 function renderHistory(conversation){
   const signature=JSON.stringify([conversation.key,conversation.messages,conversation.archivedMessages,readerDetail(conversation)]);
   if(signature===historySignature)return;
@@ -137,7 +171,7 @@ function renderDetail(){
   $('#dialogs-draft-text').disabled=!canDraft(conversation)||isSending;
   $('#dialogs-send-draft').disabled=!ready||!state.running||!text.trim()||stale||!edit&&draft?.status==='stale'||!!receipt||folderPausing||modeBusy||isSending||testOriginBlocked||test.enabled&&test.phase!=='ready';
   $('#dialogs-send-draft').textContent=isSending?(test.enabled?'Проверка…':'Отправка…'):test.enabled?'Проверить без отправки':'Отправить';
-  $('#dialogs-send-note').textContent=testOriginBlocked?'Тестовый ответ нельзя отправить настоящему поставщику. Удалите этот черновик и подготовьте новый ответ после выхода из тестового режима.':test.enabled?(test.phase==='completed'?'Проверка завершена. Переход к следующему циклу доступен в шаге 3.':test.phase==='blocked'?'Тест приостановлен. Проверьте причину в шаге 3.':test.phase==='paused'?'Сначала нажмите «Проверить первый цикл» в шаге 3.':'Кнопка проверит адресата и введёт этот текст в поле чата. Отправка не выполняется.') :receipt?(receipt.status==='unknown'?'Исход предыдущей отправки неизвестен. Проверьте чат: повторная отправка заблокирована.':receipt.status==='sending'?'Отправка уже выполняется.':'Кнопка отправки уже нажата. Повторная отправка этого ответа заблокирована.'):!state.running?'Для отправки запустите мониторинг и откройте эту переписку в выбранной вкладке.':'Откройте эту переписку во вкладке площадки и нажмите «Проверить сейчас». «Отправить» одобряет показанный текст; адресат и новые сообщения проверяются повторно.';
+  $('#dialogs-send-note').textContent=testOriginBlocked?'Тестовый ответ нельзя отправить настоящему поставщику. Удалите этот черновик и подготовьте новый ответ после выхода из тестового режима.':test.enabled?(test.phase==='completed'?'Проверка завершена. Переход к следующему циклу доступен в шаге 3.':test.phase==='blocked'?'Тест приостановлен. Проверьте причину в шаге 3.':test.phase==='paused'?'Сначала нажмите «Проверить первый цикл» в шаге 3.':'Кнопка проверит адресата и введёт этот текст в поле чата. Отправка не выполняется.') :receipt?(receipt.status==='unknown'?'Исход предыдущей отправки неизвестен. Проверьте чат: повторная отправка заблокирована.':receipt.status==='sending'?'Отправка уже выполняется.':'Кнопка отправки уже нажата. Повторная отправка этого ответа заблокирована.'):!state.running?'Для отправки запустите мониторинг и откройте эту переписку во вкладке мониторинга.':'Откройте эту переписку во вкладке площадки и нажмите «Проверить сейчас». «Отправить» одобряет показанный текст; адресат и новые сообщения проверяются повторно.';
   for(const id of busy)if($(id))$(id).disabled=true;
 }
 function renderSettings(){
@@ -171,12 +205,12 @@ function renderFolder(){
   $('#dialogs-folder-save').disabled=!folderDirty||folderPausing||modeBusy;
   $('#dialogs-folder-stop').disabled=!enabled||folderPausing||modeBusy;
   $('#dialogs-folder-poll').disabled=!enabled||folderPausing;
-  $('#dialogs-folder-send').disabled=test.enabled||modeBusy||folderPausing||(!folder.autoSend&&(!enabled||!approved||!boundTabs()||folderDirty||edits.size>0));
+  $('#dialogs-folder-send').disabled=test.enabled||modeBusy||folderPausing||(!folder.autoSend&&(openingChats||!enabled||!approved||!boundTabs()||folderDirty||edits.size>0));
   $('#dialogs-mode').classList.toggle('automatic',!test.enabled&&!!folder.autoSend);
   $('#dialogs-mode').classList.toggle('test-mode',!!test.enabled);
   $('#dialogs-mode-label').textContent=modeBusy?'Меняю режим…':test.enabled?'Тестовый режим':folder.autoSend?'Автоматический режим':'С вашим одобрением';
   $('#dialogs-folder-send-note').textContent=test.enabled?'Настоящие чаты и ответы Claude. Текст вводится в поле сообщения; отправка выключена на всех площадках.':folder.autoSend?'Claude читает новые сообщения, готовит и отправляет ответы по согласованным правилам. Снимите галочку, чтобы проверять каждый ответ.':'Claude готовит черновики. Вы проверяете текст, при необходимости редактируете и нажимаете «Отправить».';
-  $('#dialogs-monitor-note').textContent=test.enabled?'Один цикл проверяет один ответ поставщику. Следующий цикл запускается только вашей кнопкой.':!boundTabs()?'Сначала выберите хотя бы одну вкладку чатов.':!enabled?'Подключите Claude в шаге 1. Пока доступно только чтение сообщений.':!approved?'Согласуйте товар в шаге 2. Пока доступно только чтение сообщений.':folderDirty?'Сохраните модель в шаге 1.':edits.size?'Есть несохранённые черновики. Сохраните или удалите их перед включением автоматической отправки.':state.running&&folder.auto?'Мониторинг включён. Новые сообщения обрабатываются автоматически.':state.running?'Чтение работает. Нажмите «Начать мониторинг», чтобы возобновить подготовку ответов.':'Начните мониторинг для подготовки черновиков. Галочка автоматической отправки также запускает мониторинг.';
+  $('#dialogs-monitor-note').textContent=test.enabled?'Один цикл проверяет один ответ поставщику. Следующий цикл запускается только вашей кнопкой.':!boundTabs()?'Сначала откройте хотя бы один чат площадки.':!enabled?'Подключите Claude в шаге 1. Пока доступно только чтение сообщений.':!approved?'Согласуйте товар в шаге 2. Пока доступно только чтение сообщений.':folderDirty?'Сохраните модель в шаге 1.':edits.size?'Есть несохранённые черновики. Сохраните или удалите их перед включением автоматической отправки.':state.running&&folder.auto?'Мониторинг включён. Новые сообщения обрабатываются автоматически.':state.running?'Чтение работает. Нажмите «Начать мониторинг», чтобы возобновить подготовку ответов.':'Начните мониторинг для подготовки черновиков. Галочка автоматической отправки также запускает мониторинг.';
   $('#dialogs-folder-edits').hidden=!folderDirty;
   $('#dialogs-folder-edits').textContent=folderDirty?'Модель изменена. Сохраните выбор, чтобы применять его к новым заданиям.':'';
   const list=$('#dialogs-folder-jobs');list.replaceChildren();const jobs=Array.isArray(folder.jobs)?folder.jobs:[];
@@ -199,10 +233,10 @@ function renderTestMode(){
   if(!active)return;
   const labels={paused:'Готов к проверке',ready:'Ищу сообщение для одного цикла',generating:'Claude готовит тестовый ответ',preparing:'Ввожу текст в чат без отправки',completed:'Цикл выполнен — сообщение не отправлено',blocked:'Тест приостановлен'};
   $('#dialogs-test-status').textContent=labels[test.phase]||'Тест приостановлен';
-  let issue=!folderState.enabled?'Подключите Claude в шаге 1.':!productUI?.isApproved()?'Сохраните и согласуйте товар в шаге 2.':!boundTabs()?'Выберите вкладки чатов.':folderDirty?'Сохраните модель Claude.':edits.size?'Сохраните или удалите несохранённые черновики.':'';
+  let issue=!folderState.enabled?'Подключите Claude в шаге 1.':!productUI?.isApproved()?'Сохраните и согласуйте товар в шаге 2.':!boundTabs()?'Откройте чаты площадок.':folderDirty?'Сохраните модель Claude.':edits.size?'Сохраните или удалите несохранённые черновики.':'';
   $('#dialogs-test-detail').textContent=[test.detail,issue,test.phase==='blocked'?'Проверьте чат. Если тестовый текст мешает сбросу, удалите его вручную; затем выключите и снова включите тестовый режим для нового цикла.':''].filter(Boolean).join(' ');
   $('#dialogs-test-next').textContent=test.phase==='completed'?'Проверить следующий цикл':test.phase==='paused'?'Проверить первый цикл':test.phase==='blocked'?'Проверка приостановлена':'Цикл выполняется…';
-  $('#dialogs-test-next').disabled=!!issue||modeBusy||folderPausing||!['paused','completed'].includes(test.phase)||busy.has('#dialogs-test-next');
+  $('#dialogs-test-next').disabled=openingChats||!!issue||modeBusy||folderPausing||!['paused','completed'].includes(test.phase)||busy.has('#dialogs-test-next');
   $('#dialogs-test-result').hidden=!test.text;
   $('#dialogs-test-result-note').textContent=test.phase==='completed'?'Текст введён в чат для проверки. Записи об отправке в истории переписки нет.':'Сохранённый текст теста. Проверьте поле чата перед продолжением; сообщение не отправлялось.';
   const conversation=state?.conversations?.[test.key];
@@ -241,18 +275,17 @@ function render(){
   $('#dialogs-run-state').classList.toggle('running',!!state.running);
   $('#dialogs-start').hidden=testState().enabled;
   $('#dialogs-scan').hidden=testState().enabled;
-  $('#dialogs-start').disabled=!bound||!!state.running&&(!folderState.enabled||!productUI?.isApproved()||folderState.auto)||folderPausing||modeBusy;
+  $('#dialogs-start').disabled=openingChats||!bound||!!state.running&&(!folderState.enabled||!productUI?.isApproved()||folderState.auto)||folderPausing||modeBusy;
   $('#dialogs-stop').disabled=!state.running;
-  $('#dialogs-scan').disabled=!bound;
+  $('#dialogs-scan').disabled=openingChats||!bound;
   if(state.running||!readUnreadDirty)$('#dialogs-read-unread').checked=state.readUnread!==false;
   $('#dialogs-read-unread').disabled=!!state.running;
   renderBindings();renderList();renderDetail();renderSettings();renderEvents();renderFolder();
   for(const id of busy)if($(id))$(id).disabled=true;
 }
-async function refreshTabs(){const result=await command('LIST_TABS');tabs=result.tabs||[];if(state)renderBindings();}
 
 // Starting monitoring always enables Claude drafts once the task is approved.
-action('#dialogs-refresh-tabs',refreshTabs);
+action('#dialogs-open-chats',()=>openChats());
 action('#dialogs-start',async()=>{
   if(folderDirty)throw new Error('Сначала сохраните выбранную модель Claude.');
   await disableLegacyDrafts();await enableAutomaticDrafts();
@@ -261,7 +294,7 @@ action('#dialogs-start',async()=>{
 });
 $('#dialogs-read-unread').addEventListener('change',()=>{readUnreadDirty=true;});
 action('#dialogs-stop',()=>{reviewEpoch++;return act('STOP',{},'Мониторинг остановлен.');});
-action('#dialogs-scan',()=>act('SCAN',{},'Проверка выбранных вкладок завершена.'));
+action('#dialogs-scan',()=>act('SCAN',{},'Проверка чатов площадок завершена.'));
 action('#dialogs-takeover',()=>{reviewEpoch++;const item=chosen();return act('CONTROL',{key:item.key,takeover:!item.takeover},item.takeover?'Подготовка ответов снова доступна.':'Разговор под вашим управлением. Ответы Claude приостановлены.');});
 action('#dialogs-mute',()=>{reviewEpoch++;const item=chosen();return act('CONTROL',{key:item.key,paused:!item.paused},item.paused?'Пауза переписки снята.':'Переписка поставлена на паузу.');});
 function reviewedDraft(item){
@@ -327,7 +360,7 @@ $('#dialogs-folder-send').addEventListener('change',async()=>{
   modeBusy=true;modeRequested=enabled;render();
   try{
     if(enabled&&testState().enabled)throw new Error('Сначала выключите тестовый режим. Автоматическая отправка включается отдельно.');
-    if(enabled&&(!productUI?.isApproved()||!folderState.enabled||!boundTabs()||folderDirty||edits.size))throw new Error('Подключите Claude, согласуйте товар, выберите вкладки и сохраните черновики.');
+    if(enabled&&(!productUI?.isApproved()||!folderState.enabled||!boundTabs()||folderDirty||edits.size))throw new Error('Подключите Claude, согласуйте товар, откройте чаты и сохраните черновики.');
     if(enabled)await disableLegacyDrafts();
     adopt(await command('FOLDER_SETTINGS',enabled?{enabled:true,auto:true,autoSend:true}:{autoSend:false}));
     if(enabled&&!state.running){await act('START',{readUnread:$('#dialogs-read-unread').checked});readUnreadDirty=false;}
@@ -346,7 +379,7 @@ $('#dialogs-test-mode').addEventListener('change',async()=>{
 action('#dialogs-test-next',async()=>{
   const test=testState(),request={sessionId:test.sessionId,cycleId:test.cycleId},intent=reviewEpoch;
   if(!test.enabled||!['paused','completed'].includes(test.phase))throw new Error('Тестовый цикл уже выполняется или требует проверки причины остановки.');
-  if(!folderState.enabled||!productUI?.isApproved()||!boundTabs()||folderDirty||edits.size)throw new Error('Подключите Claude, согласуйте товар, выберите вкладки и сохраните изменения.');
+  if(!folderState.enabled||!productUI?.isApproved()||!boundTabs()||folderDirty||edits.size)throw new Error('Подключите Claude, согласуйте товар, откройте чаты и сохраните изменения.');
   if(folderPausePromise)await folderPausePromise;
   if(intent!==reviewEpoch||!testState().enabled||request.sessionId!==testState().sessionId||request.cycleId!==testState().cycleId||!productUI?.isApproved())throw new Error('Режим или задание изменились. Проверьте настройки перед запуском цикла.');
   const result=await command('TEST_NEXT',request);readUnreadDirty=false;adopt(result);
@@ -377,6 +410,6 @@ $('#dialogs-settings-form').addEventListener('submit',async event=>{
 });
 productUI=setupProductUI({command,adopt,feedback,getFolderState:()=>({...folderState,dirty:folderDirty}),onApproved:async()=>{if(state?.running)await enableAutomaticDrafts();},onDirty:()=>{if(state){if(productUI?.isDirty())reviewEpoch++;renderDetail();renderFolder();pauseFolderOnEdit();}}});
 chrome.storage.onChanged.addListener((changes,area)=>{if(area==='local'&&Object.keys(changes).some(key=>/dialog|claudeFolder/i.test(key)))refresh();});
-Promise.allSettled([refresh(),refreshTabs()]).then(results=>{for(const result of results)if(result.status==='rejected')feedback(result.reason?.message||'Не удалось получить список вкладок.',true);});
+refresh();
 setInterval(()=>{if(!document.hidden)refresh();},5000);
 document.addEventListener('visibilitychange',()=>{if(!document.hidden)refresh();});

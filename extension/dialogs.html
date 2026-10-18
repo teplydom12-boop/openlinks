@@ -33,7 +33,7 @@
 
     <section id="dialogs-product" class="panel dialogs-product" aria-labelledby="dialogs-product-heading">
       <div class="panel-heading"><div><div class="eyebrow">ШАГ 2</div><h2 id="dialogs-product-heading">Товар и правила общения</h2></div><span id="dialogs-product-status" class="dialogs-status" role="status">Не согласовано</span></div>
-      <p class="dialogs-product-scope">Эта задача применяется ко всем поставщикам в выбранных вкладках. Опишите товар, проверьте выводы Claude и согласуйте сведения для ответов.</p>
+      <p class="dialogs-product-scope">Эта задача применяется ко всем поставщикам в чатах мониторинга. Опишите товар, проверьте выводы Claude и согласуйте сведения для ответов.</p>
       <form id="dialogs-product-form">
         <div class="dialogs-form-grid"><div><label for="dialogs-product-card">Описание товара</label><textarea id="dialogs-product-card" rows="5" maxlength="30000" placeholder="Вставьте описание, комплектацию или текст карточки товара."></textarea></div><div><label for="dialogs-product-characteristics">Ваши требования</label><textarea id="dialogs-product-characteristics" rows="5" maxlength="12000" placeholder="Модель, материал, размеры, количество, качество и упаковка."></textarea></div></div>
         <label for="dialogs-product-url">Ссылка на товар (необязательно)</label><input id="dialogs-product-url" type="url" maxlength="4096" placeholder="https://…">
@@ -52,8 +52,9 @@
     </section>
 
     <section id="dialogs-monitor" class="panel dialogs-monitor" aria-labelledby="dialogs-tabs-heading">
-      <div class="panel-heading"><div><div class="eyebrow">ШАГ 3</div><h2 id="dialogs-tabs-heading">Мониторинг площадок</h2></div><button id="dialogs-refresh-tabs" class="link-button" type="button">Обновить список вкладок</button></div>
-      <p class="hint">Откройте центры сообщений в своём аккаунте и выберите их вкладки. Во время мониторинга держите Chrome и локальный обработчик запущенными.</p>
+      <div class="panel-heading"><div><div class="eyebrow">ШАГ 3</div><h2 id="dialogs-tabs-heading">Мониторинг площадок</h2></div><button id="dialogs-open-chats" class="button primary" type="button" disabled>Открыть чаты площадок</button></div>
+      <p class="hint">Расширение само откроет площадки и их чаты в отдельных фоновых вкладках. Если потребуется вход в аккаунт, откройте нужный чат кнопкой ниже. Во время мониторинга держите браузер и локальный обработчик запущенными.</p>
+      <p id="dialogs-open-status" class="hint" role="status" aria-live="polite">Загрузка состояния чатов…</p>
       <div id="dialogs-bindings" class="dialogs-platforms"></div>
       <div class="dialogs-mode" id="dialogs-mode"><div class="panel-heading"><div><h3 id="dialogs-mode-label">С вашим одобрением</h3><p id="dialogs-folder-send-note" class="hint" role="status">Claude готовит черновики. Вы проверяете текст и нажимаете «Отправить».</p></div><div class="dialogs-mode-options"><label class="check dialogs-mode-check"><input id="dialogs-folder-send" type="checkbox" disabled> Отправлять ответы автоматически</label><label class="check dialogs-mode-check"><input id="dialogs-test-mode" type="checkbox" disabled> Тестовый режим — без отправки</label></div></div><p id="dialogs-monitor-note" class="hint" role="status"></p>
         <div id="dialogs-test-panel" class="dialogs-test-panel" hidden>

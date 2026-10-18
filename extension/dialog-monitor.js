@@ -11,14 +11,17 @@ import {withTabOwnership} from './lib/tab-ownership.js';
 import {loadProductImage} from './lib/product-files.js';
 import {resolveChatAttachments,pruneChatAttachmentCache} from './lib/chat-attachments.js';
 import {sameJsonValue} from './lib/json-values.js';
+import {CHAT_CENTERS,CHAT_LAUNCH_TIMEOUT_MS,managedChatRoute,validMICBootstrapURL} from './lib/chat-launch.js';
+import {captureMICChat} from './lib/mic-chat-launch.js';
 
 export const DIALOGS_KEY = 'openlinksDialogs';
 const PROVIDER_KEY = 'openlinksDialogsProvider';
 const ALARM = 'openlinks-dialogs';
+const LAUNCH_ALARM='openlinks-chat-launch',MANAGED_KEY='openlinksManagedChats';
 const PLATFORMS = ['1688','alibaba','mic'];
 const DOMAINS = {'1688':'1688.com',alibaba:'alibaba.com',mic:'made-in-china.com'};
 const READ_TIMEOUT_MS=120000,READ_BACKOFF_MS=5*60000;
-const KNOWN_COMMANDS = new Set(['TEST_NEXT','GET','LIST_TABS','BIND_TAB','UNBIND_TAB','START','STOP','SCAN','SETTINGS','CONTROL','CONTEXT_EDITING','GENERATE_DRAFT','SAVE_DRAFT','DRAFT_EDITING','SEND_DRAFT','DISCARD_DRAFT','PRODUCT_SAVE','PRODUCT_EXTRACT','PRODUCT_APPROVE','AUTODRAFT','EXPORT_PRODUCT_PROMPT','EXPORT_DRAFT_PROMPT','IMPORT_PRODUCT_RESULT','FOLDER_STATUS','FOLDER_SETTINGS','FOLDER_PRODUCT','FOLDER_DRAFT','FOLDER_POLL','FOLDER_RETRY','FOLDER_CANCEL'].map(name=>'DIALOGS_'+name));
+const KNOWN_COMMANDS = new Set(['OPEN_CHATS','SHOW_CHAT','TEST_NEXT','GET','LIST_TABS','BIND_TAB','UNBIND_TAB','START','STOP','SCAN','SETTINGS','CONTROL','CONTEXT_EDITING','GENERATE_DRAFT','SAVE_DRAFT','DRAFT_EDITING','SEND_DRAFT','DISCARD_DRAFT','PRODUCT_SAVE','PRODUCT_EXTRACT','PRODUCT_APPROVE','AUTODRAFT','EXPORT_PRODUCT_PROMPT','EXPORT_DRAFT_PROMPT','IMPORT_PRODUCT_RESULT','FOLDER_STATUS','FOLDER_SETTINGS','FOLDER_PRODUCT','FOLDER_DRAFT','FOLDER_POLL','FOLDER_RETRY','FOLDER_CANCEL'].map(name=>'DIALOGS_'+name));
 
 export function dialogPlatform(url) {
   try {
@@ -41,7 +44,7 @@ const timeout = async (promise, ms = 7000) => {
   finally { clearTimeout(timer); }
 };
 
-export function createDialogMonitor({api=globalThis.chrome, fetchImpl=globalThis.fetch, now=()=>Date.now(),imageLoader=loadProductImage,attachmentResolver=resolveChatAttachments,folderBridge,folderSender=sendDialogReply,testCleaner=clearDialogTestDraft,testRecovery=recoverDialogTestDraftEmpty,pauseOutreachForTest,reserveDialogSendQuota}={}) {
+export function createDialogMonitor({api=globalThis.chrome, fetchImpl=globalThis.fetch, now=()=>Date.now(),imageLoader=loadProductImage,attachmentResolver=resolveChatAttachments,folderBridge,folderSender=sendDialogReply,testCleaner=clearDialogTestDraft,testRecovery=recoverDialogTestDraftEmpty,pauseOutreachForTest,reserveDialogSendQuota,micInitializationWait=()=>new Promise(resolve=>setTimeout(resolve,2500))}={}) {
   let serial = Promise.resolve();
   let providerTask=null, cancelEpoch=0;
   const keyEpochs=new Map();
@@ -165,6 +168,7 @@ export function createDialogMonitor({api=globalThis.chrome, fetchImpl=globalThis
   async function releaseBoundTab(state,name) {
     const binding=state.bindings[name],protection=binding.discardProtection;
     if(protection?.changed!==true||protection.original!==true||typeof api.tabs.update!=='function')return;
+    if(binding.managed&&!await managedIdentity(name,binding))return;
     try {
       const tab=await api.tabs.get(binding.tabId);
       if(tab.autoDiscardable===false)await api.tabs.update(tab.id,{autoDiscardable:true});
@@ -183,17 +187,218 @@ export function createDialogMonitor({api=globalThis.chrome, fetchImpl=globalThis
     return true;
   }
 
-  async function scanPlatform(state,name) {
+  // Session storage survives MV3 worker suspension but not browser restart.
+  // A saved local tab ID alone never authorizes adopting a user's restored tab.
+  async function managedRegistry() {
+    if(!api.storage.session?.get||!api.storage.session?.set)throw new Error('Браузер не поддерживает безопасное сохранение рабочих вкладок. Обновите Chromium.');
+    return (await api.storage.session.get(MANAGED_KEY))[MANAGED_KEY] || {};
+  }
+  async function forgetManaged(name) {
+    if(!api.storage.session?.get||!api.storage.session?.set)return;
+    const registry=await managedRegistry();delete registry[name];await api.storage.session.set({[MANAGED_KEY]:registry});
+  }
+  async function managedIdentity(name,binding) {
+    if(!binding?.managed)return null;
+    const saved=(await managedRegistry())[name],managed=binding.managed;
+    if(saved?.token!==managed.token||saved.tabId!==binding.tabId||saved.windowId!==managed.windowId)return null;
+    let tab;try {tab=await api.tabs.get(binding.tabId);}catch{return null;}
+    return tab.windowId===managed.windowId?tab:null;
+  }
+  async function managedTab(name,binding) {
+    const tab=await managedIdentity(name,binding);
+    if(!tab||!managedChatRoute(name,tab.url&&tab.url!=='about:blank'?tab.url:tab.pendingUrl)||tab.pendingUrl&&!managedChatRoute(name,tab.pendingUrl))return null;
+    return tab;
+  }
+  function protectTestBinding(folder,name,tabId) {
+    const test=folder.test;
+    if((test.source?.tabId===tabId&&Number.isInteger(tabId))||test.key?.startsWith(name+':')&&['generating','preparing','completed','blocked'].includes(test.phase)&&!!(test.text||test.jobId||test.cleanupToken))throw new Error('В этом чате сохранён незавершённый тестовый цикл. Проверьте поле и завершите тестовый режим перед заменой или отключением вкладки.');
+  }
+  async function launchWindow(sender) {
+    let window;
+    if(Number.isInteger(sender?.tab?.windowId)) {
+      try {window=await api.windows.get(sender.tab.windowId);}catch{}
+    }
+    if(!Number.isInteger(window?.id)||window.type!=='normal') {
+      try {window=await api.windows.getLastFocused({windowTypes:['normal']});}catch{}
+    }
+    if(!Number.isInteger(window?.id)||window.type!=='normal')throw new Error('Откройте OpenLinks в обычном окне рабочего профиля и повторите открытие чатов.');
+    return window.id;
+  }
+  async function syncLaunchAlarm(state) {
+    if(PLATFORMS.some(name=>state.bindings[name].managed?.pending))await api.alarms.create(LAUNCH_ALARM,{periodInMinutes:0.5});
+    else if(api.alarms.clear)await api.alarms.clear(LAUNCH_ALARM);
+  }
+  function micBootstrapSource(observed,sourceUrl=CHAT_CENTERS.mic) {
+    const sources=observed.sources || [],parent=sources.find(source=>source.frameId===0&&source.sourceUrl===sourceUrl);
+    if(!parent||!parent.documentToken)return {ready:false,busy:false};
+    // The lite iframe is cross-origin: only its own isolated reader can confirm
+    // the composer is empty. Missing evidence must never authorize navigation.
+    for(const source of sources) {
+      if(!source.busy||['hasDraft','userEditing','recentUserInput'].some(key=>typeof source.busy[key]!=='boolean'))return {ready:false,busy:false};
+      if(Object.values(source.busy).some(value=>value===true))return {ready:false,busy:true};
+      for(const frame of source.frames || [])if(frame.visible) {
+        let samePlatform=false;try{samePlatform=dialogPlatform(frame.url)==='mic';}catch{}
+        if(samePlatform) {
+          let matches=sources.filter(candidate=>candidate.sourceUrl===frame.url);
+          if(!matches.length)matches=sources.filter(candidate=>{try{const left=new URL(candidate.sourceUrl),right=new URL(frame.url);return left.origin===right.origin&&left.pathname===right.pathname;}catch{return false;}});
+          if(matches.length!==1)return {ready:false,busy:false};
+        }
+      }
+    }
+    return {ready:true,busy:false,documentToken:parent.documentToken};
+  }
+  async function bootstrapMICChat(state,binding,observed) {
+    const managed=binding.managed,tab=await managedTab('mic',binding);
+    if(!tab||tab.url!==CHAT_CENTERS.mic||tab.status!=='complete'||tab.pendingUrl)return;
+    const before=micBootstrapSource(observed);
+    if(before.busy){managed.pending=false;markHealth(state,'mic','paused','В чате есть черновик или вы работаете во вкладке. Завершите ввод и повторите проверку подключения.');return;}
+    if(!before.ready)return;
+    try {protectTestBinding(await loadFolder(),'mic',tab.id);}catch {managed.pending=false;markHealth(state,'mic','paused','Сначала завершите тестовый цикл в этом чате; сохранённый черновик не изменялся.');return;}
+    if(!api.scripting?.executeScript){managed.pending=false;markHealth(state,'mic','error','Браузер не поддерживает открытие полного чата Made-in-China. Обновите Chromium.');return;}
+    try {
+      const results=await timeout(api.scripting.executeScript({target:{tabId:tab.id,frameIds:[0]},world:'MAIN',func:captureMICChat}),5000);
+      const reply=results?.length===1&&results[0].frameId===0?results[0].result:null;
+      if(reply?.ok!==true) {
+        if(reply?.status==='loading')return;
+        managed.pending=false;
+        const consumed=['attempt_consumed','no_capture','ambiguous_open','invalid_chat_url','expand_failed','open_restore_failed'].includes(reply?.reason);
+        markHealth(state,'mic',consumed?'error':'paused',consumed?'Попытка открытия полного чата не завершена. Проверьте черновик; когда поле пустое, обновите рабочую вкладку и повторите проверку подключения.':'Не удалось безопасно открыть полный чат. Проверьте созданную вкладку, вход и черновик; затем повторите проверку подключения.');return;
+      }
+      if(!validMICBootstrapURL(reply.url)){managed.pending=false;markHealth(state,'mic','error','Площадка вернула неподдерживаемый адрес полного чата. Автоматический переход отменён.');return;}
+      const current=await managedTab('mic',binding);
+      if(!current||current.url!==tab.url||current.pendingUrl||current.status!=='complete'){managed.pending=false;markHealth(state,'mic','paused','Вкладка изменилась во время открытия чата. Повторите проверку подключения.');return;}
+      const fresh=await scanPlatform(state,'mic'),after=micBootstrapSource(fresh);
+      if(state.bindings.mic!==binding||!after.ready||after.documentToken!==before.documentToken){managed.pending=false;markHealth(state,'mic','paused','Состояние чата изменилось. Проверьте вкладку и черновик перед повторным открытием.');return;}
+      // Navigate the same owned inactive tab. Never save/log/return the native
+      // bootstrap hash, and never invoke the site's real popup or focus APIs.
+      await api.tabs.update(tab.id,{url:reply.url});
+      markHealth(state,'mic','loading','Открываю полный список переписок в рабочей вкладке.');
+    } catch {managed.pending=false;markHealth(state,'mic','error','Не удалось завершить открытие полного чата. Проверьте рабочую вкладку и повторите проверку подключения.');}
+  }
+  async function initializeHiddenMIC(state,binding,observed) {
+    const managed=binding.managed,tab=await managedTab('mic',binding);
+    if(!tab||tab.status!=='complete'||tab.pendingUrl||binding.status!=='unsupported')return;
+    let url;try{url=new URL(tab.url);}catch{return;}
+    if(url.origin!=='https://webim.made-in-china.com'||url.pathname!=='/super-tm/'||/^#\/login(?:[/?]|$)/i.test(url.hash))return;
+    if(!observed.sources?.length||observed.sources.some(source=>source.conversations?.length))return;
+    const before=micBootstrapSource(observed,tab.url);
+    if(before.busy){managed.pending=false;markHealth(state,'mic','paused','Завершите ввод в чате и повторите проверку подключения. Черновик не изменялся.');return;}
+    if(!before.ready||!/^[a-f\d]{8}-[a-f\d]{4}-[a-f\d]{4}-[a-f\d]{4}-[a-f\d]{12}$/i.test(before.documentToken)||managed.micInitDocumentToken===before.documentToken)return;
+    try {protectTestBinding(await loadFolder(),'mic',tab.id);}catch {managed.pending=false;markHealth(state,'mic','paused','Сначала завершите тестовый цикл в этом чате.');return;}
+    let hidden;
+    try {const result=await timeout(api.scripting.executeScript({target:{tabId:tab.id,frameIds:[0]},world:'ISOLATED',func:()=>document.visibilityState==='hidden'}),3000);hidden=result?.length===1&&result[0].frameId===0&&result[0].result===true;}catch{return;}
+    if(!hidden)return;
+    const target={tabId:tab.id};let attached=false,initialized=false,cleaned=true;
+    // This safe document marker prevents repeating a temporary browser emulation
+    // after worker suspension. It contains no native launch URL or account data.
+    managed.micInitDocumentToken=before.documentToken;await save(state);
+    try {
+      await api.debugger.attach(target,'1.3');attached=true;
+      const current=await managedTab('mic',binding),fresh=await scanPlatform(state,'mic'),check=micBootstrapSource(fresh,tab.url);
+      if(current?.url!==tab.url||current?.status!=='complete'||current?.pendingUrl||!check.ready||check.documentToken!==before.documentToken)return;
+      // Virtuoso on MIC does not initialize a fresh hidden document until it has
+      // received a rendering opportunity. This target-local emulation changes no
+      // selected tab, browser window, OS input, message field or clipboard.
+      await api.debugger.sendCommand(target,'Emulation.setFocusEmulationEnabled',{enabled:true});
+      await micInitializationWait();initialized=true;
+    } catch { /* An occupied debugger or failed initialization never gets retried automatically. */ }
+    finally {
+      if(attached) {
+        try {await api.debugger.sendCommand(target,'Emulation.setFocusEmulationEnabled',{enabled:false});}catch {cleaned=false;}
+        try {await api.debugger.detach(target);}catch {cleaned=false;}
+      }
+    }
+    if(!initialized||!cleaned){managed.pending=false;markHealth(state,'mic','error','Не удалось завершить загрузку фонового чата. Нажмите «Показать чат», дождитесь списка переписок и повторите проверку подключения.');return;}
+    const current=await managedTab('mic',binding);
+    if(!current||current.url!==tab.url||current.status!=='complete'||current.pendingUrl){managed.pending=false;markHealth(state,'mic','paused','Рабочая вкладка изменилась. Повторите проверку подключения.');return;}
+    // Readiness is accepted only after visibility emulation has been disabled
+    // and our own debugger attachment released.
+    const refreshed=await scanPlatform(state,'mic'),after=micBootstrapSource(refreshed,tab.url);
+    if(state.bindings.mic!==binding)return;
+    if(!after.ready||after.documentToken!==before.documentToken){managed.pending=false;markHealth(state,'mic','paused','Состояние чата изменилось во время загрузки. Проверьте вкладку и повторите проверку подключения.');return;}
+    if(binding.status==='ready')managed.pending=false;
+  }
+  async function checkManagedChat(state,name) {
+    const binding=state.bindings[name],managed=binding.managed;
+    if(!managed)return;
+    const observed=await scanPlatform(state,name);
+    if(state.bindings[name]!==binding)return;
+    const tab=name==='mic'?await managedTab(name,binding):null,needsBootstrap=tab?.url===CHAT_CENTERS.mic;
+    if(['login','captcha','paused'].includes(binding.status)||binding.status==='ready'&&!needsBootstrap)managed.pending=false;
+    if(!managed.pending)return;
+    if(now()>=managed.deadlineAt) {
+      managed.pending=false;
+      markHealth(state,name,'error','Чат не стал доступен за 2 минуты. Нажмите «Показать чат», проверьте вход в аккаунт и загрузку списка сообщений; затем повторите проверку подключения.');
+      return;
+    }
+    if(needsBootstrap)await bootstrapMICChat(state,binding,observed);
+    else if(name==='mic')await initializeHiddenMIC(state,binding,observed);
+    if(state.bindings[name]!==binding||!managed.pending)return;
+    markHealth(state,name,'loading','Ожидаю загрузки центра сообщений и доступа к списку чатов. Проверка продолжится автоматически.');
+  }
+  async function openManagedChats(state,folder,message,sender) {
+    const names=message.platform===undefined?PLATFORMS:[platform(message.platform)],windowId=await launchWindow(sender),launchErrors=[];
+    // Check capability before creating a tab: otherwise an unsupported browser
+    // could create an untracked duplicate on every click.
+    let registry=await managedRegistry();
+    for(const name of names) {
+      try {
+        let binding=state.bindings[name],tab=await managedTab(name,binding);
+        if(!tab) {
+          protectTestBinding(folder,name,binding.tabId);
+          // Recover the create->bind gap after an interrupted service worker.
+          const previous=registry[name];
+          if(previous&&Number.isInteger(previous.tabId)&&typeof previous.token==='string') {
+            let candidate;try {candidate=await api.tabs.get(previous.tabId);}catch{}
+            if(candidate&&candidate.windowId===previous.windowId&&managedChatRoute(name,candidate.url&&candidate.url!=='about:blank'?candidate.url:candidate.pendingUrl)&&(!candidate.pendingUrl||managedChatRoute(name,candidate.pendingUrl)))tab=candidate;
+          }
+          for(const key of new Set([...Object.keys(state.conversations),...folder.jobs.map(job=>job.key)]))if(key.startsWith(name+':')){cancel(key);await folderCancelPending(folder,{key});}
+          if(!tab) {
+            // The initiating window may have closed while another site opened.
+            const window=await api.windows.get(windowId);if(window.type!=='normal')throw new Error('Рабочее окно закрыто. Повторно откройте OpenLinks в нужном окне.');
+            tab=await api.tabs.create({windowId,url:CHAT_CENTERS[name],active:false});
+            if(!Number.isInteger(tab?.id)||tab.windowId!==windowId)throw new Error('Браузер не подтвердил создание рабочей вкладки.');
+            registry[name]={tabId:tab.id,windowId,token:crypto.randomUUID()};
+            await api.storage.session.set({[MANAGED_KEY]:registry});
+          }
+          await releaseBoundTab(state,name);
+          bindDialogTab(state,name,tab.id,CHAT_CENTERS[name],now());binding=state.bindings[name];
+          binding.managed={windowId:tab.windowId,openedAt:now(),deadlineAt:now()+CHAT_LAUNCH_TIMEOUT_MS,token:registry[name].token,pending:true};
+          await protectBoundTab(state,name,tab);await save(state);
+          log(state,'chat_opened','Открыта отдельная рабочая вкладка центра сообщений. Ожидаю готовности чата.',{platform:name});
+        } else if(!binding.managed.pending) {
+          Object.assign(binding.managed,{openedAt:now(),deadlineAt:now()+CHAT_LAUNCH_TIMEOUT_MS,pending:true});
+        }
+        await checkManagedChat(state,name);
+      } catch(error) {
+        const detail=error instanceof Error&&/^[А-ЯЁ]/.test(error.message)?error.message:'Не удалось открыть центр сообщений. Проверьте рабочее окно и повторите открытие этой площадки.';
+        launchErrors.push({platform:name,error:detail});
+        const binding=state.bindings[name];
+        if(!Number.isInteger(binding.tabId))Object.assign(binding,{status:'error',detail,checkedAt:now()});
+        log(state,'chat_open_failed',detail,{platform:name,level:'error'});
+      }
+      // Keep successful earlier platforms even if another create/navigation fails.
+      await save(state);
+    }
+    await syncLaunchAlarm(state);
+    return {...await publicState(state),launchErrors};
+  }
+
+  async function scanPlatform(state,name,{recoveryOnly=false}={}) {
     const binding=state.bindings[name];
     if(!Number.isInteger(binding?.tabId))return [];
     let tab;
     try { tab=await api.tabs.get(binding.tabId); }
     catch { unbindDialogTab(state,name,now());log(state,'tab_closed','Вкладка закрыта. Привяжите открытую вкладку повторно.',{platform:name,level:'error'});return []; }
+    if(binding.managed&&tab.pendingUrl&&managedChatRoute(name,tab.pendingUrl)&&(!tab.url||tab.url==='about:blank')) {
+      if(await managedTab(name,binding)){await protectBoundTab(state,name,tab);markHealth(state,name,'loading','Страница центра сообщений загружается.');return [];}
+    }
     if(dialogPlatform(tab.url)!==name || (tab.pendingUrl && dialogPlatform(tab.pendingUrl)!==name)) {
       await releaseBoundTab(state,name);
       unbindDialogTab(state,name,now());log(state,'tab_left_platform','Вкладка ушла с площадки. Привязка снята.',{platform:name,level:'error'});return [];
     }
-    await protectBoundTab(state,name,tab);
+    if(binding.managed&&!await managedTab(name,binding)) {binding.managed.pending=false;markHealth(state,name,'error','Рабочая вкладка изменилась или принадлежит прежнему сеансу браузера. Откройте чат заново кнопкой площадки.');return [];}
+    if(!recoveryOnly)await protectBoundTab(state,name,tab);
     if(unavailableTab(state,name,tab))return [];
     if(tab.status==='loading' || tab.pendingUrl) { markHealth(state,name,'loading','Страница загружается.');return []; }
     let frames;
@@ -260,7 +465,10 @@ export function createDialogMonitor({api=globalThis.chrome, fetchImpl=globalThis
     const ready=valid.filter(reply=>reply.status==='ready');
     if(!ready.length) {
       const status=valid.some(reply=>reply.status==='loading')?'loading':valid.length?'unsupported':'error';
-      markHealth(state,name,status,status==='loading'?'Чат ещё загружается.':'Чат не распознан. Откройте список сообщений и обновите вкладку после установки расширения.');return [];
+      markHealth(state,name,status,status==='loading'?'Чат ещё загружается.':'Чат не распознан. Откройте список сообщений и обновите вкладку после установки расширения.');return Object.assign([],{sources:valid});
+    }
+    if(name==='mic'&&binding.managed&&tab.url===CHAT_CENTERS.mic) {
+      markHealth(state,name,'loading','Ожидаю открытия полного списка переписок Made-in-China.');return Object.assign([],{sources:valid});
     }
     const rows=new Map(),ambiguous=new Set();
     const transcript=row=>JSON.stringify((row.messages || []).map(item=>[item.id || '',item.direction,item.text,item.at ?? null,item.format || '',(item.attachments || []).map(attachmentSourceFingerprint)]));
@@ -278,7 +486,7 @@ export function createDialogMonitor({api=globalThis.chrome, fetchImpl=globalThis
     const detail=ambiguous.size?'Найдены противоречивые копии диалога в разных фреймах. Черновик для них недоступен.':'';
     markHealth(state,name,'ready',detail);
     mergeDialogSnapshot(state,{platform:name,status:'ready',url:tab.url,detail,conversations},now());
-    for(const row of conversations)if(row.active===true && row.identityReliable===true && row.historyTailKnown===true && row.historyOrderReliable===true) {
+    for(const row of conversations)if(!recoveryOnly && row.active===true && row.identityReliable===true && row.historyTailKnown===true && row.historyOrderReliable===true) {
       try {await attachmentResolver({api,state,key:conversationKey(name,row.id),rawConversation:row,tabId:tab.id,frameId:row.frameId,documentToken:row.documentToken,sourceUrl:row.sourceUrl,now:now()});}
       catch {const item=state.conversations[conversationKey(name,row.id)];if(item)item.detail='Не удалось прочитать вложение. Подготовка ответа остаётся заблокированной.';}
     }
@@ -705,11 +913,20 @@ export function createDialogMonitor({api=globalThis.chrome, fetchImpl=globalThis
     const test=folder.test;
     if(test.cleanupToken) {
       let result;try{result=await testCleaner({api,source:test.source,token:test.cleanupToken,shouldContinue:()=>cancelEpoch===checkEpoch});}catch{}
-      if(result?.cleared!==true&&cancelEpoch===checkEpoch&&PLATFORMS.includes(test.cleanupToken.platform)&&Number.isInteger(state.bindings[test.cleanupToken.platform]?.tabId)) {
-        // A reload can replace an iframe or browser tab. New identity evidence
-        // permits only an empty-editor check, never deletion with an old token.
-        const token=test.cleanupToken,observed=await scanPlatform(state,token.platform),matches=observed.filter(row=>row.active&&row.id===token.id&&row.sourceUrl===token.sourceUrl);
-        if(matches.length===1&&cancelEpoch===checkEpoch){const row=matches[0];try{result=await testRecovery({api,source:{tabId:state.bindings[token.platform].tabId,frameId:row.frameId,documentToken:row.documentToken,sourceUrl:row.sourceUrl},token,shouldContinue:()=>cancelEpoch===checkEpoch});}catch{}}
+      if(result?.cleared!==true&&cancelEpoch===checkEpoch&&PLATFORMS.includes(test.cleanupToken.platform)) {
+        // A reload can replace an iframe; startup can also clear the binding.
+        // Inspect only a bound tab or the saved preview source, using a temporary
+        // state. This grants no tab ownership, protection, deletion or send rights.
+        const token=test.cleanupToken,tabId=state.bindings[token.platform]?.tabId ?? test.source?.tabId;
+        if(Number.isInteger(tabId))try {
+          const tab=await api.tabs.get(tabId);
+          if(dialogPlatform(tab.url)===token.platform&&!tab.pendingUrl&&tab.status!=='loading') {
+            const recoveryState=normalizeDialogs(state);
+            bindDialogTab(recoveryState,token.platform,tabId,tab.url,now());
+            const observed=await scanPlatform(recoveryState,token.platform,{recoveryOnly:true}),matches=observed.filter(row=>row.active&&row.id===token.id&&row.sourceUrl===token.sourceUrl);
+            if(matches.length===1&&cancelEpoch===checkEpoch){const row=matches[0];result=await testRecovery({api,source:{tabId,frameId:row.frameId,documentToken:row.documentToken,sourceUrl:row.sourceUrl},token,shouldContinue:()=>cancelEpoch===checkEpoch});}
+          }
+        }catch { /* Missing/ambiguous identity retains the original preview proof. */ }
       }
       if(result?.cleared!==true||cancelEpoch!==checkEpoch)throw new Error('Не удалось безопасно убрать тестовый текст. Проверьте этот чат: изменённый или чужой черновик не удаляется.');
     }
@@ -850,12 +1067,18 @@ export function createDialogMonitor({api=globalThis.chrome, fetchImpl=globalThis
     log(state,'auto_drafts',enabled?'Авточерновики включены для новых входящих по утверждённому заданию. Отправка отключена.':'Авточерновики выключены.');
   }
 
-  async function command(message,commandEpoch) {
+  async function command(message,commandEpoch,sender) {
     const state=await load(),folder=await loadFolder();
     const invalidates=['DIALOGS_STOP','DIALOGS_SETTINGS','DIALOGS_CONTEXT_EDITING','DIALOGS_PRODUCT_SAVE','DIALOGS_PRODUCT_APPROVE','DIALOGS_IMPORT_PRODUCT_RESULT','DIALOGS_BIND_TAB','DIALOGS_UNBIND_TAB'];
     if(invalidates.includes(message.type))await folderCancelPending(folder);
     else if(['DIALOGS_CONTROL','DIALOGS_SAVE_DRAFT','DIALOGS_DRAFT_EDITING','DIALOGS_SEND_DRAFT','DIALOGS_DISCARD_DRAFT'].includes(message.type))await folderCancelPending(folder,{key:message.key});
     switch(message.type) {
+      case 'DIALOGS_OPEN_CHATS':return openManagedChats(state,folder,message,sender);
+      case 'DIALOGS_SHOW_CHAT': {
+        const name=platform(message.platform),tab=await managedTab(name,state.bindings[name]);
+        if(!tab)throw new Error('Рабочая вкладка недоступна. Откройте чат заново кнопкой площадки.');
+        await api.tabs.update(tab.id,{active:true});await api.windows.update(tab.windowId,{focused:true});return publicState(state);
+      }
       case 'DIALOGS_TEST_NEXT':return nextTestCycle(state,folder,message);
       case 'DIALOGS_SEND_DRAFT':return sendReviewedDraft(state,folder,message,commandEpoch);
       case 'DIALOGS_DRAFT_EDITING':return publicState(state);
@@ -935,24 +1158,31 @@ export function createDialogMonitor({api=globalThis.chrome, fetchImpl=globalThis
           if(outreach?.queue?.some(job=>!['sent','attempted','attempt_unknown','skipped','failed'].includes(job.status) && [job.tabId,job.supplierTabId].includes(tab.id)))throw new Error('Вкладка занята очередью рассылки. Выберите отдельную вкладку для мониторинга.');
           cancel();
           const previous=state.bindings[name];
+          if(previous.tabId!==tab.id){protectTestBinding(folder,name,previous.tabId);await forgetManaged(name);}
+          const managed=previous.tabId===tab.id?previous.managed:null;
           const protection=previous.tabId===tab.id?previous.discardProtection:null;
           if(previous.tabId!==tab.id)await releaseBoundTab(state,name);
           bindDialogTab(state,name,tab.id,tab.url,now());
           // Rebinding the same tab must not forget which setting we changed.
           if(protection?.status==='protected'&&tab.autoDiscardable===false)state.bindings[name].discardProtection=protection;
+          if(managed)state.bindings[name].managed=managed;
           await protectBoundTab(state,name,tab);unavailableTab(state,name,tab);
           await save(state);return publicState(state);
         });
       }
       case 'DIALOGS_UNBIND_TAB': {
-        const name=platform(message.platform);cancel();await releaseBoundTab(state,name);unbindDialogTab(state,name,now());break;
+        const name=platform(message.platform);protectTestBinding(folder,name,state.bindings[name].tabId);cancel();await releaseBoundTab(state,name);await forgetManaged(name);unbindDialogTab(state,name,now());await syncLaunchAlarm(state);break;
       }
       case 'DIALOGS_START':
-        if(!Object.values(state.bindings).some(binding=>Number.isInteger(binding.tabId)))throw new Error('Сначала привяжите вкладки площадок.');
+        if(!Object.values(state.bindings).some(binding=>Number.isInteger(binding.tabId)))throw new Error('Сначала откройте чаты площадок.');
         if(folder.enabled || !apiAutoAvailable())state.settings.autoDraft=false;
         state.running=true;state.readUnread=message.readUnread===true;log(state,'monitor_started',`${state.readUnread?'Мониторинг запущен с открытием существующих непрочитанных диалогов.':'Мониторинг запущен без переключения диалогов.'} ${folder.enabled&&folder.auto?'Автоматическая обработка через папку включена.':state.settings.autoDraft?'Авточерновики включены по утверждённому заданию.':'Автоматическая подготовка ответов отключена.'} ${folder.test.enabled?'Тестовый режим: отправка запрещена, один цикл запускается явной кнопкой.':folder.enabled&&folder.auto&&folder.autoSend?'Автоматическая отправка разрешена после проверки контекста и общего лимита.':'Ввод и отправка сообщений отключены.'}`);await schedule();break;
       case 'DIALOGS_STOP': cancel();state.running=false;for(const name of PLATFORMS)state.traversal[name].pending=null;log(state,'monitor_stopped','Мониторинг приостановлен.');if(folder.enabled)await schedule();else await clearAlarm();break;
-      case 'DIALOGS_SCAN': await scan(state,message.platform);return publicState(state);
+      case 'DIALOGS_SCAN':
+        for(const name of message.platform?[platform(message.platform)]:PLATFORMS) {
+          if(state.bindings[name].managed?.pending)await checkManagedChat(state,name);else await scan(state,name);
+        }
+        await save(state);await syncLaunchAlarm(state);return publicState(state);
       case 'DIALOGS_SETTINGS': {
         const config=await provider(), selected=validateProvider(message.provider ?? config.provider);
         const profile={...config.profiles[selected]};
@@ -1015,10 +1245,15 @@ export function createDialogMonitor({api=globalThis.chrome, fetchImpl=globalThis
     if(['DIALOGS_FOLDER_CANCEL','DIALOGS_FOLDER_SETTINGS','DIALOGS_STOP','DIALOGS_SETTINGS','DIALOGS_CONTEXT_EDITING','DIALOGS_PRODUCT_SAVE','DIALOGS_PRODUCT_APPROVE','DIALOGS_IMPORT_PRODUCT_RESULT','DIALOGS_BIND_TAB','DIALOGS_UNBIND_TAB'].includes(message.type) || (message.type==='DIALOGS_AUTODRAFT' && message.enabled!==true))cancel();
     else if(['DIALOGS_CONTROL','DIALOGS_SAVE_DRAFT','DIALOGS_DRAFT_EDITING','DIALOGS_SEND_DRAFT','DIALOGS_DISCARD_DRAFT'].includes(message.type))cancel(message.key);
     const commandEpoch=epoch(message.key);
-    try { return await exclusive(()=>command(message,commandEpoch)); }
+    try { return await exclusive(()=>command(message,commandEpoch,sender)); }
     catch(error) { return {ok:false,error:error instanceof Error && /^[А-ЯЁ]/.test(error.message)?error.message:'Не удалось выполнить команду диалогов. Проверьте выбранную вкладку и настройки.'}; }
   }
   const onAlarm=async alarm=>{
+    if(alarm.name===LAUNCH_ALARM)return exclusive(async()=>{
+      const state=await load();
+      for(const name of PLATFORMS)if(state.bindings[name].managed?.pending)await checkManagedChat(state,name);
+      await save(state);await syncLaunchAlarm(state);
+    });
     if(alarm.name!==ALARM)return;
     const autoKey=await exclusive(async()=>{
       const cycleEpoch=cancelEpoch,state=await load(),folder=await loadFolder();if(!state.running){if(folder.enabled)await pollFolder(state,folder);return null;}
@@ -1053,22 +1288,33 @@ export function createDialogMonitor({api=globalThis.chrome, fetchImpl=globalThis
       // old tab closes; explicit unbind/rebind still restores verified ownership.
       unbindDialogTab(state,name,now());
     }
-    log(state,'bindings_reset','После перезапуска Chrome или обновления расширения привяжите вкладки заново.');
-    await clearAlarm();await save(state);
+    if(api.storage.session?.set)await api.storage.session.set({[MANAGED_KEY]:{}});
+    log(state,'bindings_reset','После перезапуска браузера или обновления расширения откройте рабочие чаты кнопкой площадки. Старые вкладки и черновики сохранены.');
+    await syncLaunchAlarm(state);await clearAlarm();await save(state);
   });
   const onTabRemoved=tabId=>exclusive(async()=>{
     const state=await load();let changed=false;
-    for(const name of PLATFORMS)if(state.bindings[name]?.tabId===tabId){cancel();unbindDialogTab(state,name,now());changed=true;}
-    if(changed)await save(state);
+    for(const name of PLATFORMS)if(state.bindings[name]?.tabId===tabId){cancel();await forgetManaged(name);unbindDialogTab(state,name,now());state.bindings[name].detail='Рабочая вкладка закрыта. Для продолжения откройте чат кнопкой площадки.';changed=true;}
+    if(changed){await save(state);await syncLaunchAlarm(state);}
   });
   const onTabUpdated=(tabId,change,tab)=>exclusive(async()=>{
-    if(!change.url&&change.discarded!==true&&change.frozen!==true)return;
+    if(!change.url&&!['loading','complete'].includes(change.status)&&change.discarded!==true&&change.frozen!==true)return;
     const state=await load();let changed=false;
     for(const name of PLATFORMS)if(state.bindings[name]?.tabId===tabId) {
       if(change.url&&dialogPlatform(change.url)!==name){cancel();await releaseBoundTab(state,name);unbindDialogTab(state,name,now());changed=true;}
       else if(unavailableTab(state,name,{...tab,...change})){changed=true;}
+      else if(state.bindings[name].managed&&change.status==='loading') {
+        const managed=state.bindings[name].managed;
+        if(!managed.pending)Object.assign(managed,{openedAt:now(),deadlineAt:now()+CHAT_LAUNCH_TIMEOUT_MS,pending:true});
+        markHealth(state,name,'loading','Центр сообщений загружается; проверка продолжится автоматически.');changed=true;
+      }
+      else if(state.bindings[name].managed&&(change.status==='complete'||change.url)) {
+        const managed=state.bindings[name].managed;
+        if(!managed.pending&&['login','captcha','paused'].includes(state.bindings[name].status)&&change.status==='complete')Object.assign(managed,{openedAt:now(),deadlineAt:now()+CHAT_LAUNCH_TIMEOUT_MS,pending:true});
+        await checkManagedChat(state,name);changed=true;
+      }
     }
-    if(changed)await save(state);
+    if(changed){await save(state);await syncLaunchAlarm(state);}
   });
   return {handle,onAlarm,onStartup:resetBindings,onInstalled:details=>details?.reason==='update'?resetBindings():Promise.resolve(),onTabRemoved,onTabUpdated};
 }

@@ -34,6 +34,7 @@ HARNESS = r"""
   let folder={enabled:false,auto:false,autoSend:false,model:'haiku',status:'disabled',detail:'',folder:'',worker:{running:false},claude:{available:true},jobs:[],sendReceipts:[],test:emptyTest()};
   const coreModule=()=>import('/extension/lib/dialogs.js');
   window.calls=[];window.permissionCalls=[];window.allowPermission=true;window.failGet=false;window.failFolder=false;
+  window.deferOpenChats=false;window.openLeavesPending=false;window.failOpenChat='';window.failOpenRequest=false;window.shownChats=[];
   window.deferSend=false;window.deferDraftEditing=false;window.deferTestNext=false;window.sendOutcome='attempted';window.sentTexts=[];window.previewedTexts=[];
   const tabs=[{id:11,platform:'1688',title:'1688 chat',url:'https://air.1688.com/chat/'},{id:22,platform:'alibaba',title:'Alibaba messages',url:'https://message.alibaba.com/'},{id:33,platform:'mic',title:'Made-in-China messages',url:'https://webim.made-in-china.com/'}];
   const publicState=()=>({ok:true,state:structuredClone(state),ai:structuredClone(ai),folder:structuredClone(folder),productFingerprint:core.productFingerprint(state)});
@@ -42,8 +43,16 @@ HARNESS = r"""
     calls.push(structuredClone(message));const t=message.type;core=await coreModule();state??=core.initialDialogs();
     try {
       if(t==='DIALOGS_GET')return failGet?{ok:false,error:'Временная ошибка чтения'}:publicState();
-      if(t==='DIALOGS_LIST_TABS')return {ok:true,tabs};
-      if(t==='DIALOGS_BIND_TAB'){const tab=tabs.find(tab=>tab.id===message.tabId);state.bindings[message.platform]={tabId:tab.id,url:tab.url,status:'loading',checkedAt:null,detail:'Ожидает проверки'};}
+      if(t==='DIALOGS_OPEN_CHATS'){
+        if(window.failOpenRequest)throw new Error('Не удалось открыть окно площадок.');
+        const selected=tabs.filter(tab=>!message.platform||tab.platform===message.platform),launchErrors=[];
+        for(const tab of selected)state.bindings[tab.platform]={tabId:tab.id,url:tab.url,status:'loading',checkedAt:null,detail:'Открываю центр сообщений',managed:{windowId:1,pending:true}};
+        announce();
+        if(window.deferOpenChats)await new Promise(resolve=>{window.resolveOpenChats=resolve;});
+        for(const tab of selected){const binding=state.bindings[tab.platform];if(window.openLeavesPending)continue;binding.managed.pending=false;if(window.failOpenChat===tab.platform){binding.status='error';binding.detail='Не удалось загрузить центр сообщений';launchErrors.push({platform:tab.platform,error:binding.detail});}else{binding.status='ready';binding.detail='Центр сообщений доступен';binding.checkedAt=now;}}
+        return {...publicState(),launchErrors};
+      }
+      else if(t==='DIALOGS_SHOW_CHAT'){if(!state.bindings[message.platform]?.managed)throw new Error('Сначала откройте чат площадки.');window.shownChats.push(message.platform);}
       else if(t==='DIALOGS_UNBIND_TAB')state.bindings[message.platform]={tabId:null,url:'',status:'unbound',checkedAt:null,detail:''};
       else if(t==='DIALOGS_START'){state.running=true;state.readUnread=message.readUnread===true;}
       else if(t==='DIALOGS_STOP')state.running=false;
@@ -106,6 +115,7 @@ HARNESS = r"""
   }}};
   const thread=(id,platform,extra={})=>({key:platform+':'+id,id,platform,title:'Supplier '+id,url:platform==='1688'?'https://air.1688.com/chat/':'https://message.alibaba.com/',identityReliable:true,unread:false,needsRead:false,messages:[{key:'m1',id:'m1',direction:'outbound',text:'Hello, I need a machine.',at:now-60000},{key:'m2',id:'m2',direction:'inbound',text:'What quantity do you need?',at:now}],orderReliable:true,tailKnown:true,revision:1,fingerprint:'fp1',unanswered:true,paused:false,takeover:false,draft:null,updatedAt:now,lastObservedAt:now,...extra});
   window.seedDialogs=()=>{state.conversations={'alibaba:alpha':thread('alpha','alibaba'),'1688:list':thread('list','1688',{title:'Only unread badge',unread:3,needsRead:true,messages:[],orderReliable:false,tailKnown:false,unanswered:false,preview:'A list preview'}),'mic:uncertain':thread('uncertain','mic',{title:'Uncertain order',orderReliable:false,messages:[{key:'m3',direction:'unknown',text:'Ambiguous author',at:null}]})};state.events=[{at:now,type:'scan',platform:'1688',detail:'Проверка завершена'}];announce();};
+  window.readyChat=platform=>{Object.assign(state.bindings[platform],{status:'ready',checkedAt:now,detail:'Центр сообщений доступен'});state.bindings[platform].managed.pending=false;announce();};
   window.changeDialog=patch=>{Object.assign(state.conversations['alibaba:alpha'],patch);announce();};
   window.changeProduct=patch=>{core.saveProduct(state,patch,now);announce();};
   window.dialogAI=()=>structuredClone(ai);window.dialogState=()=>structuredClone(state);window.folderState=()=>structuredClone(folder);
@@ -145,7 +155,7 @@ try:
         expect(ui.locator('.dialogs-platform')).to_have_count(3)
         expect(ui.locator('#dialogs-start')).to_be_disabled()
         expect(ui.locator('#dialogs-read-unread')).to_be_checked()
-        assert ui.evaluate("calls.every(c=>['DIALOGS_GET','DIALOGS_LIST_TABS'].includes(c.type))")
+        assert ui.evaluate("calls.every(c=>c.type==='DIALOGS_GET')")
         assert ui.evaluate('permissionCalls.length') == 0
         removed = '#dialogs-provider,#dialogs-api-key,#dialogs-model,#dialogs-clear-key,#dialogs-auto-draft,#dialogs-folder-auto,#dialogs-product-extract,#dialogs-product-export,#dialogs-generate,#dialogs-export-draft,#dialogs-prompt-panel'
         expect(ui.locator(removed)).to_have_count(0)
@@ -160,8 +170,83 @@ try:
         assert not ui.evaluate("calls.some(c=>/DIAGNOSTIC/.test(c.type))")
         passed('diagnostics is an explicit link with no automatic conversation collection')
 
-        ui.locator('#dialogs-tab-alibaba').select_option('22')
-        ui.locator('[data-platform="alibaba"]').get_by_role('button', name='Выбрать', exact=True).click()
+        expect(ui.locator('#dialogs-refresh-tabs,select[id^=dialogs-tab-]')).to_have_count(0)
+        ui.locator('[data-platform="alibaba"] [data-action="open-chat"]').click()
+        assert ui.evaluate("calls.filter(c=>c.type==='DIALOGS_OPEN_CHATS').at(-1)") == {'type':'DIALOGS_OPEN_CHATS','platform':'alibaba'}
+        expect(ui.locator('[data-platform="alibaba"]')).to_contain_text('Чат доступен')
+        expect(ui.locator('[data-platform="1688"] [data-action="show-chat"]')).to_be_disabled()
+        assert ui.evaluate('dialogState().running') is False
+        assert ui.evaluate('folderState().auto') is False
+        assert ui.evaluate('folderState().autoSend') is False
+        assert ui.evaluate('shownChats') == []
+        ui.locator('[data-platform="alibaba"] [data-action="show-chat"]').click()
+        ui.wait_for_function('shownChats.length === 1')
+        assert ui.evaluate('shownChats') == ['alibaba']
+        assert not ui.evaluate("calls.some(c=>['DIALOGS_LIST_TABS','DIALOGS_BIND_TAB','DIALOGS_START','DIALOGS_SEND_DRAFT','DIALOGS_FOLDER_SETTINGS'].includes(c.type))")
+        passed('open one managed platform chat without selecting existing tabs, starting monitoring or sending; showing is explicit')
+
+        open_ui=context.new_page()
+        open_ui.on('pageerror',lambda error:errors.append(str(error)))
+        open_ui.goto(f'http://127.0.0.1:{server.server_port}/extension/dialogs.html')
+        expect(open_ui.locator('#dialogs-open-chats')).to_be_enabled()
+        open_ui.evaluate('deferOpenChats=true')
+        open_ui.locator('#dialogs-open-chats').click()
+        open_ui.wait_for_function('typeof resolveOpenChats === "function"')
+        expect(open_ui.locator('#dialogs-open-chats')).to_be_disabled()
+        expect(open_ui.locator('#dialogs-open-status')).to_contain_text('Последовательно открываю')
+        expect(open_ui.locator('#dialogs-bindings')).to_have_attribute('aria-busy','true')
+        open_ui.evaluate('announceDialogs()')
+        for platform in ['1688','alibaba','mic']:
+            expect(open_ui.locator(f'[data-platform="{platform}"] [data-action="open-chat"]')).to_be_disabled()
+            expect(open_ui.locator(f'[data-platform="{platform}"] [data-action="show-chat"]')).to_be_disabled()
+        open_ui.evaluate("document.querySelector('#dialogs-open-chats').click();document.querySelector('[data-action=open-chat]').click()")
+        assert open_ui.evaluate("calls.filter(c=>c.type==='DIALOGS_OPEN_CHATS').length") == 1
+        open_ui.evaluate('deferOpenChats=false;resolveOpenChats()')
+        expect(open_ui.locator('#dialogs-open-chats')).to_be_enabled()
+        expect(open_ui.locator('#dialogs-bindings')).to_have_attribute('aria-busy','false')
+        expect(open_ui.locator('#dialogs-open-status')).to_contain_text('3 из 3')
+        assert open_ui.evaluate("calls.filter(c=>c.type==='DIALOGS_OPEN_CHATS').at(-1)") == {'type':'DIALOGS_OPEN_CHATS'}
+        assert not open_ui.evaluate("calls.some(c=>['DIALOGS_LIST_TABS','DIALOGS_BIND_TAB','DIALOGS_START','DIALOGS_SEND_DRAFT','DIALOGS_FOLDER_SETTINGS'].includes(c.type))")
+        passed('open all shows live progress and blocks duplicate clicks across storage refreshes without enabling automation')
+
+        open_ui.evaluate('openLeavesPending=true')
+        open_ui.locator('[data-platform="mic"] [data-action="open-chat"]').click()
+        expect(open_ui.locator('[data-platform="mic"]')).to_contain_text('Загрузка…')
+        expect(open_ui.locator('#dialogs-open-status')).to_contain_text('Чаты загружаются')
+        expect(open_ui.locator('#dialogs-bindings')).to_have_attribute('aria-busy','true')
+        expect(open_ui.locator('[data-platform="mic"] [data-action="show-chat"]')).to_be_enabled()
+        expect(open_ui.locator('#dialogs-open-chats')).to_be_enabled()
+        open_ui.evaluate("openLeavesPending=false;readyChat('mic')")
+        expect(open_ui.locator('[data-platform="mic"]')).to_contain_text('Чат доступен')
+        expect(open_ui.locator('#dialogs-open-status')).to_contain_text('3 из 3')
+        expect(open_ui.locator('#dialogs-bindings')).to_have_attribute('aria-busy','false')
+        assert open_ui.evaluate('shownChats') == []
+        passed('background chat loading remains visible after launch returns and readiness updates without opening or focusing more tabs')
+
+        open_ui.evaluate("failOpenChat='mic'")
+        open_ui.locator('#dialogs-open-chats').click()
+        expect(open_ui.locator('#dialogs-feedback')).to_contain_text('Made-in-China: Не удалось загрузить')
+        expect(open_ui.locator('[data-platform="mic"]')).to_contain_text('Ошибка проверки')
+        expect(open_ui.locator('[data-platform="alibaba"]')).to_contain_text('Чат доступен')
+        expect(open_ui.locator('#dialogs-open-status')).to_contain_text('2 из 3')
+        open_ui.evaluate("failOpenChat=''")
+        open_ui.locator('[data-platform="mic"] [data-action="open-chat"]').click()
+        expect(open_ui.locator('[data-platform="mic"]')).to_contain_text('Чат доступен')
+        assert open_ui.evaluate("calls.filter(c=>c.type==='DIALOGS_OPEN_CHATS').at(-1)") == {'type':'DIALOGS_OPEN_CHATS','platform':'mic'}
+        passed('partial launch error is visible per platform and can be retried independently')
+
+        open_ui.evaluate('failOpenRequest=true')
+        open_ui.locator('#dialogs-open-chats').click()
+        expect(open_ui.locator('#dialogs-feedback')).to_contain_text('Не удалось открыть окно площадок')
+        expect(open_ui.locator('#dialogs-open-chats')).to_be_enabled()
+        expect(open_ui.locator('[data-platform="mic"] [data-action="open-chat"]')).to_be_enabled()
+        expect(open_ui.locator('#dialogs-bindings')).to_have_attribute('aria-busy','false')
+        open_ui.evaluate('failOpenRequest=false')
+        open_ui.locator('[data-platform="mic"] [data-action="disconnect-chat"]').click()
+        expect(open_ui.locator('[data-platform="mic"]')).to_contain_text('Чат не открыт')
+        expect(open_ui.locator('[data-platform="mic"] [data-action="show-chat"]')).to_be_disabled()
+        open_ui.close()
+        passed('launch transport errors release UI locks; disconnect clears only the chosen platform')
         ui.locator('#dialogs-start').click()
         expect(ui.locator('#dialogs-run-state')).to_have_text('Только чтение')
         assert ui.evaluate('folderState().auto') is False
@@ -370,8 +455,7 @@ try:
             expect(page.locator('#dialogs-run-state')).to_have_text('Мониторинг остановлен')
             page.evaluate('seedDialogs()')
             page.locator('[data-key="alibaba:alpha"]').click()
-            page.locator('#dialogs-tab-alibaba').select_option('22')
-            page.locator('[data-platform="alibaba"]').get_by_role('button',name='Выбрать',exact=True).click()
+            page.locator('[data-platform="alibaba"] [data-action="open-chat"]').click()
             page.locator('#dialogs-product-card').fill('Model A, 10 units, stainless steel.')
             page.locator('#dialogs-product-points').fill('Model A. Quantity: 10. Stainless steel.')
             page.locator('#dialogs-product-rules').fill('Ask MOQ and lead time; no payment commitments.')

@@ -1,3 +1,4 @@
+import {normalizeManagedChat} from './chat-launch.js';
 import {initialProduct,normalizeProduct,saveProductState,invalidateProductSettings,productRequest,productExtractionPrompt,acceptExtractionState,approveProductState,requireProductApproval} from './product-brief.js';
 export {productApprovalError} from './product-brief.js';
 // This module only stores observations and reply drafts. It has no sending API.
@@ -429,10 +430,13 @@ export function normalizeDialogs(saved) {
   state.product=normalizeProduct(input.product,state.settings);
   for(const platform of DIALOG_PLATFORMS) {
     const binding=object(object(input.bindings)[platform]),url=safeURL(binding.url,platform),tabId=integer(binding.tabId);
+    if(tabId===null&&['unbound','closed','error'].includes(binding.status))Object.assign(state.bindings[platform],{status:binding.status,detail:clean(binding.detail,1200),checkedAt:time(binding.checkedAt)});
     if(url && tabId!==null) {
       state.bindings[platform]={tabId,url,status:HEALTH.has(binding.status)?binding.status:'loading',checkedAt:time(binding.checkedAt),detail:clean(binding.detail,1200)};
       const protection=discardProtection(binding.discardProtection);
       if(protection)state.bindings[platform].discardProtection=protection;
+      const managed=normalizeManagedChat(binding.managed);
+      if(managed)state.bindings[platform].managed=managed;
       const traversal=object(object(input.traversal)[platform]),pending=object(traversal.pending);
       try {
         conversationKey(platform,pending.id);

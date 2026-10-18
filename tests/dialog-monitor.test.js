@@ -2,6 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import {readFile} from 'node:fs/promises';
 import {createDialogMonitor,dialogPlatform,isMonitoredTab,DIALOGS_KEY,installDialogMonitor} from '../extension/dialog-monitor.js';
+import {CHAT_CENTERS} from '../extension/lib/chat-launch.js';
 import {conversationKey,resolveConversationAttachments} from '../extension/lib/dialogs.js';
 
 const urls={1688:'https://air.1688.com/app/chat/index.html',alibaba:'https://message.alibaba.com/message/default.htm',mic:'https://webim.made-in-china.com/super-tm/'};
@@ -11,22 +12,23 @@ const sortedJSON=value=>Array.isArray(value)?value.map(sortedJSON):value&&typeof
 function snapshot(platform='1688',extra={}) {
   return {platform,status:'ready',url:urls[platform],documentToken:'doc-1',frames:[],conversations:[{id:'supplier-1',title:'Supplier',identityReliable:true,active:true,unread:true,orderReliable:true,tailKnown:true,messages:[{id:'m1',direction:'inbound',text:'What quantity do you need?'}]}],...extra};
 }
-function harness({attachmentResolver,folderSender,testCleaner,testRecovery,pauseOutreachForTest,reserveDialogSendQuota,reorderStorage=false}={}) {
-  const storage={},calls=[],alarms=[],permissionRequests=[],tabUpdates=[],tabs=new Map([[1,{id:1,url:urls['1688'],status:'complete'}],[2,{id:2,url:urls.alibaba}],[3,{id:3,url:urls.mic}]]);
+function harness({attachmentResolver,folderSender,testCleaner,testRecovery,pauseOutreachForTest,reserveDialogSendQuota,micInitializationWait=async()=>{},reorderStorage=false}={}) {
+  const storage={},session={},calls=[],alarms=[],permissionRequests=[],tabUpdates=[],tabCreates=[],windowUpdates=[],windows=new Map([[20,{id:20,type:'normal'}],[30,{id:30,type:'normal'}]]),tabs=new Map([[1,{id:1,url:urls['1688'],status:'complete'}],[2,{id:2,url:urls.alibaba}],[3,{id:3,url:urls.mic}]]);
   const replies=new Map([[1,snapshot()],[2,snapshot('alibaba')],[3,snapshot('mic')]]);
-  const frameLists=new Map(),images=new Map();let reads=0,fetches=0,allowed=true,time=1000000,openAction=async message=>({ok:true,openedId:message.conversationId}),revealAction=async message=>({ok:true,revealedId:message.conversationId}),fetchAction=async()=>new Response(JSON.stringify({choices:[{message:{content:'We need 100 units. Could you share your WeChat?'}}]}));
+  const frameLists=new Map(),images=new Map();let nextTabId=4,reads=0,fetches=0,allowed=true,time=1000000,openAction=async message=>({ok:true,openedId:message.conversationId}),revealAction=async message=>({ok:true,revealedId:message.conversationId}),fetchAction=async()=>new Response(JSON.stringify({choices:[{message:{content:'We need 100 units. Could you share your WeChat?'}}]}));
   const listeners=()=>({list:[],addListener(fn){this.list.push(fn);}});
   const api={runtime:{id:'test',getURL:path=>'chrome-extension://test/'+path,getManifest:()=>({optional_host_permissions:['https://api.openai.com/*','https://api.anthropic.com/*']}),onMessage:listeners(),onStartup:listeners(),onInstalled:listeners()},
-    storage:{local:{get:async name=>{reads++;return {[name]:structuredClone(storage[name])};},set:async data=>Object.assign(storage,reorderStorage?sortedJSON(structuredClone(data)):structuredClone(data)),setAccessLevel:async value=>calls.push({access:value})}},
-    tabs:{get:async id=>{if(!tabs.has(id))throw new Error('No tab');return structuredClone(tabs.get(id));},query:async()=>[...tabs.values()],
+    storage:{session:{get:async name=>({[name]:structuredClone(session[name])}),set:async data=>Object.assign(session,structuredClone(data))},local:{get:async name=>{reads++;return {[name]:structuredClone(storage[name])};},set:async data=>Object.assign(storage,reorderStorage?sortedJSON(structuredClone(data)):structuredClone(data)),setAccessLevel:async value=>calls.push({access:value})}},
+    windows:{get:async id=>{if(!windows.has(id))throw new Error('No window');return structuredClone(windows.get(id));},getLastFocused:async()=>structuredClone(windows.get(20)),update:async(id,patch)=>{windowUpdates.push({id,...patch});return {...windows.get(id),...patch};}},
+    tabs:{create:async options=>{tabCreates.push(structuredClone(options));const id=nextTabId++,tab={id,windowId:options.windowId,url:options.url,status:'loading',active:options.active,autoDiscardable:true};tabs.set(id,tab);return structuredClone(tab);},get:async id=>{if(!tabs.has(id))throw new Error('No tab');return structuredClone(tabs.get(id));},query:async()=>[...tabs.values()],
       update:async(id,patch)=>{if(!tabs.has(id))throw new Error('No tab');tabUpdates.push({id,...patch});Object.assign(tabs.get(id),patch);return structuredClone(tabs.get(id));},
       sendMessage:async(id,message,options)=>{calls.push({id,...structuredClone(message),frameId:options.frameId});if(message.type==='DIALOGS_OPEN_CONVERSATION')return openAction(message,id);if(message.type==='DIALOGS_REVEAL_LATEST')return revealAction(message,id);const value=replies.get(`${id}:${options.frameId}`) || replies.get(id);return typeof value==='function'?value(message):structuredClone(value);},onUpdated:listeners(),onRemoved:listeners()},
     webNavigation:{getAllFrames:async({tabId})=>frameLists.get(tabId) || [{frameId:0,parentFrameId:-1,url:tabs.get(tabId).url}]},
     alarms:{create:async(name,options)=>alarms.push({name,...options}),clear:async()=>true,onAlarm:listeners()},
     permissions:{contains:async request=>{permissionRequests.push(structuredClone(request));return typeof allowed==='function'?allowed(request):allowed;}},
   };
-  const monitor=createDialogMonitor({api,now:()=>time,attachmentResolver,folderSender,testCleaner,testRecovery,pauseOutreachForTest,reserveDialogSendQuota,imageLoader:async key=>{if(!images.has(key))throw new Error('Файл изображения недоступен.');return images.get(key);},fetchImpl:async(...args)=>{fetches++;return fetchAction(...args);}});
-  return {api,monitor,storage,calls,alarms,permissionRequests,tabUpdates,tabs,replies,frameLists,images,advanceTime:ms=>{time+=ms;},get time(){return time;},get reads(){return reads;},get fetches(){return fetches;},set allowed(value){allowed=value;},set fetchAction(value){fetchAction=value;},set openAction(value){openAction=value;},set revealAction(value){revealAction=value;},command:(type,extra={},sender=ui)=>monitor.handle({type:'DIALOGS_'+type,...extra},sender)};
+  const monitor=createDialogMonitor({api,now:()=>time,attachmentResolver,folderSender,testCleaner,testRecovery,pauseOutreachForTest,reserveDialogSendQuota,micInitializationWait,imageLoader:async key=>{if(!images.has(key))throw new Error('Файл изображения недоступен.');return images.get(key);},fetchImpl:async(...args)=>{fetches++;return fetchAction(...args);}});
+  return {api,monitor,storage,session,calls,alarms,permissionRequests,tabUpdates,tabCreates,windowUpdates,windows,tabs,replies,frameLists,images,advanceTime:ms=>{time+=ms;},get time(){return time;},get reads(){return reads;},get fetches(){return fetches;},set allowed(value){allowed=value;},set fetchAction(value){fetchAction=value;},set openAction(value){openAction=value;},set revealAction(value){revealAction=value;},command:(type,extra={},sender=ui)=>monitor.handle({type:'DIALOGS_'+type,...extra},sender)};
 }
 async function ready(h) {
   assert.equal((await h.command('BIND_TAB',{platform:'1688',tabId:1})).ok,true);
@@ -1185,4 +1187,306 @@ test('unsaved test edits keep their immutable origin after another window exits 
   const saved=await h.command('SAVE_DRAFT',staleEditor);assert.equal(saved.ok,true,saved.error);assert.equal(saved.state.conversations[key].draft.testSessionId,done.folder.test.sessionId);
   const sent=await h.command('SEND_DRAFT',{...reviewedPayload(saved),testMode:false});assert.equal(sent.ok,false);assert.match(sent.error,/Тестовый черновик/);assert.equal(previews.length,1);assert.deepEqual(saved.folder.sendReceipts,[]);
   for(const draftTestSessionId of [null,42,'bad-origin'])assert.equal((await h.command('SAVE_DRAFT',{...staleEditor,draftTestSessionId})).ok,false);
+});
+
+function managedReady(h,name,{status='ready',conversations=[]}={}) {
+  const binding=h.storage[DIALOGS_KEY].bindings[name],tab=h.tabs.get(binding.tabId);
+  Object.assign(tab,{url:name==='mic'?urls.mic:CHAT_CENTERS[name],status:'complete'});delete tab.pendingUrl;
+  h.replies.set(tab.id,snapshot(name,{url:tab.url,status,conversations}));return tab;
+}
+test('opening centers creates three dedicated inactive tabs sequentially in the initiating window without enabling automation',async()=>{
+  const h=harness();await ready(h);const draft=(await h.command('GET')).state.conversations[key];
+  await h.command('SAVE_DRAFT',{key,text:'Preserve this draft',revision:draft.revision,fingerprint:draft.fingerprint});
+  const oldTabs=structuredClone([...h.tabs.values()]);
+  const result=await h.command('OPEN_CHATS',{}, {...ui,tab:{windowId:30}});
+  assert.equal(result.ok,true);assert.deepEqual(result.launchErrors,[]);
+  assert.deepEqual(h.tabCreates,['1688','alibaba','mic'].map(name=>({windowId:30,url:CHAT_CENTERS[name],active:false})));
+  assert.deepEqual([...h.tabs.values()].slice(0,3),oldTabs);
+  assert.equal(result.state.running,false);assert.equal(result.state.settings.autoDraft,false);assert.equal(result.folder.enabled,false);assert.equal(result.folder.autoSend,false);
+  assert.equal(result.state.conversations[key].draft.text,'Preserve this draft');assert.equal(h.fetches,0);
+  assert.ok(Object.values(result.state.bindings).every(binding=>binding.managed.pending&&binding.managed.windowId===30&&binding.status==='loading'));
+  assert.ok(h.tabUpdates.every(update=>Object.keys(update).join(',')==='id,autoDiscardable'));assert.deepEqual(h.windowUpdates,[]);
+  assert.ok(h.alarms.some(alarm=>alarm.name==='openlinks-chat-launch'));
+  assert.equal(h.calls.some(call=>/SEND|INPUT|DRAFT|OPEN_CONVERSATION/.test(call.type||'')),false);
+});
+test('concurrent open commands and MV3 worker recreation reuse only their existing managed tabs',async()=>{
+  const h=harness();const results=await Promise.all([h.command('OPEN_CHATS'),h.command('OPEN_CHATS'),h.command('OPEN_CHATS',{platform:'1688'})]);
+  assert.ok(results.every(result=>result.ok));assert.equal(h.tabCreates.length,3);
+  const first=structuredClone(h.storage[DIALOGS_KEY].bindings['1688'].managed);h.advanceTime(60000);
+  await h.command('OPEN_CHATS',{platform:'1688'});assert.equal(h.storage[DIALOGS_KEY].bindings['1688'].managed.deadlineAt,first.deadlineAt);
+  const recreated=createDialogMonitor({api:h.api,now:()=>h.time});
+  const result=await recreated.handle({type:'DIALOGS_OPEN_CHATS'},ui);assert.equal(result.ok,true);assert.equal(h.tabCreates.length,3);
+  assert.equal(result.state.bindings['1688'].managed.token,first.token);
+});
+test('an interrupted create-to-bind operation recovers the exact session-owned tab without creating another',async()=>{
+  const h=harness();await h.command('OPEN_CHATS',{platform:'alibaba'});
+  const old=h.storage[DIALOGS_KEY].bindings.alibaba;delete h.storage[DIALOGS_KEY].bindings.alibaba;
+  const recreated=createDialogMonitor({api:h.api,now:()=>h.time});
+  const result=await recreated.handle({type:'DIALOGS_OPEN_CHATS',platform:'alibaba'},ui);
+  assert.equal(result.ok,true);assert.equal(h.tabCreates.length,1);assert.equal(result.state.bindings.alibaba.tabId,old.tabId);assert.equal(result.state.bindings.alibaba.managed.token,old.managed.token);
+});
+test('load completion and a readiness alarm work while monitoring is stopped without AI or send calls',async()=>{
+  const h=harness();await h.command('OPEN_CHATS');
+  const first=managedReady(h,'1688');await h.monitor.onTabUpdated(first.id,{status:'complete'},first);
+  assert.equal(h.storage[DIALOGS_KEY].bindings['1688'].status,'ready');assert.equal(h.storage[DIALOGS_KEY].bindings['1688'].managed.pending,false);
+  managedReady(h,'alibaba');managedReady(h,'mic');await h.command('STOP');await h.monitor.onAlarm({name:'openlinks-chat-launch'});
+  const result=await h.command('GET');assert.equal(result.state.running,false);assert.ok(Object.values(result.state.bindings).every(binding=>binding.status==='ready'&&!binding.managed.pending));
+  assert.equal(h.fetches,0);assert.ok(h.calls.every(call=>call.type==='DIALOGS_SNAPSHOT'));assert.equal(h.tabCreates.length,3);
+});
+test('managed loading has a fixed deadline and explicit retry reuses the tab without navigation',async()=>{
+  const h=harness();await h.command('OPEN_CHATS',{platform:'1688'});h.advanceTime(120001);
+  await h.monitor.onAlarm({name:'openlinks-chat-launch'});const failed=(await h.command('GET')).state.bindings['1688'];
+  assert.equal(failed.status,'error');assert.equal(failed.managed.pending,false);assert.match(failed.detail,/2 минуты/);
+  const calls=h.calls.length;h.advanceTime(30000);await h.monitor.onAlarm({name:'openlinks-chat-launch'});assert.equal(h.calls.length,calls);
+  const retry=await h.command('OPEN_CHATS',{platform:'1688'});assert.equal(h.tabCreates.length,1);assert.equal(retry.state.bindings['1688'].tabId,failed.tabId);assert.equal(retry.state.bindings['1688'].status,'loading');
+  assert.equal(retry.state.bindings['1688'].managed.pending,true);assert.ok(h.tabUpdates.every(update=>!('url'in update)&&!('active'in update)));
+});
+test('missing content scripts time out with actionable state instead of endless loading',async()=>{
+  const h=harness();await h.command('OPEN_CHATS',{platform:'alibaba'});
+  const tab=h.tabs.get(h.storage[DIALOGS_KEY].bindings.alibaba.tabId);tab.status='complete';
+  await h.monitor.onTabUpdated(tab.id,{status:'complete'},tab);assert.equal(h.storage[DIALOGS_KEY].bindings.alibaba.status,'loading');
+  h.advanceTime(120001);await h.monitor.onAlarm({name:'openlinks-chat-launch'});
+  assert.equal(h.storage[DIALOGS_KEY].bindings.alibaba.status,'error');assert.match(h.storage[DIALOGS_KEY].bindings.alibaba.detail,/вход в аккаунт/);
+});
+test('a pending initial URL is retained until the new tab navigates to the known center',async()=>{
+  const h=harness(),create=h.api.tabs.create;h.api.tabs.create=async options=>{const tab=await create(options);Object.assign(h.tabs.get(tab.id),{url:'',pendingUrl:options.url});return {...tab,url:'',pendingUrl:options.url};};
+  const result=await h.command('OPEN_CHATS',{platform:'1688'});assert.equal(result.state.bindings['1688'].status,'loading');assert.equal(result.state.bindings['1688'].tabId,4);
+  const tab=managedReady(h,'1688');await h.monitor.onTabUpdated(tab.id,{status:'complete'},tab);assert.equal(h.storage[DIALOGS_KEY].bindings['1688'].status,'ready');
+});
+test('login and captcha stop launch retries, and completion after login resumes readiness without replacing the tab',async()=>{
+  for(const status of ['login','captcha']) {
+    const h=harness();await h.command('OPEN_CHATS',{platform:'alibaba'});const tab=managedReady(h,'alibaba',{status});
+    await h.monitor.onTabUpdated(tab.id,{status:'complete'},tab);
+    assert.equal(h.storage[DIALOGS_KEY].bindings.alibaba.status,status);assert.equal(h.storage[DIALOGS_KEY].bindings.alibaba.managed.pending,false);
+    const calls=h.calls.length;await h.monitor.onAlarm({name:'openlinks-chat-launch'});assert.equal(h.calls.length,calls);
+    managedReady(h,'alibaba');await h.monitor.onTabUpdated(tab.id,{status:'complete'},tab);assert.equal(h.storage[DIALOGS_KEY].bindings.alibaba.status,'ready');assert.equal(h.tabCreates.length,1);
+  }
+});
+
+
+test('partial create failure preserves successful platforms and their status through storage normalization',async()=>{
+  const h=harness(),create=h.api.tabs.create;h.api.tabs.create=async options=>{if(options.url===CHAT_CENTERS.alibaba)throw new Error('failed');return create(options);};
+  const result=await h.command('OPEN_CHATS');assert.equal(result.ok,true);assert.deepEqual(result.launchErrors.map(error=>error.platform),['alibaba']);
+  assert.equal(result.state.bindings.alibaba.tabId,null);assert.equal(result.state.bindings.alibaba.status,'error');assert.ok(result.state.bindings['1688'].managed);assert.ok(result.state.bindings.mic.managed);
+  assert.equal((await h.command('GET')).state.bindings.alibaba.status,'error');assert.equal(h.tabCreates.length,2);
+});
+test('a closed or foreign-navigated managed tab is never recreated by background events',async()=>{
+  for(const mode of ['closed','foreign','storefront','moved']) {
+    const h=harness();await h.command('OPEN_CHATS',{platform:'1688'});const old=h.storage[DIALOGS_KEY].bindings['1688'].tabId;
+    if(mode==='closed'){h.tabs.delete(old);await h.monitor.onTabRemoved(old);}
+    else {const tab=h.tabs.get(old);tab.status='complete';if(mode==='moved')tab.windowId=30;else tab.url=mode==='foreign'?'https://personal.example/':'https://some-store.1688.com/';await h.monitor.onTabUpdated(old,{status:'complete',url:tab.url},tab);}
+    await h.monitor.onAlarm({name:'openlinks-chat-launch'});await h.monitor.onAlarm({name:'openlinks-dialogs'});assert.equal(h.tabCreates.length,1);
+    await h.command('OPEN_CHATS',{platform:'1688'});assert.equal(h.tabCreates.length,2);assert.notEqual(h.storage[DIALOGS_KEY].bindings['1688'].tabId,old);
+    if(mode!=='closed')assert.ok(h.tabs.has(old));
+  }
+});
+test('session ownership loss or browser startup never adopts a reused tab ID or recreates a chat automatically',async()=>{
+  const h=harness();await h.command('OPEN_CHATS',{platform:'1688'});const old=h.storage[DIALOGS_KEY].bindings['1688'].tabId;
+  h.session.openlinksManagedChats={};const tab=managedReady(h,'1688');await h.monitor.onTabUpdated(tab.id,{status:'complete'},tab);
+  assert.equal(h.storage[DIALOGS_KEY].bindings['1688'].status,'error');assert.equal(h.calls.length,0);
+  await h.monitor.onStartup();await h.monitor.onAlarm({name:'openlinks-chat-launch'});assert.equal(h.tabCreates.length,1);assert.equal(h.storage[DIALOGS_KEY].bindings['1688'].tabId,null);
+  await h.command('OPEN_CHATS',{platform:'1688'});assert.equal(h.tabCreates.length,2);assert.notEqual(h.storage[DIALOGS_KEY].bindings['1688'].tabId,old);assert.ok(h.tabs.has(old));
+});
+test('the initiating window must still exist and caller-supplied URLs never control a center',async()=>{
+  const h=harness();assert.equal((await h.command('OPEN_CHATS',{platform:'other'})).ok,false);
+  h.windows.delete(20);assert.equal((await h.command('OPEN_CHATS',{}, {...ui,tab:{windowId:99}})).ok,false);assert.equal(h.tabCreates.length,0);h.windows.set(20,{id:20,type:'normal'});
+  await h.command('OPEN_CHATS',{platform:'1688',url:'https://foreign.example/'});assert.equal(h.tabCreates[0].url,CHAT_CENTERS['1688']);
+  const noSession=harness();delete noSession.api.storage.session;assert.equal((await noSession.command('OPEN_CHATS')).ok,false);assert.equal(noSession.tabCreates.length,0);
+});
+test('only explicit show activates the managed tab and its window; unrelated tabs cannot be shown',async()=>{
+  const h=harness();await h.command('BIND_TAB',{platform:'1688',tabId:1});assert.equal((await h.command('SHOW_CHAT',{platform:'1688'})).ok,false);
+  await h.command('OPEN_CHATS',{platform:'1688'}, {...ui,tab:{windowId:30}});const id=h.storage[DIALOGS_KEY].bindings['1688'].tabId;
+  assert.equal((await h.command('SHOW_CHAT',{platform:'1688'})).ok,true);assert.deepEqual(h.tabUpdates.at(-1),{id,active:true});assert.deepEqual(h.windowUpdates,[{id:30,focused:true}]);
+  h.tabs.get(id).url='https://store.1688.com/';assert.equal((await h.command('SHOW_CHAT',{platform:'1688'})).ok,false);
+});
+test('replacing or disconnecting a test-preview tab is blocked without erasing its text or ownership',async()=>{
+  const h=harness();await h.command('BIND_TAB',{platform:'1688',tabId:1});
+  h.storage.openlinksClaudeFolder={test:{enabled:true,sessionId:crypto.randomUUID(),cycleId:crypto.randomUUID(),phase:'completed',key,text:'Unsent preview',source:{tabId:1,frameId:0,documentToken:'doc-1',sourceUrl:urls['1688']},cleanupToken:{operation:'test',platform:'1688',id:'supplier-1',text:'Unsent preview'}}};
+  const result=await h.command('OPEN_CHATS');assert.deepEqual(result.launchErrors.map(error=>error.platform),['1688']);assert.equal(result.state.bindings['1688'].tabId,1);assert.equal(h.tabCreates.length,2);
+  assert.equal(h.storage.openlinksClaudeFolder.test.text,'Unsent preview');assert.equal(h.storage.openlinksClaudeFolder.test.source.tabId,1);assert.equal(h.storage.openlinksClaudeFolder.test.phase,'completed');
+  assert.equal((await h.command('UNBIND_TAB',{platform:'1688'})).ok,false);assert.equal(h.storage[DIALOGS_KEY].bindings['1688'].tabId,1);
+});
+test('repeated opening of a managed completed preview only reads the existing tab without cancelling its cycle',async()=>{
+  const h=harness();await h.command('OPEN_CHATS',{platform:'1688'});const tab=managedReady(h,'1688');
+  h.storage.openlinksClaudeFolder={test:{enabled:true,sessionId:crypto.randomUUID(),cycleId:crypto.randomUUID(),phase:'completed',key,text:'Unsent preview',source:{tabId:tab.id,frameId:0,documentToken:'doc-1',sourceUrl:tab.url},cleanupToken:{operation:'test',platform:'1688',id:'supplier-1',text:'Unsent preview'}}};
+  const result=await h.command('OPEN_CHATS',{platform:'1688'});assert.deepEqual(result.launchErrors,[]);assert.equal(h.tabCreates.length,1);assert.equal(result.folder.test.phase,'completed');assert.equal(h.storage.openlinksClaudeFolder.test.text,'Unsent preview');
+});
+test('the popup extension UI opens centers in the last focused normal window without activating it',async()=>{
+  const h=harness();h.windows.set(50,{id:50,type:'popup'});
+  const result=await h.command('OPEN_CHATS',{platform:'alibaba'}, {...ui,tab:{windowId:50}});
+  assert.equal(result.ok,true);assert.equal(h.tabCreates[0].windowId,20);assert.deepEqual(h.windowUpdates,[]);
+});
+test('a later managed page reload retries readiness, but repeated load events do not extend its deadline',async()=>{
+  const h=harness();await h.command('OPEN_CHATS',{platform:'mic'});const tab=managedReady(h,'mic');await h.monitor.onTabUpdated(tab.id,{status:'complete'},tab);
+  h.advanceTime(60000);tab.status='loading';await h.monitor.onTabUpdated(tab.id,{status:'loading'},tab);
+  const first=h.storage[DIALOGS_KEY].bindings.mic.managed.deadlineAt;assert.equal(h.storage[DIALOGS_KEY].bindings.mic.managed.pending,true);
+  h.advanceTime(60000);await h.monitor.onTabUpdated(tab.id,{status:'loading'},tab);assert.equal(h.storage[DIALOGS_KEY].bindings.mic.managed.deadlineAt,first);
+  h.advanceTime(60001);await h.monitor.onAlarm({name:'openlinks-chat-launch'});assert.equal(h.storage[DIALOGS_KEY].bindings.mic.status,'error');
+});
+test('lost session ownership never restores auto-discard on a reused ID while replacing its binding',async()=>{
+  const h=harness();await h.command('OPEN_CHATS',{platform:'1688'});const id=h.storage[DIALOGS_KEY].bindings['1688'].tabId;
+  h.session.openlinksManagedChats={};h.tabs.set(id,{id,windowId:20,url:CHAT_CENTERS['1688'],status:'complete',autoDiscardable:false});
+  const before=h.tabUpdates.length;await h.command('OPEN_CHATS',{platform:'1688'});
+  assert.equal(h.tabCreates.length,2);assert.equal(h.tabs.get(id).autoDiscardable,false);assert.ok(h.tabUpdates.slice(before).every(update=>update.id!==id));
+});
+
+test('manual read checks keep pending launches bounded instead of exposing transient unsupported states',async()=>{
+  const h=harness();await h.command('OPEN_CHATS',{platform:'alibaba'});managedReady(h,'alibaba',{status:'unsupported'});
+  assert.equal((await h.command('SCAN',{platform:'alibaba'})).state.bindings.alibaba.status,'loading');
+  h.advanceTime(120001);const result=await h.command('SCAN',{platform:'alibaba'});assert.equal(result.state.bindings.alibaba.status,'error');assert.equal(result.state.bindings.alibaba.managed.pending,false);
+});
+test('test-preview recovery after startup finds a replaced iframe without binding, modifying, or abandoning nonempty drafts',async()=>{
+  for(const variant of ['empty','nonempty','wrong-recipient']) {
+    const {h}=previewHarness({testCleaner:async()=>({status:'blocked',cleared:false})}),host=await testCycleReady(h);await completeTest(h,host);
+    const old=structuredClone(h.storage.openlinksClaudeFolder.test.cleanupToken);await h.monitor.onStartup();
+    const wrapper='https://air.1688.com/reloaded-wrapper';h.tabs.get(1).url=wrapper;h.tabs.get(1).autoDiscardable=true;
+    h.frameLists.set(1,[{frameId:0,parentFrameId:-1,url:wrapper},{frameId:17,parentFrameId:0,url:urls['1688']}]);
+    h.replies.set(1,snapshot('1688',{url:wrapper,status:'unsupported',conversations:[],frames:[{url:urls['1688'],visible:true}]}));
+    const child=snapshot('1688',{documentToken:'new-document'});if(variant==='wrong-recipient')child.conversations[0].id='another-supplier';h.replies.set('1:17',child);
+    const native=h.api.tabs.sendMessage,checks=[],updates=h.tabUpdates.length;
+    h.api.tabs.sendMessage=async(tab,message,options)=>{
+      assert.ok(!['SEND','PREPARE','DIALOGS_CLEAR_PREVIEW'].includes(message.type),'recovery has no mutation authority');
+      if(message.type==='DIALOGS_CHECK_PREVIEW_EMPTY'){checks.push(message);assert.equal(options.frameId,17);assert.equal(message.guard.documentToken,'new-document');assert.equal(message.guard.id,old.id);return {empty:variant==='empty'};}
+      return native(tab,message,options);
+    };
+    const result=await h.command('FOLDER_SETTINGS',{testMode:false});assert.equal(result.ok,variant==='empty');assert.equal(checks.length,variant==='wrong-recipient'?0:1);
+    assert.equal(h.storage[DIALOGS_KEY].bindings['1688'].tabId,null);assert.equal(h.tabUpdates.length,updates);assert.equal(h.tabs.get(1).autoDiscardable,true);assert.equal(h.tabCreates.length,0);
+    if(variant==='empty'){assert.equal(h.storage.openlinksClaudeFolder.test.cleanupToken,null);assert.equal(h.storage.openlinksClaudeFolder.test.enabled,false);}
+    else {assert.deepEqual(h.storage.openlinksClaudeFolder.test.cleanupToken,old);assert.equal(h.storage.openlinksClaudeFolder.test.enabled,true);}
+  }
+});
+
+const micNativeURL='https://webim.made-in-china.com/super-tm/#/synthetic-route?data=synthetic-auth-never-persist&refer=&isLiteTM=false&isSAChat=false';
+function micBootstrapReady(h,{child=true,parentBusy={},childBusy={}}={}) {
+  const tab=h.tabs.get(h.storage[DIALOGS_KEY].bindings.mic.tabId);Object.assign(tab,{url:CHAT_CENTERS.mic,status:'complete'});delete tab.pendingUrl;
+  const busy={hasDraft:false,userEditing:false,recentUserInput:false};
+  h.replies.set(tab.id,snapshot('mic',{url:tab.url,status:'unsupported',busy:{...busy,...parentBusy},conversations:[],frames:child?[{url:urls.mic,visible:true}]:[]}));
+  if(child){h.frameLists.set(tab.id,[{frameId:0,parentFrameId:-1,url:tab.url},{frameId:1,parentFrameId:0,url:urls.mic}]);h.replies.set(`${tab.id}:1`,snapshot('mic',{url:urls.mic,status:'unsupported',busy:{...busy,...childBusy},conversations:[]}));}
+  return tab;
+}
+test('MIC native bootstrap stays in the same inactive tab and never stores its authentication URL',async()=>{
+  const h=harness();await h.command('OPEN_CHATS',{platform:'mic'});const tab=micBootstrapReady(h),captures=[];
+  h.api.scripting={executeScript:async request=>{captures.push(request);return [{frameId:0,result:captures.length===1?{ok:false,status:'loading',reason:'bubble_opened'}:{ok:true,url:micNativeURL}}];}};
+  await h.monitor.onTabUpdated(tab.id,{status:'complete'},tab);assert.equal(h.storage[DIALOGS_KEY].bindings.mic.status,'loading');assert.equal(h.tabUpdates.filter(patch=>patch.url).length,0);
+  await h.monitor.onAlarm({name:'openlinks-chat-launch'});
+  assert.equal(captures.length,2);assert.ok(captures.every(request=>request.world==='MAIN'&&request.func.name==='captureMICChat'&&request.target.tabId===tab.id&&request.target.frameIds.length===1&&request.target.frameIds[0]===0));
+  assert.deepEqual(h.tabUpdates.filter(patch=>patch.url),[{id:tab.id,url:micNativeURL}]);assert.equal(h.tabCreates.length,1);assert.equal(h.tabCreates[0].url,CHAT_CENTERS.mic);assert.equal(h.tabCreates[0].active,false);
+  assert.equal(JSON.stringify(h.storage).includes('synthetic-auth-never-persist'),false);assert.equal(JSON.stringify(h.session).includes('synthetic-auth-never-persist'),false);assert.equal(JSON.stringify(await h.command('GET')).includes('synthetic-auth-never-persist'),false);
+  h.frameLists.delete(tab.id);h.replies.set(tab.id,snapshot('mic',{url:micNativeURL,busy:{hasDraft:false,userEditing:false,recentUserInput:false}}));
+  await h.monitor.onTabUpdated(tab.id,{url:micNativeURL,status:'complete'},h.tabs.get(tab.id));
+  assert.equal(h.storage[DIALOGS_KEY].bindings.mic.status,'ready');assert.equal(h.storage[DIALOGS_KEY].bindings.mic.managed.pending,false);
+  assert.equal(JSON.stringify(h.storage).includes('synthetic-auth-never-persist'),false);assert.deepEqual(h.windowUpdates,[]);assert.equal(h.fetches,0);assert.ok(h.calls.every(call=>call.type==='DIALOGS_SNAPSHOT'));
+});
+test('MIC bootstrap preserves cross-origin lite-frame drafts and pauses for interaction in either frame',async()=>{
+  for(const [frame,flag] of [['parent','hasDraft'],['child','hasDraft'],['child','userEditing'],['child','recentUserInput']]) {
+    const h=harness();await h.command('OPEN_CHATS',{platform:'mic'});const tab=micBootstrapReady(h,{[frame+'Busy']:{[flag]:true}});let captures=0;
+    h.api.scripting={executeScript:async()=>{captures++;return [{frameId:0,result:{ok:true,url:micNativeURL}}];}};
+    await h.monitor.onTabUpdated(tab.id,{status:'complete'},tab);
+    assert.equal(captures,0);assert.equal(h.storage[DIALOGS_KEY].bindings.mic.status,'paused');assert.equal(h.storage[DIALOGS_KEY].bindings.mic.managed.pending,false);assert.equal(h.tabUpdates.some(patch=>patch.url),false);
+  }
+});
+test('MIC bootstrap waits for every visible child reader instead of assuming an unreadable editor is empty',async()=>{
+  const h=harness();await h.command('OPEN_CHATS',{platform:'mic'});const tab=micBootstrapReady(h);let captures=0;
+  h.replies.delete(`${tab.id}:1`);h.api.tabs.sendMessage=async(id,message,options)=>options.frameId===1?null:h.replies.get(id);
+  h.api.scripting={executeScript:async()=>{captures++;return [{frameId:0,result:{ok:true,url:micNativeURL}}];}};
+  await h.monitor.onTabUpdated(tab.id,{status:'complete'},tab);assert.equal(captures,0);assert.equal(h.storage[DIALOGS_KEY].bindings.mic.status,'loading');
+  h.advanceTime(120001);await h.monitor.onAlarm({name:'openlinks-chat-launch'});assert.equal(h.storage[DIALOGS_KEY].bindings.mic.status,'error');assert.equal(captures,0);
+});
+test('MIC bootstrap rejects foreign, login, lite, malformed and ambiguous capture results without navigation',async()=>{
+  for(const result of [{ok:true,url:'https://evil.example/#/x?data=secret'}, {ok:true,url:urls.mic+'#/login'},{ok:true,url:micNativeURL.replace('isLiteTM=false','isLiteTM=true')},{ok:true,url:micNativeURL+'&extra=1'},{ok:false,status:'blocked',detail:micNativeURL},null]) {
+    const h=harness();await h.command('OPEN_CHATS',{platform:'mic'});const tab=micBootstrapReady(h);h.api.scripting={executeScript:async()=>[{frameId:0,result}]};
+    await h.monitor.onTabUpdated(tab.id,{status:'complete'},tab);
+    assert.equal(h.storage[DIALOGS_KEY].bindings.mic.managed.pending,false);assert.equal(h.tabUpdates.some(patch=>patch.url),false);assert.equal(JSON.stringify(h.storage).includes('synthetic-auth-never-persist'),false);
+  }
+});
+test('MIC bootstrap rechecks the owned tab and all editor states after capturing the route',async()=>{
+  for(const change of ['draft','navigation','document']) {
+    const h=harness();await h.command('OPEN_CHATS',{platform:'mic'});const tab=micBootstrapReady(h);
+    h.api.scripting={executeScript:async()=>{
+      if(change==='navigation')h.tabs.get(tab.id).url='https://personal.example/';
+      else if(change==='draft')h.replies.get(`${tab.id}:1`).busy.hasDraft=true;
+      else h.replies.get(tab.id).documentToken='reloaded-document';
+      return [{frameId:0,result:{ok:true,url:micNativeURL}}];
+    }};
+    await h.monitor.onTabUpdated(tab.id,{status:'complete'},tab);
+    assert.equal(h.storage[DIALOGS_KEY].bindings.mic.managed.pending,false);assert.equal(h.tabUpdates.some(patch=>patch.url),false);assert.equal(JSON.stringify(h.storage).includes('synthetic-auth-never-persist'),false);
+  }
+});
+test('a readable MIC lite list cannot bypass native full-inbox bootstrap or enable replies',async()=>{
+  const h=harness();await h.command('OPEN_CHATS',{platform:'mic'});const tab=micBootstrapReady(h);h.replies.get(`${tab.id}:1`).status='ready';h.replies.get(`${tab.id}:1`).conversations=snapshot('mic').conversations;
+  h.api.scripting={executeScript:async()=>[{frameId:0,result:{ok:false,status:'loading'}}]};
+  await h.monitor.onTabUpdated(tab.id,{status:'complete'},tab);assert.equal(h.storage[DIALOGS_KEY].bindings.mic.status,'loading');assert.equal(Object.keys(h.storage[DIALOGS_KEY].conversations).length,0);assert.equal(h.fetches,0);
+});
+test('MIC bootstrap matches one sanitized child URL but blocks ambiguous same-path frames',async()=>{
+  for(const ambiguous of [false,true]) {
+    const h=harness();await h.command('OPEN_CHATS',{platform:'mic'});const tab=micBootstrapReady(h);let captures=0;
+    const childURL=urls.mic+'#/synthetic-lite?data=synthetic-child';
+    h.frameLists.set(tab.id,[{frameId:0,parentFrameId:-1,url:tab.url},{frameId:1,parentFrameId:0,url:childURL},...(ambiguous?[{frameId:2,parentFrameId:0,url:urls.mic+'#/other-lite'}]:[])]);
+    h.replies.set(`${tab.id}:1`,snapshot('mic',{url:childURL,status:'unsupported',busy:{hasDraft:false,userEditing:false,recentUserInput:false},conversations:[]}));
+    if(ambiguous)h.replies.set(`${tab.id}:2`,snapshot('mic',{url:urls.mic+'#/other-lite',status:'unsupported',busy:{hasDraft:false,userEditing:false,recentUserInput:false},conversations:[]}));
+    h.api.scripting={executeScript:async()=>{captures++;return [{frameId:0,result:{ok:false,status:'loading'}}];}};
+    await h.monitor.onTabUpdated(tab.id,{status:'complete'},tab);assert.equal(captures,ambiguous?0:1);assert.equal(h.tabUpdates.some(patch=>patch.url),false);
+  }
+});
+
+function hiddenMIC(h,{busy={},hidden=true,documentToken=crypto.randomUUID()}={}) {
+  const tab=h.tabs.get(h.storage[DIALOGS_KEY].bindings.mic.tabId);Object.assign(tab,{url:micNativeURL,status:'complete'});delete tab.pendingUrl;h.frameLists.delete(tab.id);
+  h.replies.set(tab.id,snapshot('mic',{url:tab.url,status:'unsupported',documentToken,busy:{hasDraft:false,userEditing:false,recentUserInput:false,...busy},conversations:[]}));
+  h.api.scripting={executeScript:async request=>{assert.equal(request.world,'ISOLATED');assert.equal(request.target.tabId,tab.id);return [{frameId:0,result:hidden}];}};
+  return tab;
+}
+test('a fresh hidden MIC document initializes once without changing focus and is accepted only after debugger cleanup',async()=>{
+  const steps=[];let h;
+  h=harness({micInitializationWait:async()=>{steps.push('wait');h.replies.get(tab.id).status='ready';h.replies.get(tab.id).conversations=snapshot('mic').conversations;}});
+  await h.command('OPEN_CHATS',{platform:'mic'});const tab=hiddenMIC(h),documentToken=h.replies.get(tab.id).documentToken;let emulating=false;
+  const send=h.api.tabs.sendMessage;h.api.tabs.sendMessage=async(...args)=>{assert.equal(emulating,false,'reader never accepts evidence while focus is emulated');return send(...args);};
+  h.api.debugger={attach:async target=>{assert.equal(target.tabId,tab.id);assert.equal(h.storage[DIALOGS_KEY].bindings.mic.managed.micInitDocumentToken,documentToken);steps.push('attach');},sendCommand:async(target,method,params)=>{assert.equal(target.tabId,tab.id);assert.equal(method,'Emulation.setFocusEmulationEnabled');emulating=params.enabled;steps.push(params.enabled?'enable':'disable');},detach:async target=>{assert.equal(target.tabId,tab.id);assert.equal(emulating,false);steps.push('detach');}};
+  await h.monitor.onTabUpdated(tab.id,{status:'complete'},tab);
+  assert.deepEqual(steps,['attach','enable','wait','disable','detach']);assert.equal(h.storage[DIALOGS_KEY].bindings.mic.status,'ready');assert.equal(h.storage[DIALOGS_KEY].bindings.mic.managed.pending,false);
+  await h.command('OPEN_CHATS',{platform:'mic'});assert.equal(steps.length,5);assert.deepEqual(h.windowUpdates,[]);assert.ok(h.tabUpdates.every(patch=>!('active'in patch)&&!('url'in patch)));assert.equal(h.tabCreates.length,1);assert.equal(h.fetches,0);
+});
+test('hidden MIC initialization survives worker suspension as a one-shot marker and resets only for a new document',async()=>{
+  const h=harness();await h.command('OPEN_CHATS',{platform:'mic'});const tab=hiddenMIC(h);let attachments=0;
+  h.api.debugger={attach:async()=>{attachments++;},sendCommand:async()=>{},detach:async()=>{}};
+  await h.monitor.onTabUpdated(tab.id,{status:'complete'},tab);assert.equal(attachments,1);
+  await h.monitor.onAlarm({name:'openlinks-chat-launch'});assert.equal(attachments,1);
+  const recreated=createDialogMonitor({api:h.api,now:()=>h.time,micInitializationWait:async()=>{}});await recreated.handle({type:'DIALOGS_OPEN_CHATS',platform:'mic'},ui);assert.equal(attachments,1);
+  h.replies.get(tab.id).documentToken=crypto.randomUUID();await recreated.onTabUpdated(tab.id,{status:'complete'},tab);assert.equal(attachments,2);
+});
+test('hidden MIC initialization always cleans up its own debugger after failure and never detaches someone else',async()=>{
+  for(const failure of ['attach','enable','wait','disable','detach']) {
+    const steps=[],h=harness({micInitializationWait:async()=>{steps.push('wait');if(failure==='wait')throw new Error('failed');}});
+    await h.command('OPEN_CHATS',{platform:'mic'});const tab=hiddenMIC(h);
+    h.api.debugger={attach:async()=>{steps.push('attach');if(failure==='attach')throw new Error('already attached');},sendCommand:async(target,method,params)=>{const stage=params.enabled?'enable':'disable';steps.push(stage);if(failure===stage)throw new Error('failed');},detach:async()=>{steps.push('detach');if(failure==='detach')throw new Error('failed');}};
+    await h.monitor.onTabUpdated(tab.id,{status:'complete'},tab);
+    if(failure==='attach')assert.deepEqual(steps,['attach']);else assert.deepEqual(steps.slice(-2),['disable','detach']);
+    assert.equal(h.storage[DIALOGS_KEY].bindings.mic.status,'error');assert.equal(h.storage[DIALOGS_KEY].bindings.mic.managed.pending,false);
+    await h.command('OPEN_CHATS',{platform:'mic'});assert.equal(steps.filter(step=>step==='attach').length,1,'failed document cannot repeatedly commandeer debugger');
+  }
+});
+test('MIC background initialization refuses visible pages, editors, unreadable state and foreign tabs',async()=>{
+  for(const variant of ['visible','draft','editing','recent','unknown','foreign']) {
+    const h=harness();await h.command('OPEN_CHATS',{platform:'mic'});
+    const busy=variant==='draft'?{hasDraft:true}:variant==='editing'?{userEditing:true}:variant==='recent'?{recentUserInput:true}:{};
+    const tab=hiddenMIC(h,{hidden:variant!=='visible',busy});let attachments=0;
+    if(variant==='unknown')delete h.replies.get(tab.id).busy;
+    if(variant==='foreign')h.tabs.get(tab.id).url='https://personal.example/';
+    h.api.debugger={attach:async()=>{attachments++;},sendCommand:async()=>{},detach:async()=>{}};
+    await h.monitor.onTabUpdated(tab.id,{status:'complete'},h.tabs.get(tab.id));assert.equal(attachments,0);assert.equal(h.tabUpdates.some(patch=>'active'in patch),false);assert.deepEqual(h.windowUpdates,[]);
+  }
+});
+test('MIC initialization restores debugger before rejecting a changed document or newly edited draft',async()=>{
+  for(const variant of ['document','draft','navigation']) {
+    const steps=[];let h;
+    h=harness({micInitializationWait:async()=>{steps.push('wait');if(variant==='document')h.replies.get(tab.id).documentToken=crypto.randomUUID();else if(variant==='draft')h.replies.get(tab.id).busy.hasDraft=true;else h.tabs.get(tab.id).url='https://personal.example/';}});
+    await h.command('OPEN_CHATS',{platform:'mic'});const tab=hiddenMIC(h);
+    h.api.debugger={attach:async()=>steps.push('attach'),sendCommand:async(target,method,params)=>steps.push(params.enabled?'enable':'disable'),detach:async()=>steps.push('detach')};
+    await h.monitor.onTabUpdated(tab.id,{status:'complete'},tab);
+    assert.deepEqual(steps,['attach','enable','wait','disable','detach']);assert.notEqual(h.storage[DIALOGS_KEY].bindings.mic.status,'ready');assert.equal(h.storage[DIALOGS_KEY].bindings.mic.managed.pending,false);
+  }
+});
+test('MIC navigation during debugger attach skips emulation but still releases only its own attachment',async()=>{
+  const h=harness();await h.command('OPEN_CHATS',{platform:'mic'});const tab=hiddenMIC(h),steps=[];
+  h.api.debugger={attach:async()=>{steps.push('attach');h.tabs.get(tab.id).url='https://personal.example/';},sendCommand:async(target,method,params)=>steps.push(params.enabled?'enable':'disable'),detach:async()=>steps.push('detach')};
+  await h.monitor.onTabUpdated(tab.id,{status:'complete'},tab);assert.deepEqual(steps,['attach','disable','detach']);assert.equal(h.storage[DIALOGS_KEY].bindings.mic.tabId,null);assert.equal(h.storage[DIALOGS_KEY].bindings.mic.status,'unbound');
 });
