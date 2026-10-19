@@ -734,6 +734,53 @@ with sync_playwright() as p:
     assert page.evaluate('document.querySelector(".normal-list-container").scrollTop')==0 and page.evaluate('selectedThreads')==[]
     passed('inbox traversal scrolls only the verified list with one-use tokens, overlaps batches and resets to newest without selecting or closing chats')
 
+    load(OBSERVED_ALIBABA,'https://message.alibaba.com/message/default.htm')
+    page.evaluate('''()=>{const list=document.querySelector('.normal-list-container');list.style.cssText='height:100px;overflow-y:auto';list.firstElementChild.style.height='15000px'}''')
+    effects=page.evaluate('({...readerSideEffects})');previous=snapshot()['listCoverage']['progressToken']
+    for step in range(1,101):
+        source=snapshot();coverage=source['listCoverage'];assert coverage['hasMore'] and coverage['status']=='ready' and coverage['stalledAttempts']==0
+        reply=page.evaluate('(r)=>OpenLinksDialogsReader.advanceList(r)',{'documentToken':source['documentToken'],'listToken':coverage['token']})
+        assert reply['ok'] and reply['advanced'] and reply['steps']==step and reply['stalledAttempts']==0
+        assert reply['progressToken']!=previous;previous=reply['progressToken']
+    assert snapshot()['listCoverage']['hasMore'] and page.evaluate('readerSideEffects')==effects and page.evaluate('selectedThreads')==[]
+    passed('more than 64 legitimate inbox pages remain traversable while real scroll progress continues, without clicking or selecting chats')
+
+    load(OBSERVED_ALIBABA,'https://message.alibaba.com/message/default.htm')
+    page.evaluate('''()=>{const list=document.querySelector('.normal-list-container');list.style.cssText='height:100px;overflow-y:auto';list.firstElementChild.style.height='500px';Object.defineProperty(list,'scrollTop',{configurable:true,get:()=>0,set:()=>{}})}''')
+    previous=snapshot()['listCoverage']['progressToken']
+    for attempt in range(1,9):
+        source=snapshot();coverage=source['listCoverage'];assert coverage['hasMore'] and coverage['progressToken']==previous
+        reply=page.evaluate('(r)=>OpenLinksDialogsReader.advanceList(r)',{'documentToken':source['documentToken'],'listToken':coverage['token']})
+        assert reply['ok'] and not reply['advanced'] and reply['stalledAttempts']==attempt and reply['progressToken']==previous
+    source=snapshot();coverage=source['listCoverage'];assert not coverage['hasMore'] and coverage['status']=='limited' and coverage['stalledAttempts']==8
+    assert not page.evaluate('(r)=>OpenLinksDialogsReader.advanceList(r)',{'documentToken':source['documentToken'],'listToken':coverage['token']})['ok']
+    page.evaluate('''()=>{const row=document.querySelector('.contact-item-container');row.setAttribute('data-cid','910000099-910000009#11011@icbu')}''')
+    source=snapshot();coverage=source['listCoverage'];assert coverage['hasMore'] and coverage['status']=='ready' and coverage['stalledAttempts']==0 and coverage['progressToken']!=previous
+    reply=page.evaluate('(r)=>OpenLinksDialogsReader.advanceList(r)',{'documentToken':source['documentToken'],'listToken':coverage['token']})
+    assert reply['stalledAttempts']==1 and not reply['advanced']
+    page.evaluate("delete document.querySelector('.normal-list-container').scrollTop")
+    source=snapshot();reply=page.evaluate('(r)=>OpenLinksDialogsReader.advanceList(r)',{'documentToken':source['documentToken'],'listToken':source['listCoverage']['token']})
+    assert reply['advanced'] and reply['stalledAttempts']==0
+    passed('eight identical inbox attempts stop; fresh virtual rows or actual scroll movement reset the stall guard, while fresh action tokens alone do not')
+
+    load(OBSERVED_ALIBABA,'https://message.alibaba.com/message/default.htm')
+    page.evaluate('''()=>{
+      const list=document.querySelector('.normal-list-container'),template=list.firstElementChild.cloneNode(true);list.replaceChildren();list.style.cssText='height:120px;overflow-y:auto';
+      for(let index=0;index<250;index++){
+        const row=template.cloneNode(true);row.setAttribute('data-cid',`${930000000+index}-910000009#11011@icbu`);row.style.cssText='height:30px;min-height:30px;overflow:hidden';row.classList.toggle('selected',index===0);list.append(row);
+      }
+    }''')
+    effects=page.evaluate('({...readerSideEffects})');first=snapshot();assert len(first['conversations'])==200
+    assert not any('930000220-' in row['id'] for row in first['conversations'])
+    page.evaluate('''()=>{const list=document.querySelector('.normal-list-container');list.scrollTop=list.children[220].getBoundingClientRect().top-list.getBoundingClientRect().top}''')
+    later=snapshot();ids=[row['id'] for row in later['conversations']]
+    assert len(ids)<=200 and any('930000220-' in id for id in ids) and any('930000249-' in id for id in ids)
+    assert any('930000000-' in row['id'] and row['active'] for row in later['conversations'])
+    assert page.evaluate('readerSideEffects')==effects and page.evaluate('selectedThreads')==[]
+    page.evaluate("document.querySelector('.buyer-conversation-list').style.transform='translateY(2000px)'")
+    clipped=snapshot()['listCoverage'];assert clipped['status']=='limited' and clipped['windowLimited'] and not clipped['hasMore'] and not clipped['complete']
+    passed('a nonvirtualized native inbox beyond 200 rows exposes the current viewport window after scrolling while retaining the active conversation and per-snapshot bound')
+
     for text,blocked in [('Added your WeChat wx_buyer-12.',True),('Added ＷＸ＿ＢＵＹＥＲ－１２.',True),('Added wx_\u200bbuyer-12.',True),('Added wx_buyer-123.',False),('Added other_wx_buyer-12.',False)]:
         load();page.evaluate('(text)=>document.querySelectorAll("[data-message-text]")[1].textContent=text',text)
         current=active();expected={'platform':'1688','sourceUrl':page.url,'documentToken':snapshot()['documentToken'],'id':current['id'],'replyFingerprint':current['replyFingerprint'],'buyerWechat':'wx_buyer-12'}

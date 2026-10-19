@@ -133,3 +133,9 @@ test('traversal visits cover more than the transcript cache and preserve the mos
   assert.ok(visits[conversationKey('alibaba','visited-200')]);
   assert.equal(Object.keys(normalizeDialogs(restored,now).workflow.visits).length,2000);
 });
+
+test('ordered sweep progress and bounded factual chat results survive normalization without URL leakage',()=>{
+  const state=stateWithMemory();state.workflow={...state.workflow,orderVersion:1,sweepId:8,cursor:1,platformSince:now,list:{alibaba:{sweepId:8,jobsChecked:true,progressToken:'opaque-progress',stalls:2,hasPagination:true,needsStart:false}},visits:{[key]:{at:now,sweepId:8,preview:'p',status:'waiting_supplier',detail:'latest check',title:'Supplier',url:'https://air.1688.com/chat',fingerprint:'new-context',lastResult:{status:'test_completed',at:now-1,fingerprint:'old-context',detail:'Simulated, not sent'}}}};
+  const result=normalizeDialogs(state,now).workflow;assert.equal(result.orderVersion,1);assert.equal(result.sweepId,8);assert.equal(result.cursor,1);assert.equal(result.platformSince,now);assert.equal(result.list.alibaba.jobsChecked,true);assert.equal(result.list.alibaba.stalls,2);assert.equal(result.visits[key].lastResult.status,'test_completed');assert.equal(result.visits[key].lastResult.fingerprint,'old-context');assert.equal(result.visits[key].title,'Supplier');
+  state.workflow.visits[key].url='https://malicious.example/private';assert.equal(normalizeDialogs(state,now).workflow.visits[key].url,'');
+});

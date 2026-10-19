@@ -25,7 +25,7 @@
   const firstBuyerProofs=new Map();
   const latestMessageTimes=new Map();
   const HISTORY_LOAD_LIMIT=8;
-  let inboxTraversal={token:'',signature:'',steps:0,scroller:null};
+  let inboxTraversal={token:'',signature:'',progressSignature:'',progressToken:'',steps:0,stalledAttempts:0,scroller:null};
   const LIMIT = {conversations: 200, messages: 500, text: 12000, nodes: 3000};
   const HISTORY = '[data-message-history],[data-chat-history],[data-message-list],[role="log"],.message-list,.messages-list,.chat-messages,.message-history,.chat-history,.buyer-messenger-container .message-box .im-message-flow .scroll-box,.conversation-area .window-center-messages-main > .msg-list';
   const ROOT = '[data-dialog-root],[data-chat-root],[data-conversation-root],.chat-panel,.chat-window,.conversation-panel,.message-panel,.ww_box,.buyer-messenger-container .message-box,.conversation-area .conversation-window,.conversation-area';
@@ -495,10 +495,31 @@
   function listCoverage() {
     const rows=select(document,INBOX),scroller=inboxScroller();
     if(!scroller)return {token:'',hasMore:false,status:'unsupported',renderedRows:rows.length,complete:false};
-    const signature=JSON.stringify([rows.map(row=>identity(row)),scroller.scrollTop,scroller.scrollHeight,scroller.clientHeight]);
+    const signature=JSON.stringify([rows.map(row=>identity(row)),Math.round(scroller.scrollTop),scroller.scrollHeight,scroller.clientHeight]);
+    // A consumed action token is not list progress. Keep a separate token for
+    // actual row/geometry changes, including delayed virtual-list rendering.
+    // Successful traversal has no page-count ceiling; only repeated stalls do.
+    if(inboxTraversal.progressSignature!==signature)Object.assign(inboxTraversal,{progressSignature:signature,progressToken:crypto.randomUUID(),stalledAttempts:0});
     if(inboxTraversal.signature!==signature||inboxTraversal.scroller!==scroller)inboxTraversal={...inboxTraversal,token:crypto.randomUUID(),signature,scroller};
-    const hasMore=scroller.scrollHeight-scroller.clientHeight-scroller.scrollTop>3&&inboxTraversal.steps<64;
-    return {token:inboxTraversal.token,hasMore,status:inboxTraversal.steps>=64?'limited':hasMore?'ready':'end_visible',renderedRows:rows.length,complete:false};
+    const limited=inboxTraversal.stalledAttempts>=8,hasMore=scroller.scrollHeight-scroller.clientHeight-scroller.scrollTop>3&&!limited;
+    return {token:inboxTraversal.token,progressToken:inboxTraversal.progressToken,stalledAttempts:inboxTraversal.stalledAttempts,hasMore,status:limited?'limited':hasMore?'ready':'end_visible',renderedRows:rows.length,complete:false};
+  }
+  function inboxSnapshotRows() {
+    const items=select(document,ITEM);
+    if(items.length<=LIMIT.conversations)return {rows:items,limited:false};
+    const fallback=()=>({rows:items.slice(0,LIMIT.conversations),limited:true});
+    if(!items.every(item=>item.matches(INBOX)))return fallback();
+    const scroller=inboxScroller();if(!scroller)return fallback();
+    const bounds=scroller.getBoundingClientRect(),top=Math.max(0,bounds.top),bottom=Math.min(innerHeight,bounds.bottom);
+    const start=items.findIndex(item=>{
+      if(!scroller.contains(item))return false;
+      const rect=item.getBoundingClientRect();return rect.bottom>top&&rect.top<bottom;
+    });
+    if(start<0)return fallback();
+    // Some native inboxes retain every DOM row instead of virtualizing. A
+    // fixed first-200 slice would never expose later chats after scrolling.
+    // Keep the active identity, then read a bounded window from this viewport.
+    return {rows:[...new Set([...items.filter(rowActive),...items.slice(start,start+LIMIT.conversations)])].slice(0,LIMIT.conversations),limited:false};
   }
   function advanceList(request) {
     if(request?.documentToken!==DOCUMENT_TOKEN||typeof request.listToken!=='string'||!request.listToken)return {ok:false,detail:'Документ или разрешение прокрутки списка устарели.'};
@@ -506,10 +527,14 @@
     if(Object.values(current.busy).some(Boolean))return {ok:false,busy:true,detail:'Список не прокручивается во время работы пользователя или при открытом черновике.'};
     const coverage=current.listCoverage,scroller=inboxTraversal.scroller,start=request.direction==='start';
     if(request.listToken!==coverage.token||!scroller||inboxScroller()!==scroller||(!start&&!coverage.hasMore))return {ok:false,detail:'Список диалогов изменился либо доступная часть уже просмотрена.'};
+    const before=inboxTraversal.progressSignature;
     inboxTraversal.token='';inboxTraversal.signature='';
-    if(start){scroller.scrollTop=0;inboxTraversal.steps=0;}
+    if(start){scroller.scrollTop=0;inboxTraversal.steps=0;inboxTraversal.stalledAttempts=0;}
     else {scroller.scrollTop=Math.min(scroller.scrollHeight-scroller.clientHeight,scroller.scrollTop+Math.max(1,Math.floor(scroller.clientHeight*0.8)));inboxTraversal.steps++;}
-    return {ok:true,advanced:true,direction:start?'start':'next',steps:inboxTraversal.steps};
+    listCoverage();
+    const advanced=inboxTraversal.progressSignature!==before;
+    if(!start&&!advanced)inboxTraversal.stalledAttempts++;
+    return {ok:true,advanced,direction:start?'start':'next',steps:inboxTraversal.steps,stalledAttempts:inboxTraversal.stalledAttempts,progressToken:inboxTraversal.progressToken,status:inboxTraversal.stalledAttempts>=8?'limited':'ready'};
   }
   function loadHistoryStart(request) {
     if(request?.documentToken!==DOCUMENT_TOKEN||typeof request.conversationId!=='string')return {ok:false,detail:'Документ или диалог изменились.'};
@@ -641,7 +666,8 @@
       const conversations=leafHistories.map(history=>readHistory(history,leafHistories.length)).filter(Boolean).map(workflowEvidence);
       const byId=new Map();
       for(const entry of conversations){if(byId.has(entry.id)){const other=byId.get(entry.id);other.orderReliable=false;other.tailKnown=false;other.readComplete=false;other.historyTailKnown=false;other.historyOrderReliable=false;other.historyStartKnown=false;other.historyComplete=false;other.firstBuyerMessage=null;other.firstBuyerMessageReliable=false;other.latestMessageAtReliable=false;firstBuyerProofs.delete(entry.id);other.detail='Найдено несколько историй одного диалога; нужно уточнить структуру страницы.';}else byId.set(entry.id,entry);}
-      for(const item of select(document,ITEM).slice(0,LIMIT.conversations)){
+      const rowWindow=inboxSnapshotRows();
+      for(const item of rowWindow.rows){
         const id=identity(item);if(!id)continue;
         const previewNode=select(item,'[data-message-preview],.message-preview,.conversation-preview,.last-message'+(platform()==='1688'&&item.matches(INBOX_1688)?',.conversation-secondary-line > .desc':platform()==='alibaba'&&item.matches(INBOX_ALIBABA)?',.msg-wrapper .latest-msg > div':platform()==='mic'&&item.matches(INBOX_MIC)?',.rg-last-msg .last-msg':''))[0];const preview=textOf(previewNode,LIMIT.text,true);
         const existing=byId.get(id);if(existing){if(unread(item)!==null)existing.unread=unread(item);if(!existing.title)existing.title=title(item);if(preview)existing.preview=preview;mergeRowTime(existing,item,preview);continue;}
@@ -649,6 +675,7 @@
         mergeRowTime(entry,item,preview);byId.set(id,entry);
       }
       result.conversations=[...byId.values()].slice(0,LIMIT.conversations);result.listCoverage=listCoverage();
+      if(rowWindow.limited)Object.assign(result.listCoverage,{status:'limited',hasMore:false,windowLimited:true,detail:'В длинном списке не подтверждено текущее окно диалогов. Проверка всего списка не завершена.'});
       const nextReplyEvidence=new Map();
       for(const row of result.conversations.filter(item=>item.active)){
         const signature=JSON.stringify([row.id,row.identityReliable,row.orderReliable,row.tailKnown,row.historyOrderReliable,row.historyTailKnown,row.historyStartKnown,row.historyComplete,row.needsRead,row.messages,row.coverage,row.firstBuyerMessage,row.firstBuyerMessageReliable,row.latestMessageAt,row.latestMessageAtReliable]);

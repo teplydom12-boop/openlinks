@@ -1813,14 +1813,14 @@ test('workflow24h virtual inbox advances with a one-use reader token only after 
   const h=harness();await workflowReady(h);const snap=h.replies.get(1);snap.conversations[0].messages.push({id:'last',direction:'outbound',text:'Waiting.'});snap.listCoverage={token:'list-1',hasMore:true,status:'ready',complete:false};
   await h.command('START');await poll(h);const advance=h.calls.filter(call=>call.type==='DIALOGS_ADVANCE_LIST');assert.equal(advance.length,1);assert.equal(advance[0].listToken,'list-1');assert.equal(advance[0].documentToken,'doc-1');assert.equal(opening(h).length,0);
 });
-test('workflow24h rotates one chat selection across marketplaces without focus changes',async()=>{
+test('workflow24h holds a pending chat on its marketplace before bounded timeout permits the next platform',async()=>{
   const h=harness();await workflowReady(h);
   for(const [index,name] of ['1688','alibaba','mic'].entries()){
     if(index)await h.command('BIND_TAB',{platform:name,tabId:index+1});
     h.replies.get(index+1).conversations=[];h.replies.get(index+1).conversations.push(workflowInactive(h,'target-'+name));
   }
   await h.command('START');for(let index=0;index<3;index++)await poll(h);
-  assert.deepEqual(opening(h).map(row=>row.id),[1,2,3]);assert.equal(h.tabUpdates.some(update=>update.active===true),false);assert.equal(h.windowUpdates.length,0);
+  assert.deepEqual(opening(h).map(row=>row.id),[1]);h.advanceTime(120001);await poll(h);await poll(h);assert.deepEqual(opening(h).map(row=>row.id),[1,2]);assert.equal(h.tabUpdates.some(update=>update.active===true),false);assert.equal(h.windowUpdates.length,0);
 });
 test('workflow24h a pause during submit preserves the paid job UUID and never cancels it',async()=>{
   const h=harness(),host=await workflowReady(h,{folder:true}),entered=deferred(),release=deferred(),native=h.api.runtime.sendNativeMessage;
@@ -1861,11 +1861,12 @@ test('workflow24h selects rendered chats beyond the 100-transcript cache across 
   const h=harness();await workflowReady(h);await h.command('BIND_TAB',{platform:'alibaba',tabId:2});
   for(const [index,name] of ['1688','alibaba'].entries()){
     h.replies.get(index+1).conversations=Array.from({length:150},(_,position)=>workflowInactive(h,`${name}-supplier-${position}`));
-    for(let position=0;position<120;position++)h.storage[DIALOGS_KEY].workflow.visits[conversationKey(name,`${name}-supplier-${position}`)]={at:h.time,preview:'Supplier replied',status:'waiting_supplier',detail:'Already checked this sweep.'};
+    for(let position=0;position<120;position++)h.storage[DIALOGS_KEY].workflow.visits[conversationKey(name,`${name}-supplier-${position}`)]={at:h.time,sweepId:h.storage[DIALOGS_KEY].workflow.sweepId,preview:'Supplier replied',status:'waiting_supplier',detail:'Already checked this sweep.'};
   }
-  await h.command('START');await poll(h);await poll(h);
+  await h.command('START');await poll(h);
+  assert.ok(h.storage[DIALOGS_KEY].conversations[conversationKey('1688','1688-supplier-120')]);h.storage[DIALOGS_KEY].traversal['1688'].pending=null;h.replies.get(1).conversations=[];await poll(h);
   assert.deepEqual(opening(h).map(row=>row.conversationId),['1688-supplier-120','alibaba-supplier-120']);
-  const state=(await h.command('GET')).state;assert.ok(Object.keys(state.conversations).length<=100);assert.ok(state.conversations[conversationKey('1688','1688-supplier-120')]);assert.ok(state.conversations[conversationKey('alibaba','alibaba-supplier-120')]);assert.equal(h.fetches,0);
+  const state=(await h.command('GET')).state;assert.ok(Object.keys(state.conversations).length<=100);assert.ok(state.conversations[conversationKey('alibaba','alibaba-supplier-120')]);assert.equal(h.fetches,0);
 });
 test('workflow24h native history boundary is applied only to the requested exact frame and document',async()=>{
   for(const invalid of ['', 'platform', 'url', 'frame']){
@@ -1964,7 +1965,7 @@ test('switching test selection back to all restores normal traversal without com
 });
 test('running workflow activates its cold managed MIC launch once without focusing the OS window',async()=>{
   const h=harness();await workflowReady(h);await h.command('SETTINGS',{settings:{showWorkingTab:true}});const opened=await h.command('OPEN_CHATS',{platform:'mic'}),id=opened.state.bindings.mic.tabId;h.tabs.get(id).url=CHAT_CENTERS.mic;h.tabs.get(id).status='loading';h.storage[DIALOGS_KEY].workflow.cursor=2;
-  await h.command('START');await poll(h);assert.deepEqual(h.tabUpdates.filter(update=>update.active===true).map(update=>update.id),[id]);assert.equal(h.windowUpdates.length,0);const state=(await h.command('GET')).state;assert.equal(state.bindings.mic.status,'loading');assert.equal(state.workflow.cursor,0);
+  await h.command('START');await poll(h);assert.deepEqual(h.tabUpdates.filter(update=>update.active===true).map(update=>update.id),[id]);assert.equal(h.windowUpdates.length,0);const state=(await h.command('GET')).state;assert.equal(state.bindings.mic.status,'loading');assert.equal(state.workflow.cursor,2);
   await poll(h);assert.equal(h.tabUpdates.filter(update=>update.id===id&&update.active).length,1);
 });
 test('cold managed chat stays inactive for read-only scanning and when working-tab activation is disabled',async()=>{
@@ -1985,5 +1986,117 @@ test('cold launch activation respects busy readers and outreach coordination',as
   for(const blocked of ['busy','coordination']){
     const h=harness({getWorkCoordination:async()=>({enabled:blocked==='coordination',allowDialogs:false,phase:'outreach',detail:'Primary queue owns the turn.'})});await workflowReady(h);await h.command('SETTINGS',{settings:{showWorkingTab:true}});const opened=await h.command('OPEN_CHATS',{platform:'mic'}),id=opened.state.bindings.mic.tabId;h.tabs.get(id).url=CHAT_CENTERS.mic;h.tabs.get(id).status='complete';h.replies.set(id,snapshot('mic',{url:CHAT_CENTERS.mic,status:'loading',conversations:[],busy:{focusedEditor:true}}));h.storage[DIALOGS_KEY].workflow.cursor=2;
     await h.command('START');await poll(h);assert.equal(h.tabUpdates.some(update=>update.active),false);assert.equal(h.windowUpdates.length,0);
+  }
+});
+
+function completeSelectedRead(h) {
+  const template=structuredClone(h.replies.get(1).conversations[0]);
+  h.openAction=async(message,tabId)=>{
+    const rows=h.replies.get(tabId).conversations;for(const row of rows)row.active=false;
+    const target=rows.find(row=>row.id===message.conversationId),id=target.id,title=target.title,preview=target.preview;
+    Object.assign(target,structuredClone(template),{id,title,preview,active:true});
+    target.messages.push({id:'buyer-last-'+id,direction:'outbound',text:'Waiting for your reply.'});
+    return {ok:true,openedId:id};
+  };
+}
+test('sticky sweep completes every available 1688 chat before Alibaba and MIC even after sixty seconds',async()=>{
+  const h=harness();await workflowReady(h);await bindWorkflowPlatforms(h);completeSelectedRead(h);
+  for(const [index,name] of ['1688','alibaba','mic'].entries())h.replies.get(index+1).conversations=[workflowInactive(h,name+'-a'),...(index<2?[workflowInactive(h,name+'-b')]:[])];
+  await h.command('START');for(let i=0;i<8&&opening(h).length<5;i++){await poll(h);h.advanceTime(70000);}
+  assert.deepEqual(opening(h).map(call=>call.conversationId),['1688-a','1688-b','alibaba-a','alibaba-b','mic-a']);
+  assert.equal(h.windowUpdates.length,0);assert.equal(h.fetches,0);
+});
+test('sticky sweep preserves history, pause and resume on its current marketplace',async()=>{
+  const h=harness();await workflowReady(h);await bindWorkflowPlatforms(h);h.storage[DIALOGS_KEY].workflow.cursor=1;
+  const row=h.replies.get(2).conversations[0];row.firstBuyerMessageReliable=false;delete row.firstBuyerMessage;
+  await h.command('START');await poll(h);assert.equal(h.storage[DIALOGS_KEY].workflow.cursor,1);assert.equal(h.calls.at(-1).id,2);
+  const before=h.storage[DIALOGS_KEY].workflow.sweepId;await h.command('STOP');await h.command('START');await poll(h);
+  assert.equal(h.storage[DIALOGS_KEY].workflow.cursor,1);assert.equal(h.storage[DIALOGS_KEY].workflow.sweepId,before);assert.equal(h.calls.filter(call=>call.type==='DIALOGS_LOAD_HISTORY_START').length,2);
+});
+test('sticky sweep paginates the current platform through more than64 advancing pages before switching',async()=>{
+  const h=harness();await workflowReady(h);await bindWorkflowPlatforms(h);h.replies.get(1).conversations=[];let page=0;
+  h.replies.get(1).listCoverage={token:'page-0',progressToken:'page-0',hasMore:true};h.replies.get(2).conversations=[workflowInactive(h,'ali-next')];
+  const original=h.api.tabs.sendMessage;h.api.tabs.sendMessage=async(id,message,options)=>{
+    if(message.type==='DIALOGS_ADVANCE_LIST'){h.calls.push({id,...message});page++;h.replies.get(1).listCoverage={token:'page-'+page,progressToken:'page-'+page,hasMore:page<66};return {ok:true,advanced:true};}
+    return original(id,message,options);
+  };
+  await h.command('START');for(let i=0;i<66;i++){await poll(h);assert.equal(h.storage[DIALOGS_KEY].workflow.cursor,0);assert.equal(opening(h).length,0);}
+  await poll(h);assert.equal(page,66);assert.deepEqual(opening(h).map(call=>call.conversationId),['ali-next']);
+});
+test('sticky sweep bounds a stalled list and cold loading then proceeds to the next available platform',async()=>{
+  for(const variant of ['list','loading']){
+    const h=harness();await workflowReady(h);await bindWorkflowPlatforms(h);h.replies.get(1).conversations=[];h.replies.get(2).conversations=[workflowInactive(h,'available')];
+    if(variant==='list'){h.replies.get(1).listCoverage={token:'stalled',progressToken:'stalled',hasMore:true};const original=h.api.tabs.sendMessage;h.api.tabs.sendMessage=(id,message,options)=>message.type==='DIALOGS_ADVANCE_LIST'?Promise.resolve({ok:true,advanced:false}):original(id,message,options);}
+    else h.tabs.get(1).status='loading';
+    await h.command('START');await poll(h);assert.equal(opening(h).length,0);
+    if(variant==='loading'){h.advanceTime(120001);await poll(h);}else for(let i=0;i<10&&!opening(h).length;i++)await poll(h);
+    assert.deepEqual(opening(h).map(call=>call.conversationId),['available']);
+  }
+});
+test('sticky sweep polls an old paid result before advancing past its sole active chat',async()=>{
+  const {h,previews}=manualReviewHarness(),host=await workflowReady(h,{folder:true});await bindWorkflowPlatforms(h);await h.command('START');await poll(h);const id=host.first.id;
+  h.advanceTime(600001);host.done('The original paid result.');await poll(h);
+  const current=await h.command('GET');assert.equal(current.folder.review.phase,'prepared');assert.equal(current.folder.jobs[0].id,id);assert.equal(host.jobs.size,1);assert.equal(previews.length,1);assert.equal(current.state.workflow.cursor,0);
+});
+test('sticky sweep holds a ready Alibaba job until all remaining1688 chats are processed without resubmitting',async()=>{
+  const {h,previews}=manualReviewHarness(),host=await workflowReady(h,{folder:true});await bindWorkflowPlatforms(h);await h.command('SCAN',{platform:'alibaba'});
+  const aliKey=conversationKey('alibaba','supplier-1');assert.equal((await h.command('FOLDER_DRAFT',{key:aliKey})).ok,true);const id=host.first.id;host.done('Saved Alibaba result.');
+  completeSelectedRead(h);h.replies.get(1).conversations=[workflowInactive(h,'1688-a'),workflowInactive(h,'1688-b')];await h.command('START');
+  for(let i=0;i<2;i++){const before=h.calls.length;await poll(h);assert.ok(h.calls.slice(before).every(call=>call.id===1));assert.equal(previews.length,0);}
+  await poll(h);assert.deepEqual(opening(h).map(call=>call.conversationId),['1688-a','1688-b']);assert.equal(previews.length,1);assert.equal((await h.command('GET')).folder.review.key,aliKey);assert.equal(host.jobs.size,1);assert.equal(host.first.id,id);
+});
+test('test next retains the current marketplace while explicit all resets to1688',async()=>{
+  const {h}=previewHarness(),host=await workflowReady(h,{folder:true,testMode:true});await bindWorkflowPlatforms(h);h.storage[DIALOGS_KEY].workflow.cursor=1;
+  let current=await h.command('GET');await h.command('TEST_NEXT',testTokens(current));await poll(h);assert.equal(host.first.request.key,conversationKey('alibaba','supplier-1'));host.done();await poll(h);
+  current=await h.command('GET');assert.equal(current.state.workflow.cursor,1);const next=await h.command('TEST_NEXT',testTokens(current));assert.equal(next.state.workflow.cursor,1);
+  const reset=await h.command('TEST_PLATFORM',{...testTokens(next),platform:'all'});assert.equal(reset.state.workflow.cursor,0);assert.ok(reset.state.workflow.sweepId>next.state.workflow.sweepId);
+});
+test('chat results retain exact test and manual outcomes independently of later eligibility checks',async()=>{
+  const {h}=previewHarness(),host=await workflowReady(h,{folder:true,testMode:true});const enabled=await h.command('GET');await h.command('TEST_NEXT',testTokens(enabled));await poll(h);host.done();await poll(h);
+  let current=await h.command('GET');assert.equal(current.state.workflow.visits[key].lastResult.status,'test_preview');
+  await h.command('TEST_NEXT',testTokens(current));await poll(h);current=await h.command('GET');assert.equal(current.state.workflow.visits[key].lastResult.status,'test_completed');assert.equal(current.state.workflow.visits[key].title,'Supplier');
+  h.replies.get(1).conversations[0].messages.at(-1).text='I added buyer-wechat';await poll(h);current=await h.command('GET');assert.equal(current.state.workflow.visits[key].lastResult.status,'completed');
+});
+test('history retains names and safe URLs for skipped rendered rows outside the transcript cache',async()=>{
+  const h=harness();await workflowReady(h);h.replies.get(1).conversations=Array.from({length:150},(_,i)=>workflowInactive(h,'old-'+i,{title:'Old supplier '+i,url:'https://shop'+i+'.1688.com/',latestMessageAt:h.time-86400001}));
+  await h.command('START');await poll(h);const visit=(await h.command('GET')).state.workflow.visits[conversationKey('1688','old-149')];assert.equal(visit.title,'Old supplier 149');assert.equal(visit.url,'https://shop149.1688.com/');assert.equal(visit.status,'expired');assert.equal(visit.platform,'1688');
+});
+
+test('sticky sweep retries an eligible quota-delayed response before leaving its active platform',async()=>{
+  const {h,sends}=manualReviewHarness({deferOnce:true}),host=await workflowReady(h,{folder:true});await bindWorkflowPlatforms(h);await h.command('FOLDER_SETTINGS',{autoSend:true});await h.command('START');await poll(h);host.done('Retry the existing result.');await poll(h);
+  assert.equal(h.storage.openlinksClaudeFolder.jobs[0].status,'awaiting_limit');const id=host.first.id;h.advanceTime(70000);await poll(h);
+  assert.equal(sends.length,1);assert.equal(host.jobs.size,1);assert.equal(h.storage.openlinksClaudeFolder.jobs[0].id,id);assert.equal(h.storage.openlinksClaudeFolder.jobs[0].status,'sent');assert.equal(h.storage[DIALOGS_KEY].workflow.visits[key].lastResult.status,'attempted');
+});
+test('a failed explicit manual approval remains a factual result until a newer action or completed WeChat proof',async()=>{
+  const {h}=manualReviewHarness({edited:true}),host=await workflowReady(h,{folder:true});await h.command('START');await poll(h);host.done();await poll(h);const review=(await h.command('GET')).folder.review;
+  const result=await h.command('REVIEW_SEND',{operationId:review.operationId,text:review.text});assert.equal(result.ok,false);assert.equal(h.storage[DIALOGS_KEY].workflow.visits[key].lastResult.status,'failed');
+  await poll(h);assert.equal((await h.command('GET')).state.workflow.visits[key].lastResult.status,'failed');
+});
+test('a pending result with no active chat opens its exact row before waiting for Claude',async()=>{
+  const {h,previews}=manualReviewHarness(),host=await workflowReady(h,{folder:true});await h.command('START');await poll(h);host.done('Keep this result.');
+  const row=h.replies.get(1).conversations[0];Object.assign(row,{active:false,canSelect:true,selectionToken:'return-to-paid-chat'});
+  await poll(h);assert.equal(opening(h).at(-1).conversationId,row.id);assert.equal(previews.length,0);assert.equal(host.jobs.size,1);
+  row.active=true;await poll(h);assert.equal(previews.length,1);assert.equal((await h.command('GET')).folder.review.phase,'prepared');
+});
+test('exhausting MIC starts a fresh1688 sweep while waiting suppliers never block the round',async()=>{
+  const h=harness();await workflowReady(h);await bindWorkflowPlatforms(h);completeSelectedRead(h);
+  for(const [index,name] of ['1688','alibaba','mic'].entries())h.replies.get(index+1).conversations=[workflowInactive(h,name+'-a'),workflowInactive(h,name+'-b')];
+  await h.command('START');for(let i=0;i<6;i++)await poll(h);assert.deepEqual(opening(h).map(call=>call.id),[1,1,2,2,3,3]);
+  const before=h.storage[DIALOGS_KEY].workflow.sweepId;await poll(h);assert.equal(h.storage[DIALOGS_KEY].workflow.cursor,0);assert.equal(h.storage[DIALOGS_KEY].workflow.sweepId,before+1);
+  await poll(h);assert.equal(opening(h).at(-1).conversationId,'1688-a');
+});
+
+test('a stale known manual review records a blocked result without clearing or sending its owned preview',async()=>{
+  const {h,cleaned,sends}=manualReviewHarness(),host=await workflowReady(h,{folder:true});await h.command('START');await poll(h);host.done();await poll(h);const review=(await h.command('GET')).folder.review;
+  h.advanceTime(86400001);const failed=await h.command('REVIEW_SEND',{operationId:review.operationId,text:review.text});assert.equal(failed.ok,false);assert.equal(cleaned.length,0);assert.equal(sends.length,0);
+  const current=await h.command('GET');assert.equal(current.folder.review.phase,'blocked');assert.equal(current.state.workflow.visits[key].lastResult.status,'failed');assert.ok(h.storage.openlinksClaudeFolder.review.cleanupToken);
+});
+
+test('limited native coverage is recorded as incomplete rather than an exhausted list before moving on',async()=>{
+  for(const coverage of [{token:'limited-token',status:'limited',hasMore:false},{token:'viewport-token',status:'limited',hasMore:false,windowLimited:true},{status:'limited',hasMore:false,windowLimited:true}]){
+    const h=harness();await workflowReady(h);await h.command('BIND_TAB',{platform:'alibaba',tabId:2});h.replies.get(1).conversations=[];h.replies.get(1).listCoverage=coverage;h.replies.get(2).conversations=[workflowInactive(h,'next-marketplace')];
+    await h.command('START');await poll(h);const result=await h.command('GET'),page=result.state.workflow.list['1688'];
+    assert.equal(page.failed,true);assert.equal(page.atEnd,false);assert.deepEqual(opening(h).map(call=>call.conversationId),['next-marketplace']);assert.equal(result.state.workflow.cursor,1);
+    const event=result.workflowActivityHistory.find(event=>event.type==='workflow_list_limited'&&event.platform==='1688');assert.ok(event);assert.match(event.detail,/Не удалось завершить чтение списка/);assert.equal(h.calls.some(call=>call.type==='DIALOGS_ADVANCE_LIST'&&call.id===1),false);
   }
 });

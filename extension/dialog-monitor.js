@@ -83,6 +83,7 @@ export function createDialogMonitor({api=globalThis.chrome, fetchImpl=globalThis
     const raw=(await api.storage.local.get(DIALOGS_KEY))[DIALOGS_KEY];let state=normalizeDialogs(raw,now());
     const release=String(api.runtime.getManifest?.()?.version || '').split('.').map(Number);
     if((release[0]>0||release[1]>=20)&&state.settings.workflowMigrationVersion!==1){state.settings.workflow24h=true;state.settings.showWorkingTab=true;state.settings.workflowMigrationVersion=1;state=normalizeDialogs(state,now());await api.storage.local.set({[DIALOGS_KEY]:state});}
+    if(state.settings.workflow24h&&state.workflow.orderVersion!==1){state.workflow.orderVersion=1;state.workflow.cursor=0;state.workflow.sweepId=1;state.workflow.platformSince=now();await api.storage.local.set({[DIALOGS_KEY]:state});}
     if(!apiAutoAvailable()&&state.settings.autoDraft) {state.settings.autoDraft=false;await api.storage.local.set({[DIALOGS_KEY]:state});}
     return state;
   };
@@ -148,9 +149,19 @@ export function createDialogMonitor({api=globalThis.chrome, fetchImpl=globalThis
       return true;
     } catch {return false; /* A closing/navigating tab is rechecked on the next scan. */}
   }
-  function workflowVisit(state,key,status,detail) {
-    state.workflow.visits[key]={at:now(),preview:state.conversations[key]?.preview || '',status,detail};
-    activity(state,status,detail,{platform:state.conversations[key]?.platform,key});
+  function workflowVisit(state,key,status,detail,{result=false,item=state.conversations[key]}={}) {
+    if(!state.settings.workflow24h)return;
+    const previous=state.workflow.visits[key],name=item?.platform || previous?.platform || key.split(':')[0];
+    state.workflow.visits[key]={at:now(),sweepId:state.workflow.sweepId,preview:item?.preview || '',status,detail,
+      title:item?.title || previous?.title || '',url:item?.url || previous?.url || '',platform:name,fingerprint:item?.fingerprint || '',
+      ...(previous?.lastResult?{lastResult:previous.lastResult}:{}),...((result||status==='completed')?{lastResult:{status,detail,at:now(),fingerprint:item?.fingerprint || ''}}:{})};
+    activity(state,status,detail,{platform:name,key});
+  }
+  function workflowPlatform(state,folder) {return testPlatform(folder) || PLATFORMS[state.workflow.cursor % PLATFORMS.length];}
+  function advanceWorkflowPlatform(state,name,{single=false}={}) {
+    const index=PLATFORMS.indexOf(name);
+    if(single||index===PLATFORMS.length-1)state.workflow.sweepId++;
+    state.workflow.cursor=single?index:(index+1)%PLATFORMS.length;state.workflow.platformSince=now();
   }
   const attemptFingerprint=async(state,request,config)=>{
     // Readiness and view changes affect the revision guard, but must not buy a
@@ -592,6 +603,7 @@ export function createDialogMonitor({api=globalThis.chrome, fetchImpl=globalThis
     if(failed)traversal.backoff[key]=now()+READ_BACKOFF_MS;
     else traversal.seenPreviews[key]=read.preview || '';
     traversal.pending=null;
+    if(failed)workflowVisit(state,key,'failed',detail,{result:true});
     log(state,type,detail,{key,platform:name,level:failed?'warning':'info'});
   }
 
@@ -701,8 +713,8 @@ export function createDialogMonitor({api=globalThis.chrome, fetchImpl=globalThis
     state.workflow.pinnedKeys=[...new Set([...PLATFORMS.flatMap(name=>state.traversal[name].pending?[conversationKey(name,state.traversal[name].pending.id)]:[]),...(folderConfig?.jobs.filter(job=>job.kind==='dialog'&&folderPending(job)).map(job=>job.key) || [])])].slice(0,16);
     if(folderConfig?.test.key&&!state.workflow.pinnedKeys.includes(folderConfig.test.key))state.workflow.pinnedKeys.push(folderConfig.test.key);
     const names=selected?[platform(selected)]:testPlatform(folderConfig)?[testPlatform(folderConfig)]:PLATFORMS;
-    const ordered=selected?names:[...names.slice(state.workflow.cursor % names.length),...names.slice(0,state.workflow.cursor % names.length)];
-    let acted=false;
+    const single=!!selected||!!testPlatform(folderConfig),ordered=single?names:PLATFORMS.slice(state.workflow.cursor % PLATFORMS.length);
+    let acted=false,held=false;
     for(const name of ordered) {
       if(acted)break;
       if(cancelEpoch!==cycleEpoch||!state.running)break;
@@ -712,15 +724,22 @@ export function createDialogMonitor({api=globalThis.chrome, fetchImpl=globalThis
       if(acted)continue;
       const binding=state.bindings[name],rows=observed.rows || [],sources=observed.sources || [],traversal=state.traversal[name];
       state.workflow.list ||= {};
-      if(sources.some(source=>source.listCoverage?.token))state.workflow.list[name] ||= {attempts:0,startedAt:now(),nextAt:0,atEnd:false};
+      const priorPage=state.workflow.list[name];
+      if(!priorPage||priorPage.sweepId!==state.workflow.sweepId)state.workflow.list[name]={sweepId:state.workflow.sweepId,attempts:0,startedAt:now(),nextAt:0,atEnd:false,needsStart:!!priorPage?.hasPagination,hasPagination:false,failed:false,jobsChecked:false,progressToken:'',stalls:0};
+      const page=state.workflow.list[name];
+      if(sources.some(source=>source.listCoverage?.token))page.hasPagination=true;
       const busy=sources.some(source=>source.busy===true||source.busy&&typeof source.busy==='object'&&Object.values(source.busy).some(value=>value===true));
-      if(busy){activity(state,'user_busy','Пользователь работает в чате или поле содержит черновик; площадка временно пропущена.',{platform:name});continue;}
-      if(await activateLoadingWorkingTab(state,name,cycleEpoch)){acted=true;state.workflow.cursor=(PLATFORMS.indexOf(name)+1)%PLATFORMS.length;continue;}
-      if(binding.status!=='ready')continue;
+      if(busy){activity(state,'user_busy','Пользователь работает в чате или поле содержит черновик; площадка временно пропущена.',{platform:name});advanceWorkflowPlatform(state,name,{single});continue;}
+      if(binding.status!=='ready'){
+        if((binding.status==='loading'||binding.managed?.pending)&&now()-state.workflow.platformSince<READ_TIMEOUT_MS){
+          await activateLoadingWorkingTab(state,name,cycleEpoch);activity(state,'opening','Ожидаю загрузки текущей площадки; затем продолжу её чаты.',{platform:name});held=true;break;
+        }
+        advanceWorkflowPlatform(state,name,{single});continue;
+      }
       const keyOf=row=>{try{return conversationKey(name,row.id);}catch{return '';}};
       const rowItem=row=>{
         const key=keyOf(row),cached=state.conversations[key];
-        const metadata={key,platform:name,id:row.id,identityReliable:row.identityReliable===true,messages:[],...cached,preview:String(row.preview || '').slice(0,1000)};
+        const metadata={key,platform:name,id:row.id,identityReliable:row.identityReliable===true,messages:[],...cached,title:row.title || cached?.title || '',url:row.url || cached?.url || '',preview:String(row.preview || '').slice(0,1000)};
         if(Object.hasOwn(row,'latestMessageAt'))Object.assign(metadata,{latestMessageAt:row.latestMessageAt,latestMessageAtReliable:row.latestMessageAtReliable===true});
         else if(cached?.preview!==metadata.preview)Object.assign(metadata,{latestMessageAt:null,latestMessageAtReliable:false});
         return metadata;
@@ -731,9 +750,9 @@ export function createDialogMonitor({api=globalThis.chrome, fetchImpl=globalThis
         if(source&&source.documentToken!==read.documentToken){finishRead(state,name,'Страница изменилась при открытии чата. Перехожу к другим.',{failed:true});acted=true;}
         else if(active?.id===read.id&&active.frameId===read.frameId&&active.documentToken===read.documentToken){traversal.pending=null;}
         else if(now()-read.startedAt>=READ_TIMEOUT_MS){finishRead(state,name,'Чат не открылся за 120 секунд. Повторная проверка через 5 минут.',{failed:true});acted=true;}
-        else {activity(state,'opening','Ожидаю загрузки выбранного чата; другие площадки продолжают проверяться.',{platform:name,key:conversationKey(name,read.id)});continue;}
+        else {activity(state,'opening','Ожидаю загрузки выбранного чата на текущей площадке.',{platform:name,key:conversationKey(name,read.id)});held=true;break;}
       }
-      if(acted){state.workflow.cursor=(PLATFORMS.indexOf(name)+1)%PLATFORMS.length;continue;}
+      if(acted)break;
       if(active) {
         const key=keyOf(active),item=state.conversations[key],visit=state.workflow.visits[key];
         if(item&&!item.paused&&!item.takeover&&!(traversal.backoff[key]>now())) {
@@ -745,7 +764,7 @@ export function createDialogMonitor({api=globalThis.chrome, fetchImpl=globalThis
             const sourceValid=operation.documentToken===active.documentToken&&operation.frameId===active.frameId;
             if(!sourceValid||operation.attempts>=8||now()-operation.startedAt>=READ_TIMEOUT_MS) {
               if(sourceValid)await restoreWorkflowTail(state,name,active,cycleEpoch);
-              traversal.backoff[key]=now()+READ_BACKOFF_MS;delete state.workflow.history[key];workflowVisit(state,key,'history_unavailable','Не удалось подтвердить первое ваше сообщение за ограниченное число проверок. Чат пропущен; повтор через 5 минут.');
+              traversal.backoff[key]=now()+READ_BACKOFF_MS;delete state.workflow.history[key];workflowVisit(state,key,'history_unavailable','Не удалось подтвердить первое ваше сообщение за ограниченное число проверок. Чат пропущен; повтор через 5 минут.',{result:true});
             } else {
               if(item.firstBuyerMessageReliable)operation.phase='latest';
               const type=operation.phase==='latest'?'DIALOGS_REVEAL_LATEST':'DIALOGS_LOAD_HISTORY_START';operation.attempts++;
@@ -754,7 +773,7 @@ export function createDialogMonitor({api=globalThis.chrome, fetchImpl=globalThis
               if(cancelEpoch!==cycleEpoch)break;
               try {
                 const reply=await timeout(api.tabs.sendMessage(binding.tabId,{type,conversationId:active.id,documentToken:active.documentToken},{frameId:active.frameId}));
-                if(reply?.ok===false&&!['loading','busy'].includes(reply.status)||['unsupported','limited'].includes(reply?.status)) {await restoreWorkflowTail(state,name,active,cycleEpoch);traversal.backoff[key]=now()+READ_BACKOFF_MS;delete state.workflow.history[key];workflowVisit(state,key,'history_unavailable','Площадка не разрешила безопасно прочитать начало истории. Чат пропущен; повтор через 5 минут.');}
+                if(reply?.ok===false&&!['loading','busy'].includes(reply.status)||['unsupported','limited'].includes(reply?.status)) {await restoreWorkflowTail(state,name,active,cycleEpoch);traversal.backoff[key]=now()+READ_BACKOFF_MS;delete state.workflow.history[key];workflowVisit(state,key,'history_unavailable','Площадка не разрешила безопасно прочитать начало истории. Чат пропущен; повтор через 5 минут.',{result:true});}
                 else if(operation.phase==='latest'&&reply?.ok===true)delete state.workflow.history[key];
               } catch {activity(state,'history_retry','Ответ страницы потерян. Проверю историю на следующем обходе; отправка не выполнялась.',{platform:name,key});}
             }
@@ -770,11 +789,11 @@ export function createDialogMonitor({api=globalThis.chrome, fetchImpl=globalThis
               await activateWorkingTab(state,name,cycleEpoch);
               if(localFolderKey)result.folderKeys.push(localFolderKey);if(localKey)result.autoKey=localKey;
               activity(state,'preparing_reply','Товар найден в памяти. Готовлю ответ на последнее сообщение продавца.',{platform:name,key});acted=true;
-            } else if(!visit||visit.preview!==(item.preview || '')||now()-visit.at>=60000) {
+            } else if(!visit||visit.fingerprint!==item.fingerprint||visit.preview!==(item.preview || '')||visit.sweepId!==state.workflow.sweepId) {
               let status=assessment.status,detail=assessment.detail;
-              if(item.draft){status='awaiting_approval';detail='Ответ подготовлен и ожидает вашего решения. Продолжаю проверять другие чаты.';}
+              if(item.draft){status='awaiting_approval';detail='Ответ подготовлен и ожидает вашего решения.';}
               const job=folderConfig?.jobs.find(job=>job.key===key&&folderPending(job));
-              if(job){status='waiting_claude';detail='Задание Claude сохранено. Продолжаю обход; готовый ответ будет проверен при возвращении.';}
+              if(job){status='waiting_claude';detail='Задание Claude сохранено. Ожидаю готовый ответ на текущей площадке.';}
               workflowVisit(state,key,status,detail);
               if(['date_unknown','first_message_unknown','unreadable'].includes(status))traversal.backoff[key]=now()+READ_BACKOFF_MS;
             }
@@ -782,18 +801,19 @@ export function createDialogMonitor({api=globalThis.chrome, fetchImpl=globalThis
         }
       }
       if(!acted) {
+        const waitingJob=folderConfig?.jobs.find(job=>job.kind==='dialog'&&job.key.startsWith(name+':')&&folderPending(job)&&(job.status==='awaiting_limit'?now()>=(job.retryAt || 0)&&now()-state.workflow.platformSince<600000:now()-job.createdAt<600000||job.status==='done'&&now()-state.workflow.platformSince<600000)&&active&&job.key===keyOf(active));
+        if(waitingJob){activity(state,'waiting_claude','Ожидаю ответ Claude на текущей площадке. Задание сохранено; повторный запрос не создаётся.',{platform:name,key:waitingJob.key});held=true;break;}
         const candidates=rows.filter(row=>{
           const key=keyOf(row),item=rowItem(row);
           if(!key||row.active||!row.canSelect||!row.identityReliable||row.selectionBusy||item.paused||item.takeover||traversal.backoff[key]>now())return false;
           if(!row.selectionToken||!row.documentToken)return false;
           const assessment=workflowAssessment(state,item,now());
-          if(['completed','expired','future_date'].includes(assessment.status)) {if(state.workflow.visits[key]?.status!==assessment.status)workflowVisit(state,key,assessment.status,assessment.detail);return false;}
+          if(['completed','expired','future_date'].includes(assessment.status)) {if(state.workflow.visits[key]?.status!==assessment.status)workflowVisit(state,key,assessment.status,assessment.detail,{item});return false;}
           // Unknown row dates may become known only after opening its real tail.
           // The core reply guard still refuses any response without a date.
           const visit=state.workflow.visits[key],preview=String(item.preview || '');
-          const readyJob=folderConfig?.jobs.some(job=>job.key===key&&(job.status==='done'||job.status==='awaiting_limit'&&now()>=(job.retryAt || 0)));
-          const hasPagination=sources.some(source=>source.listCoverage?.token);
-          const anotherSweep=hasPagination?visit&&visit.at<state.workflow.list[name].startedAt:visit&&now()-visit.at>=60000;
+          const readyJob=folderConfig?.jobs.some(job=>job.key===key&&(job.status==='done'||job.status==='awaiting_limit'&&now()>=(job.retryAt || 0)||!active&&folderPending(job)));
+          const anotherSweep=visit&&visit.sweepId!==state.workflow.sweepId;
           return readyJob||!visit||visit.preview!==preview||anotherSweep;
         }).sort((a,b)=>{
           const first=state.workflow.visits[keyOf(a)]?.at || 0,last=state.workflow.visits[keyOf(b)]?.at || 0;
@@ -815,32 +835,36 @@ export function createDialogMonitor({api=globalThis.chrome, fetchImpl=globalThis
           catch {activity(state,'opening','Подтверждение клика потеряно. Проверю выбранный чат без повторного клика.',{platform:name,key});}
           acted=true;
         } else {
-          const source=sources.find(source=>source.listCoverage?.token),coverage=source?.listCoverage;
-          state.workflow.list ||= {};
-          const page=state.workflow.list[name] ||= {attempts:0,startedAt:now(),nextAt:0,atEnd:false};
-          if(coverage?.token&&now()>=(page.nextAt || 0)) {
-            const restart=page.atEnd;
-            if(page.attempts>=8)page.attempts=0;
-            if(!restart&&!coverage.hasMore){page.atEnd=true;page.nextAt=now()+READ_BACKOFF_MS;}
+          const source=sources.find(source=>source.listCoverage?.status==='limited'||source.listCoverage?.windowLimited)||sources.find(source=>source.listCoverage?.token),coverage=source?.listCoverage;
+          const limited=coverage?.status==='limited'||coverage?.windowLimited===true;
+          if(limited&&(!page.needsStart||coverage.windowLimited||!coverage.token)){
+            page.failed=true;page.atEnd=false;
+            activity(state,'list_limited','Не удалось завершить чтение списка чатов этой площадки. Перехожу дальше и повторю чтение в следующем круге.',{platform:name});
+          } else if(coverage?.token&&!page.failed&&!page.atEnd) {
+            if(!page.needsStart&&!coverage.hasMore)page.atEnd=true;
+            else if(page.stalls>=8){page.failed=true;activity(state,'list_limited','Список чатов не продвигается после повторных проверок. Вернусь к площадке в следующем круге.',{platform:name});}
             else {
-              if(restart){page.attempts=0;page.startedAt=now();page.atEnd=false;}
-              page.attempts++;
+              const restart=page.needsStart;page.needsStart=false;page.attempts++;
+              const progress=coverage.progressToken || JSON.stringify(rows.map(row=>row.id));page.stalls=page.progressToken===progress?page.stalls+1:0;page.progressToken=progress;
               await activateWorkingTab(state,name,cycleEpoch);
-              activity(state,'reading_list',restart?'Возвращаюсь к началу списка для проверки новых сообщений.':'Проверяю следующую часть списка чатов.',{platform:name});await save(state);
+              activity(state,'reading_list',restart?'Возвращаюсь к началу списка для нового круга.':'Проверяю следующую часть списка чатов текущей площадки.',{platform:name});await save(state);
               if(cancelEpoch!==cycleEpoch)break;
-              try {
-                const reply=await timeout(api.tabs.sendMessage(binding.tabId,{type:'DIALOGS_ADVANCE_LIST',documentToken:source.documentToken,listToken:coverage.token,...(restart?{direction:'start'}:{})},{frameId:source.frameId}));
-                if(reply?.ok!==true)page.nextAt=now()+READ_BACKOFF_MS;
-              }catch{page.nextAt=now()+READ_BACKOFF_MS;}
-              if(page.attempts>=8)page.nextAt=now()+READ_BACKOFF_MS;
+              try {const reply=await timeout(api.tabs.sendMessage(binding.tabId,{type:'DIALOGS_ADVANCE_LIST',documentToken:source.documentToken,listToken:coverage.token,...(restart?{direction:'start'}:{})},{frameId:source.frameId}));if(reply?.ok!==true)page.failed=true;}
+              catch{page.failed=true;}
               acted=true;
             }
           }
         }
       }
-      if(acted)state.workflow.cursor=(PLATFORMS.indexOf(name)+1)%PLATFORMS.length;
+      if(!acted){
+        const pendingJob=folderConfig?.jobs.find(job=>job.kind==='dialog'&&job.key.startsWith(name+':')&&folderPending(job)&&(job.status==='awaiting_limit'?now()>=(job.retryAt || 0)&&now()-state.workflow.platformSince<600000:now()-job.createdAt<600000||job.status==='done'&&now()-state.workflow.platformSince<600000));
+        const uncheckedJob=!page.jobsChecked&&folderConfig?.jobs.find(job=>job.kind==='dialog'&&job.key.startsWith(name+':')&&folderPending(job)&&(job.status!=='awaiting_limit'||now()>=(job.retryAt || 0)));
+        if(uncheckedJob)page.jobsChecked=true;
+        if(pendingJob||uncheckedJob){activity(state,'waiting_claude','Ожидаю сохранённый ответ Claude перед переходом к следующей площадке.',{platform:name,key:(pendingJob || uncheckedJob).key});held=true;break;}
+        advanceWorkflowPlatform(state,name,{single});
+      }
     }
-    if(!acted&&cancelEpoch===cycleEpoch&&state.running)activity(state,'waiting','Обход завершён. Ожидаю новые сообщения; незавершённые чаты будут проверены повторно.');
+    if(!acted&&!held&&cancelEpoch===cycleEpoch&&state.running)activity(state,'waiting','Круг проверки завершён. Незавершённые чаты и ограничения чтения проверю повторно; результаты сохранены в журнале.');
     await save(state);return result;
   }
 
@@ -1169,6 +1193,7 @@ export function createDialogMonitor({api=globalThis.chrome, fetchImpl=globalThis
     }});}catch{outcome={status:'unknown',reason:'Не удалось подтвердить состояние тестового поля.'};}
     test.phase=outcome?.status==='previewed'&&epoch(request.key)===jobEpoch?'completed':'blocked';test.at=now();
     test.detail=test.phase==='completed'?'Тестовый цикл завершён: ответ введён, но не отправлен. Проверьте поле и нажмите «Проверить следующий цикл».':outcome?.reason || 'Тестовый цикл прерван. Проверьте поле; автоматического повтора нет.';
+    workflowVisit(state,request.key,test.phase==='completed'?'test_preview':'failed',test.detail,{result:true});await save(state);
     await saveFolder(folder);log(state,'test_cycle',test.detail,{key:request.key,platform:state.conversations[request.key]?.platform});
     return {...outcome,status:test.phase==='completed'?'previewed':'blocked',reason:test.detail};
   }
@@ -1209,7 +1234,7 @@ export function createDialogMonitor({api=globalThis.chrome, fetchImpl=globalThis
     }});}catch{outcome={status:'unknown',reason:'Не удалось подтвердить заполнение поля. Проверьте чат; отправка не выполнялась.'};}
     folder.review.phase=outcome?.status==='previewed'&&epoch(request.key)===jobEpoch?'prepared':'blocked';folder.review.at=now();
     folder.review.detail=folder.review.phase==='prepared'?'Ответ введён в поле чата. Проверьте его и выберите «Отправить» или «Пропустить поставщика».':outcome?.reason || 'Подготовка ответа остановлена. Проверьте поле; автоматического повтора нет.';
-    activity(state,'awaiting_approval',folder.review.detail,{key:request.key,platform:state.conversations[request.key]?.platform});await saveFolder(folder);await save(state);
+    workflowVisit(state,request.key,folder.review.phase==='prepared'?'awaiting_approval':'failed',folder.review.detail,{result:true});await saveFolder(folder);await save(state);
   }
   function checkedReview(folder,message) {
     const review=folder.review;
@@ -1227,7 +1252,7 @@ export function createDialogMonitor({api=globalThis.chrome, fetchImpl=globalThis
     const review=checkedReview(folder,message),checkEpoch=cancelEpoch;
     if(!folder.reviewSkipped.some(entry=>entry.context===review.context)&&folder.reviewSkipped.length>=FOLDER_LIMITS.reviewSkipped)throw new Error('Журнал пропусков заполнен. Работа остановлена.');
     await clearTestPreview(state,{test:review},checkEpoch);
-    recordReviewSkip(folder,review.key,review.context);workflowVisit(state,review.key,'skipped','Вы пропустили подготовленный ответ. Перехожу к следующему поставщику; этот диалог проверю после нового сообщения.');
+    recordReviewSkip(folder,review.key,review.context);workflowVisit(state,review.key,'skipped','Вы пропустили подготовленный ответ. Перехожу к следующему поставщику; этот диалог проверю после нового сообщения.',{result:true});
     folder.review=normalizeFolder().review;await saveFolder(folder);await save(state);if(state.running)await schedule();return publicState(state);
   }
   async function waitForManualComposer(state,key,jobEpoch) {
@@ -1250,11 +1275,11 @@ export function createDialogMonitor({api=globalThis.chrome, fetchImpl=globalThis
     if(review.phase!=='prepared')throw new Error('Подготовка текста не подтверждена. Проверьте поле и пропустите этот ответ перед повторной подготовкой.');
     const text=Object.hasOwn(message,'text')?message.text:review.text;
     if(typeof text!=='string'||!text.trim()||text.length>6000)throw new Error('Укажите текст ответа до 6000 символов.');
-    const request=draftRequest(state,review.key,now());
-    if(!sameRequest(request,review.request))throw new Error('История или сведения о товаре изменились. Пропустите прежний ответ и сформируйте новый.');
     // Removing our unchanged preview precedes a fresh guarded send. A manual
     // editor change or uncertain ownership keeps the review blocked in place.
     try {
+      const request=draftRequest(state,review.key,now());
+      if(!sameRequest(request,review.request))throw new Error('История или сведения о товаре изменились. Пропустите прежний ответ и сформируйте новый.');
       await clearTestPreview(state,{test:review},cancelEpoch);review.text=text.trim();review.phase='preparing';review.detail='Проверяю актуальную историю перед подтверждённой отправкой.';await saveFolder(folder);
       if(epoch(review.key)!==jobEpoch)throw new Error('Отправка приостановлена.');
       await waitForManualComposer(state,review.key,jobEpoch);
@@ -1262,7 +1287,7 @@ export function createDialogMonitor({api=globalThis.chrome, fetchImpl=globalThis
       const response=await sendReviewedDraft(state,folder,{...request,key:review.key,text:text.trim(),testMode:false},jobEpoch);
       const outcome=response.send;
       if(['attempted','unknown'].includes(outcome?.status)){
-        workflowVisit(state,review.key,outcome.status==='attempted'?'waiting_supplier':'send_unknown',outcome.detail);folder.review=normalizeFolder().review;
+        workflowVisit(state,review.key,outcome.status==='attempted'?'attempted':'send_unknown',outcome.detail,{result:true});folder.review=normalizeFolder().review;
       } else if(outcome?.status==='deferred'&&epoch(review.key)===jobEpoch){
         const item=state.conversations[review.key],observed=await scan(state,item.platform),source=observed.find(row=>row.id===item.id&&row.active);
         if(!source||source.busy)throw new Error('Лимит исчерпан; не удалось восстановить поле для проверки. Проверьте чат.');
@@ -1272,14 +1297,14 @@ export function createDialogMonitor({api=globalThis.chrome, fetchImpl=globalThis
       } else {review.phase='blocked';review.detail=outcome?.detail || 'Отправка не выполнена. Проверьте состояние чата.';review.at=now();}
       await saveFolder(folder);await save(state);return {...await publicState(state),send:outcome};
     } catch(error) {
-      review.phase='blocked';review.detail=error?.message || 'Проверка перед отправкой не завершена. Проверьте чат.';review.at=now();await saveFolder(folder);await save(state);throw error;
+      review.phase='blocked';review.detail=error?.message || 'Проверка перед отправкой не завершена. Проверьте чат.';review.at=now();workflowVisit(state,review.key,'failed',review.detail,{result:true});await saveFolder(folder);await save(state);throw error;
     }
   }
   async function skipTestCycle(state,folder,message) {
     const test=folder.test;
     if(!test.enabled||message.sessionId!==test.sessionId||message.cycleId!==test.cycleId||!['completed','blocked'].includes(test.phase))throw new Error('Тестовый цикл изменился или ещё не дошёл до проверки текста.');
     if(!folder.reviewSkipped.some(entry=>entry.context===test.context)&&folder.reviewSkipped.length>=FOLDER_LIMITS.reviewSkipped)throw new Error('Журнал пропусков заполнен. Работа остановлена.');
-    await clearTestPreview(state,folder,cancelEpoch);recordReviewSkip(folder,test.key,test.context);workflowVisit(state,test.key,'skipped','Тестовый ответ пропущен; сообщение не отправлено и не записано как пробная отправка.');
+    await clearTestPreview(state,folder,cancelEpoch);recordReviewSkip(folder,test.key,test.context);workflowVisit(state,test.key,'skipped','Тестовый ответ пропущен; сообщение не отправлено и не записано как пробная отправка.',{result:true});
     test.phase='paused';test.text='';test.detail='Тестовый ответ пропущен.';await saveFolder(folder);await save(state);
     return nextTestCycle(state,folder,message);
   }
@@ -1298,11 +1323,13 @@ export function createDialogMonitor({api=globalThis.chrome, fetchImpl=globalThis
     if(completed&&(test.completed.length>=1000||test.history.length>=100))throw new Error('Тестовый журнал заполнен. Завершите текущий тестовый сеанс и начните новый.');
     if(completed||test.cleanupToken)await clearTestPreview(state,folder,checkEpoch);
     if(completed) {
+      workflowVisit(state,test.key,'test_completed','Тест подтверждён: ответ не отправлялся. Перехожу к следующему чату.',{result:true});
       test.completed.push({key:test.key,context:test.context,fingerprint:test.fingerprint || '',at:now()});test.history.push({key:test.key,context:test.context,text:test.text,at:now(),simulated:true});
     }
     if(cancelEpoch!==checkEpoch)throw new Error('Тестовый цикл отменён изменением настроек.');
     Object.assign(test,{phase:'ready',platform:target,cycleId:crypto.randomUUID(),key:'',jobId:'',context:'',fingerprint:'',text:'',detail:state.settings.scanRead?'Ожидаю подходящий прочитанный чат для одного тестового цикла.':'Ожидаю следующее прочитанное входящее сообщение для одного тестового цикла.',at:now()});
     folder.auto=true;folder.autoSend=false;state.running=true;state.readUnread=true;
+    if(switching){state.workflow.cursor=target==='all'?0:PLATFORMS.indexOf(target);state.workflow.sweepId++;state.workflow.platformSince=now();}
     if(target!=='all'){state.workflow.cursor=PLATFORMS.indexOf(target);test.detail='Проверяю следующий тестовый цикл только на '+({'1688':'1688',alibaba:'Alibaba',mic:'Made-in-China'})[target]+'. Остальные чаты не помечаются обработанными.';}
     if(cancelEpoch!==checkEpoch)throw new Error('Переключение тестового цикла отменено.');
     await saveFolder(folder);await save(state);await schedule();
@@ -1329,6 +1356,7 @@ export function createDialogMonitor({api=globalThis.chrome, fetchImpl=globalThis
     const outcome=await guardedReply(state,folder,{request:checked.request,text:message.text,source:{tabId:state.bindings[item.platform].tabId,frameId:source.frameId,documentToken:source.documentToken,sourceUrl:source.sourceUrl,replyFingerprint:source.replyFingerprint},jobEpoch});
     const status=['attempted','unknown','deferred','previewed'].includes(outcome.status)?outcome.status:'blocked';
     const detail=status==='previewed'?folder.test.detail:status==='attempted'?'Кнопка отправки нажата. Доставка и прочтение не проверяются.':status==='unknown'?'Исход отправки неизвестен. Проверьте переписку; повтор запрещён.':status==='deferred'?'Лимит площадки пока исчерпан. Ответ сохранён; после обновления лимита подтвердите отправку заново.':outcome.reason || 'Отправка остановлена до нажатия. Проверьте диалог.';
+    workflowVisit(state,message.key,status==='previewed'?'test_preview':status==='unknown'?'send_unknown':status==='deferred'?'awaiting_limit':status,detail,{result:true});
     log(state,'draft_send',detail,{key:message.key,platform:item.platform,level:status==='unknown'?'warning':'info'});await save(state);
     return {...await publicState(state),send:{status,detail,...(Number.isFinite(outcome.retryAt)?{retryAt:outcome.retryAt}:{})}};
   }
@@ -1346,7 +1374,7 @@ export function createDialogMonitor({api=globalThis.chrome, fetchImpl=globalThis
     const pollEpoch=cancelEpoch;
     await folderStatus(folder);if(cancelEpoch!==pollEpoch)return;if(folder.status==='unavailable')return;
     for(const job of folder.jobs.filter(job=>job.ackPending))await acknowledgeFolder(folder,job,job.ack);
-    const jobs=folder.jobs.filter(job=>(dialogs||job.kind==='product')&&(!testHolding||job.kind==='product')&&folderPending(job)&&(job.status!=='awaiting_limit'||now()>=(job.retryAt || 0))).slice(0,FOLDER_LIMITS.poll);if(!jobs.length)return;
+    const jobs=folder.jobs.filter(job=>(!state.settings.workflow24h||job.kind==='product'||job.key.startsWith(workflowPlatform(state,folder)+':'))&&(dialogs||job.kind==='product')&&(!testHolding||job.kind==='product')&&folderPending(job)&&(job.status!=='awaiting_limit'||now()>=(job.retryAt || 0))).slice(0,FOLDER_LIMITS.poll);if(!jobs.length)return;
     let response;
     try {response=await bridge.call('poll',{ids:jobs.map(job=>job.id)});if(!Array.isArray(response.results))throw new Error('Invalid poll');}
     catch {folder.status='unavailable';folder.detail='Не удалось проверить файлы ответов. Ожидающие задания сохранены.';await saveFolder(folder);return;}
@@ -1356,11 +1384,11 @@ export function createDialogMonitor({api=globalThis.chrome, fetchImpl=globalThis
       if(cancelEpoch!==pollEpoch)break;
       const job=jobs.find(job=>job.id===result?.id);if(!job||seen.has(job.id))continue;seen.add(job.id);
       if(!['queued','running','done','error','cancelled'].includes(result.status))continue;
-      if(result.status!=='done') {if(['error','cancelled'].includes(result.status))blockTestJob(folder,job,'Тестовый цикл остановлен: Claude не вернул ответ. Проверьте локальный журнал; для нового сеанса выключите и включите тестовый режим.');job.status=result.status;job.at=now();job.detail=result.status==='error'?'Claude не обработал задание. Проверьте интернет, вход и журнал; повтор доступен вручную.':result.status==='cancelled'?'Обработчик отменил задание.':'Ожидаю ответ Claude в локальной папке.';continue;}
+      if(result.status!=='done') {if(job.kind==='dialog'&&['error','cancelled'].includes(result.status)){workflowVisit(state,job.key,'failed',result.status==='error'?'Claude не обработал задание. Проверьте локальный журнал; повтор доступен вручную.':'Обработчик отменил задание.',{result:true});}if(['error','cancelled'].includes(result.status))blockTestJob(folder,job,'Тестовый цикл остановлен: Claude не вернул ответ. Проверьте локальный журнал; для нового сеанса выключите и включите тестовый режим.');job.status=result.status;job.at=now();job.detail=result.status==='error'?'Claude не обработал задание. Проверьте интернет, вход и журнал; повтор доступен вручную.':result.status==='cancelled'?'Обработчик отменил задание.':'Ожидаю ответ Claude в локальной папке.';continue;}
       const awaitingLimit=job.status==='awaiting_limit'||(job.sendDeferrals || 0)>0;
       job.status='done';job.at=now();job.detail='Ответ готов; проверяю актуальность диалога.';
       const jobEpoch=epoch(job.key);
-      const reject=async detail=>{blockTestJob(folder,job,detail);finishFolderJob(folder,job,'stale',detail,now());await acknowledgeFolder(folder,job,'stale');log(state,'folder_stale',detail,{key:job.key,level:'warning'});};
+      const reject=async detail=>{if(job.kind==='dialog')workflowVisit(state,job.key,'failed',detail,{result:true});blockTestJob(folder,job,detail);finishFolderJob(folder,job,'stale',detail,now());await acknowledgeFolder(folder,job,'stale');log(state,'folder_stale',detail,{key:job.key,level:'warning'});};
       if(job.kind==='dialog'&&((!!job.testSessionId)!==folder.test.enabled||job.testSessionId&&(job.testSessionId!==folder.test.sessionId||job.testCycleId!==folder.test.cycleId))){await reject('Тестовый режим или цикл изменился. Ответ не использован.');continue;}
       if(!sameRequest(result.request,job.request)||!sameRequest(result.imageKeys || [],job.request.imageKeys || [])||job.configRevision!==folder.revision) {await reject('Ответ отклонён: задание или настройки изменились.');continue;}
       try {
@@ -1396,7 +1424,7 @@ export function createDialogMonitor({api=globalThis.chrome, fetchImpl=globalThis
           const status=deferred?'awaiting_limit':outcome?.status==='attempted'?'sent':outcome?.status==='unknown'?'send_unknown':'accepted';
           if(deferred){job.retryAt=Math.max(now()+30000,outcome.retryAt+500);job.sendDeferrals=(job.sendDeferrals || 0)+1;job.draftGuard=await folderDraftGuard(current);}
           finishFolderJob(folder,job,status,status==='awaiting_limit'?'Ответ готов. Ожидаю освобождения общего лимита площадки; новый запрос Claude не выполняется.':status==='sent'?'Нажатие отправки выполнено; доставка не проверяется.':status==='send_unknown'?'Исход отправки неизвестен. Проверьте переписку; автоматического повтора не будет.':'Черновик сохранён. Отправка отложена или заблокирована; проверьте диалог.',now());
-          if(state.settings.workflow24h)workflowVisit(state,job.key,status==='sent'?'waiting_supplier':status,job.detail+' Продолжаю проверять другие чаты.');
+          if(state.settings.workflow24h)workflowVisit(state,job.key,status==='sent'?'attempted':status,job.detail+' Продолжаю проверять другие чаты.',{result:true});
           log(state,'folder_send',job.detail,{key:job.key,platform:item.platform,level:status==='send_unknown'?'warning':'info'});await save(state);
         }
         if(state.settings.workflow24h&&!folder.test.enabled&&!folder.autoSend&&state.running&&job.status==='accepted'){
@@ -1491,7 +1519,11 @@ export function createDialogMonitor({api=globalThis.chrome, fetchImpl=globalThis
       case 'DIALOGS_TEST_SKIP':return skipTestCycle(state,folder,message);
       case 'DIALOGS_REVIEW_SKIP':return skipManualReview(state,folder,message);
       case 'DIALOGS_REVIEW_SEND':return requireDialogTurn(()=>sendManualReview(state,folder,message,commandEpoch));
-      case 'DIALOGS_SEND_DRAFT':if(folder.review?.phase!=='none')throw new Error('Используйте подтверждение подготовленного ответа: «Отправить» или «Пропустить поставщика».');return requireDialogTurn(()=>sendReviewedDraft(state,folder,message,commandEpoch));
+      case 'DIALOGS_SEND_DRAFT':
+        if(folder.review?.phase!=='none')throw new Error('Используйте подтверждение подготовленного ответа: «Отправить» или «Пропустить поставщика».');
+        return requireDialogTurn(async()=>{try{return await sendReviewedDraft(state,folder,message,commandEpoch);}catch(error){
+          const item=state.conversations[message.key];if(item&&state.settings.workflow24h){workflowVisit(state,message.key,'failed',error.message || 'Проверка перед отправкой не завершена.',{result:true,item:{...item,fingerprint:message.fingerprint || item.fingerprint}});await save(state);}throw error;
+        }});
       case 'DIALOGS_DRAFT_EDITING':return publicState(state);
       case 'DIALOGS_CONTEXT_EDITING':folder.auto=false;folder.autoSend=false;state.settings.autoDraft=false;await saveFolder(folder);await save(state);return publicState(state);
       case 'DIALOGS_FOLDER_STATUS':await folderStatus(folder);return publicState(state);
@@ -1704,7 +1736,7 @@ export function createDialogMonitor({api=globalThis.chrome, fetchImpl=globalThis
           for(const key of observed.folderKeys) {
             if(cancelEpoch!==cycleEpoch||folder.test.enabled&&folder.test.phase!=='ready')break;
             try {await enqueueFolder(state,folder,{key,automatic:true,observed});}
-            catch {log(state,'folder_failed','Не удалось подготовить задание папки. Проверьте вложения и локальный обработчик.',{key,level:'warning'});}
+            catch {workflowVisit(state,key,'failed','Не удалось подготовить задание папки. Проверьте вложения и локальный обработчик.',{result:true});log(state,'folder_failed','Не удалось подготовить задание папки. Проверьте вложения и локальный обработчик.',{key,level:'warning'});}
           }
           if(cancelEpoch===cycleEpoch)await pollFolder(state,folder);
         }

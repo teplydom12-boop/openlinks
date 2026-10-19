@@ -88,6 +88,20 @@ HARNESS = r"""
     'alibaba:undated':thread('undated','Which quantity?',{latestMessageAt:null,latestMessageAtReliable:false,messages:[{key:'first',direction:'outbound',text:'Hello, I need a log splitter.',at:null},{key:'last',direction:'inbound',text:'Which quantity?',at:null}]})
   };announce();};
   window.activity=()=>{state.running=true;const at=Date.now();state.workflow={current:{phase:'reading',platform:'alibaba',conversationKey:'alibaba:ready',detail:'Читаю первое ваше сообщение и проверяю название товара.',at}};state.events.push({type:'workflow_reading',platform:'alibaba',detail:'Открыта переписка для чтения.',at});announce();};
+  window.seedResults=()=>{
+    const now=Date.now(),ready=state.conversations['alibaba:ready'];
+    state.workflow ||= {};state.workflow.visits={
+      'alibaba:ready':{platform:'alibaba',title:ready.title,at:now,status:'expired',detail:'Последняя проверка: дата устарела.',fingerprint:ready.fingerprint,lastResult:{status:'send_unknown',detail:'Связь потеряна после попытки отправки; проверьте чат.',at:now-10000,fingerprint:ready.fingerprint}},
+      'alibaba:done':{platform:'alibaba',title:'Supplier done',at:now-20000,status:'completed',detail:'Ваш WeChat найден в сообщении поставщика.'},
+      'alibaba:waiting':{platform:'alibaba',title:'Supplier waiting',at:now-30000,status:'waiting_supplier',detail:'Первичное обращение осталось без ответа.'},
+      'alibaba:archived':{platform:'alibaba',title:'Archived Supplier <img src=x onerror=alert(1)>',at:Date.UTC(2026,9,19,1,2,3),status:'test_completed',detail:'Пробный цикл завершён. Поставщику ничего не отправлено.'},
+      'mic:skipped':{platform:'mic',title:'Skipped Supplier',at:now-40000,status:'skipped',detail:'Пропущено пользователем, черновик очищен.'},
+      '1688:failed':{platform:'1688',title:'Failed Supplier',at:now-50000,status:'failed',detail:'Кнопка отправки недоступна; отправка не выполнялась.'},
+      'mic:opaque-key-do-not-show':{platform:'mic',at:now-60000,status:'date_unknown',detail:'Дата последнего сообщения не распознана.'}
+    };
+    for(let index=0;index<130;index++)state.workflow.visits['1688:old-'+index]={platform:'1688',title:'Earlier Supplier '+index,at:now-100000-index,status:'ready',detail:'Товар определён. Ожидает обработки.'};
+    announce();
+  };
   window.testPhase=phase=>{folder.test.phase=phase;announce();};
   window.announceState=announce;
   window.finishPreview=text=>{window.chatComposer=text;Object.assign(folder.test,{phase:'completed',text,key:'alibaba:ready',at:Date.now()});state.running=false;state.workflow={current:{phase:'completed',detail:'Точный ответ введён в поле чата. Отправка не выполнялась.',at:Date.now()}};announce();};
@@ -368,6 +382,59 @@ try:
         expect(ui.locator('.dialogs-memory')).to_have_count(0)
         expect(ui.locator('#dialogs-test-next')).to_be_disabled()
         expect(ui.locator('#dialogs-workflow-assessment')).to_contain_text('Сохраните утверждённый товар')
+        ui.evaluate('seedResults()')
+        expect(ui.locator('#dialogs-results-count')).to_contain_text('137 результатов')
+        expect(ui.locator('#dialogs-results-body tr')).to_have_count(50)
+        expect(ui.locator('#dialogs-results-page')).to_contain_text('1–50')
+        ui.locator('#dialogs-results-next').click()
+        expect(ui.locator('#dialogs-results-page')).to_contain_text('51–100')
+        expect(ui.locator('#dialogs-results-body tr')).to_have_count(50)
+        passed('per-chat history lists persisted results beyond live conversation cache with pagination')
+
+        ui.locator('#dialogs-results-search').fill('Supplier ready')
+        expect(ui.locator('#dialogs-results-body tr')).to_have_count(1)
+        expect(ui.locator('#dialogs-results-body')).to_contain_text('Исход отправки неизвестен')
+        expect(ui.locator('#dialogs-results-body')).not_to_contain_text('Пропущен: сообщение старше суток')
+        ui.locator('#dialogs-results-body button').click()
+        expect(ui.locator('#dialogs-outcome-status')).to_have_text('Исход отправки неизвестен')
+        expect(ui.locator('#dialogs-outcome-detail')).to_contain_text('Связь потеряна')
+        expect(ui.locator('[data-key="alibaba:ready"]')).not_to_contain_text('Требует ответа')
+        passed('factual unknown-send outcome remains separate from later eligibility and opens cached chat history')
+
+        ui.locator('#dialogs-results-search').fill('Archived Supplier')
+        expect(ui.locator('#dialogs-results-body tr')).to_have_count(1)
+        expect(ui.locator('#dialogs-results-body')).to_contain_text('Тест завершён — не отправлено')
+        expect(ui.locator('#dialogs-results-body')).to_contain_text('09:02:03')
+        expect(ui.locator('#dialogs-results-body')).to_contain_text('<img src=x onerror=alert(1)>')
+        expect(ui.locator('#dialogs-results-body img')).to_have_count(0)
+        expect(ui.locator('#dialogs-results-body button,#dialogs-results-body a')).to_have_count(0)
+        expect(ui.locator('#dialogs-results-body')).to_contain_text('История не загружена')
+        passed('evicted chat retains named no-send test result and local time, escapes markup and offers no false history link')
+
+        ui.locator('#dialogs-results-search').fill('')
+        ui.locator('#dialogs-results-filter').select_option('completed')
+        expect(ui.locator('#dialogs-results-body tr')).to_have_count(1)
+        expect(ui.locator('#dialogs-results-body')).to_contain_text('WeChat найден — диалог завершён')
+        expect(ui.locator('#dialogs-results-body')).not_to_contain_text('доставлено')
+        ui.locator('#dialogs-results-filter').select_option('skipped')
+        expect(ui.locator('#dialogs-results-body')).to_contain_text('Skipped Supplier')
+        ui.locator('#dialogs-results-platform').select_option('1688')
+        expect(ui.locator('#dialogs-results-body tr')).to_have_count(0)
+        ui.locator('#dialogs-results-filter').select_option('issue')
+        expect(ui.locator('#dialogs-results-body')).to_contain_text('Failed Supplier')
+        expect(ui.locator('#dialogs-results-body')).to_contain_text('отправка не выполнялась')
+        passed('result and platform filters distinguish WeChat completion, skip and failed processing')
+
+        ui.locator('#dialogs-results-platform').select_option('mic')
+        expect(ui.locator('#dialogs-results-body')).to_contain_text('Имя поставщика не прочитано')
+        expect(ui.locator('#dialogs-results-body')).not_to_contain_text('opaque-key-do-not-show')
+        ui.locator('#dialogs-results-platform').select_option('all')
+        ui.locator('#dialogs-results-filter').select_option('pending')
+        ui.locator('#dialogs-results-search').fill('Supplier undated')
+        expect(ui.locator('#dialogs-results-body')).to_contain_text('Ещё не проверен')
+        ui.set_viewport_size({'width':600,'height':850})
+        assert ui.evaluate('document.documentElement.scrollWidth <= window.innerWidth')
+        passed('unvisited chats are explicit and unavailable names never expose technical conversation identifiers')
         assert external == []
         assert errors == [], errors
         passed('deleting memory blocks context-dependent actions; no external network or browser errors')

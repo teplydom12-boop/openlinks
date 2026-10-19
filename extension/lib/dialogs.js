@@ -617,7 +617,7 @@ export function buildDraftPrompt(state,request,now=Date.now()) {
   };
 }
 function normalizeWorkflow(raw){
-  const input=object(raw),result={version:1,cursor:Math.min(integer(input.cursor)??0,1000000000),activity:null,visits:{},history:{},list:{},pinnedKeys:[...new Set((Array.isArray(input.pinnedKeys)?input.pinnedKeys:[]).filter(key=>typeof key==='string'&&key.length<=1600&&DIALOG_PLATFORMS.some(platform=>key.startsWith(platform+':'))))].slice(0,20)};
+  const input=object(raw),result={version:1,orderVersion:integer(input.orderVersion)??0,sweepId:Math.max(1,integer(input.sweepId)??1),platformSince:time(input.platformSince)??0,cursor:Math.min(integer(input.cursor)??0,1000000000),activity:null,visits:{},history:{},list:{},pinnedKeys:[...new Set((Array.isArray(input.pinnedKeys)?input.pinnedKeys:[]).filter(key=>typeof key==='string'&&key.length<=1600&&DIALOG_PLATFORMS.some(platform=>key.startsWith(platform+':'))))].slice(0,20)};
   const activity=object(input.activity);
   if(typeof activity.phase==='string')result.activity={phase:clean(activity.phase,80),platform:platformOK(activity.platform)?activity.platform:'',key:clean(activity.key,1600),detail:clean(activity.detail,1200),at:time(activity.at)};
   // Traversal remembers lightweight list rows independently of the bounded
@@ -627,7 +627,8 @@ function normalizeWorkflow(raw){
   let visitBytes=2;
   for(const [key,rawVisit] of visits){
     if(key.length>1600||!DIALOG_PLATFORMS.some(platform=>key.startsWith(platform+':')))continue;
-    const visit=object(rawVisit),record={at:time(visit.at),preview:clean(visit.preview,1000),status:clean(visit.status,80),detail:clean(visit.detail,1200)};
+    const visit=object(rawVisit),record={at:time(visit.at),sweepId:integer(visit.sweepId)??0,preview:clean(visit.preview,1000),status:clean(visit.status,80),detail:clean(visit.detail,1200),title:clean(visit.title,300),url:safeURL(visit.url,key.split(':')[0]),platform:key.split(':')[0],fingerprint:clean(visit.fingerprint,100)};
+    if(visit.lastResult&&typeof visit.lastResult==='object')record.lastResult={status:clean(visit.lastResult.status,80),detail:clean(visit.lastResult.detail,1200),at:time(visit.lastResult.at),fingerprint:clean(visit.lastResult.fingerprint,100)};
     const bytes=new TextEncoder().encode(JSON.stringify([key,record])).length;if(visitBytes+bytes>2*1024*1024)continue;
     visitBytes+=bytes;result.visits[key]=record;
   }
@@ -636,7 +637,7 @@ function normalizeWorkflow(raw){
     const history=object(rawHistory);if(!['start','latest'].includes(history.phase))continue;
     result.history[key]={phase:history.phase,attempts:Math.min(integer(history.attempts)??0,1000),startedAt:time(history.startedAt),documentToken:clean(history.documentToken,200),frameId:integer(history.frameId)};
   }
-  for(const platform of DIALOG_PLATFORMS){const list=object(object(input.list)[platform]);if(Object.keys(list).length)result.list[platform]={attempts:Math.min(integer(list.attempts)??0,1000),startedAt:time(list.startedAt),nextAt:time(list.nextAt),atEnd:list.atEnd===true};}
+  for(const platform of DIALOG_PLATFORMS){const list=object(object(input.list)[platform]);if(Object.keys(list).length)result.list[platform]={sweepId:integer(list.sweepId)??0,needsStart:list.needsStart===true,hasPagination:list.hasPagination===true,failed:list.failed===true,jobsChecked:list.jobsChecked===true,progressToken:clean(list.progressToken,40000),stalls:Math.min(integer(list.stalls)??0,100),attempts:Math.min(integer(list.attempts)??0,1000),startedAt:time(list.startedAt),nextAt:time(list.nextAt),atEnd:list.atEnd===true};}
   return result;
 }
 function normalizePreviousDraft(value,now=Date.now()){
