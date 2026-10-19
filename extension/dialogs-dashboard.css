@@ -212,3 +212,40 @@ button:focus-visible, a:focus-visible, summary:focus-visible, select:focus-visib
 .dialogs-outcome h4 { margin: 0; font-size: 12px; color: #36564a; }.dialogs-outcome p { margin: 8px 0 0; overflow-wrap: anywhere; }
 @media (max-width: 950px) { .dialogs-results-filters { grid-template-columns: 1fr 1fr; }.dialogs-results-filters > div:last-child { grid-column: 1/-1; } }
 @media (max-width: 720px) { .dialogs-results-filters { grid-template-columns: 1fr; }.dialogs-results-filters > div:last-child { grid-column: auto; } }
+
+/* dashboard.css gives every table nowrap; override it for readable chat reports. */
+.dialogs-results-table, .dialogs-audit-table { white-space: normal; font-size: 13px; line-height: 1.55; }
+.dialogs-results-table th, .dialogs-results-table td { font-size: 13px; white-space: normal; }
+.dialogs-results-table .dialogs-status, .dialogs-results-table td .link-button { font-size: 13px; white-space: normal; }
+.dialogs-results-table td:first-child { max-width: none; overflow: visible; text-overflow: clip; }
+.wechat-audit .hint, .wechat-audit .panel p, .wechat-audit .panel label, .wechat-audit .button, .wechat-audit input, .wechat-audit .link-button, .wechat-audit .dialogs-status, .wechat-audit .dialogs-subtitle, .wechat-audit .tiny-tag, .wechat-audit .dialogs-events li { font-size: 13px; }
+.wechat-audit .tiny-tag { letter-spacing: normal; }
+.dialogs-audit .panel-heading { flex-wrap: wrap; }
+.dialogs-audit-settings { display: grid; grid-template-columns: minmax(200px, 420px) auto; align-items: end; justify-content: start; gap: 14px; margin: 18px 0 0; }
+.dialogs-audit-settings label { margin-top: 0; }
+.dialogs-audit-settings input { width: 100%; }
+.dialogs-audit .actions { flex-wrap: wrap; }
+.dialogs-audit-progress { margin: 20px 0; padding: 16px; border: 1px solid #d9e5e3; border-radius: 8px; background: #f8fbfa; overflow-wrap: anywhere; }
+.dialogs-audit-progress strong { font-size: 16px; }
+.dialogs-audit-progress p { margin: 8px 0 0; }
+.dialogs-audit-progress p:empty { display: none; }
+.dialogs-audit-platform-progress { list-style: none; display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; padding: 0; margin: 18px 0 0; }
+.dialogs-audit-platform-progress li { border: 1px solid var(--line); border-radius: 7px; padding: 12px; min-width: 0; }
+.dialogs-audit-platform-progress strong, .dialogs-audit-platform-progress span { display: block; }
+.dialogs-audit-platform-progress span { margin-top: 5px; font-size: 13px; color: #617582; }
+.dialogs-audit-platform-progress p { overflow-wrap: anywhere; margin-bottom: 0; }
+.dialogs-audit-table { width: 100%; min-width: 1040px; table-layout: fixed; border-collapse: collapse; }
+.dialogs-audit-table th, .dialogs-audit-table td { padding: 14px 12px; font-size: 13px; line-height: 1.55; vertical-align: top; white-space: normal; overflow-wrap: anywhere; border-bottom: 1px solid #e2e9ed; }
+.dialogs-audit-table th { background: #f5f8fa; font-weight: 600; color: #4b6372; }
+.dialogs-audit-table th:nth-child(1) { width: 5%; }.dialogs-audit-table th:nth-child(2) { width: 12%; }.dialogs-audit-table th:nth-child(3) { width: 18%; }.dialogs-audit-table th:nth-child(4) { width: 15%; }.dialogs-audit-table th:nth-child(5) { width: 18%; }.dialogs-audit-table th:nth-child(6) { width: 15%; }.dialogs-audit-table th:nth-child(7) { width: 17%; }
+.dialogs-audit-table td:first-child { max-width: none; overflow: visible; text-overflow: clip; }
+.dialogs-audit-table tbody tr:nth-child(even) { background: #fbfcfd; }
+.dialogs-audit-result { font-weight: 600; color: #425b69; }
+.dialogs-audit-result.good { color: #247047; }.dialogs-audit-result.warn { color: #896218; }.dialogs-audit-result.bad { color: #a44141; }
+.dialogs-audit-table details { min-width: 0; }.dialogs-audit-table summary { cursor: pointer; color: #087f70; }
+.dialogs-audit-table details p { margin: 10px 0; font-size: 13px; line-height: 1.6; color: #4b6372; white-space: pre-wrap; overflow-wrap: anywhere; }
+.dialogs-audit-table details a { display: inline-block; margin-top: 8px; }
+@media (max-width: 950px) { .dialogs-audit-platform-progress { grid-template-columns: 1fr; } }
+@media (max-width: 720px) { .dialogs-audit-settings { grid-template-columns: 1fr; justify-content: stretch; }.dialogs-audit-settings .button { justify-self: start; } }
+
+.dialogs-audit .dialogs-audit-report-note { padding: 12px 14px; border: 1px solid #e6d5ab; border-radius: 7px; background: #fff9eb; color: #805b22; }

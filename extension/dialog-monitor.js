@@ -14,6 +14,8 @@ import {resolveChatAttachments,pruneChatAttachmentCache} from './lib/chat-attach
 import {sameJsonValue} from './lib/json-values.js';
 import {CHAT_CENTERS,CHAT_LAUNCH_TIMEOUT_MS,managedChatRoute,validMICBootstrapURL,isMICBootstrapPage,isMICMessengerPage} from './lib/chat-launch.js';
 import {captureMICChat} from './lib/mic-chat-launch.js';
+import {startWechatAudit,pauseWechatAudit,resumeWechatAudit} from './lib/wechat-audit.js';
+import {createWechatAuditRunner} from './wechat-audit-runner.js';
 
 export const DIALOGS_KEY = 'openlinksDialogs';
 const PROVIDER_KEY = 'openlinksDialogsProvider';
@@ -23,7 +25,8 @@ const PLATFORMS = ['1688','alibaba','mic'];
 const DOMAINS = {'1688':'1688.com',alibaba:'alibaba.com',mic:'made-in-china.com'};
 const READ_TIMEOUT_MS=120000,READ_BACKOFF_MS=5*60000;
 const viewOnlySettings=message=>message?.type==='DIALOGS_SETTINGS'&&message.settings&&Object.keys(message.settings).length===1&&Object.hasOwn(message.settings,'showWorkingTab')&&Object.keys(message).every(key=>['type','settings'].includes(key));
-const KNOWN_COMMANDS = new Set(['JOINT_GET','JOINT_START','JOINT_PAUSE','OPEN_CHATS','SHOW_CHAT','TEST_NEXT','TEST_PLATFORM','TEST_SKIP','REVIEW_SEND','REVIEW_SKIP','GET','LIST_TABS','BIND_TAB','UNBIND_TAB','START','STOP','SCAN','SETTINGS','CONTROL','CONTEXT_EDITING','GENERATE_DRAFT','SAVE_DRAFT','DRAFT_EDITING','SEND_DRAFT','DISCARD_DRAFT','MEMORY_SAVE','MEMORY_DELETE','MEMORY_LOAD','PRODUCT_SAVE','PRODUCT_EXTRACT','PRODUCT_APPROVE','AUTODRAFT','EXPORT_PRODUCT_PROMPT','EXPORT_DRAFT_PROMPT','IMPORT_PRODUCT_RESULT','FOLDER_STATUS','FOLDER_SETTINGS','FOLDER_PRODUCT','FOLDER_DRAFT','FOLDER_POLL','FOLDER_RETRY','FOLDER_CANCEL'].map(name=>'DIALOGS_'+name));
+const KNOWN_COMMANDS = new Set(['AUDIT_START','JOINT_GET','JOINT_START','JOINT_PAUSE','OPEN_CHATS','SHOW_CHAT','TEST_NEXT','TEST_PLATFORM','TEST_SKIP','REVIEW_SEND','REVIEW_SKIP','GET','LIST_TABS','BIND_TAB','UNBIND_TAB','START','STOP','SCAN','SETTINGS','CONTROL','CONTEXT_EDITING','GENERATE_DRAFT','SAVE_DRAFT','DRAFT_EDITING','SEND_DRAFT','DISCARD_DRAFT','MEMORY_SAVE','MEMORY_DELETE','MEMORY_LOAD','PRODUCT_SAVE','PRODUCT_EXTRACT','PRODUCT_APPROVE','AUTODRAFT','EXPORT_PRODUCT_PROMPT','EXPORT_DRAFT_PROMPT','IMPORT_PRODUCT_RESULT','FOLDER_STATUS','FOLDER_SETTINGS','FOLDER_PRODUCT','FOLDER_DRAFT','FOLDER_POLL','FOLDER_RETRY','FOLDER_CANCEL'].map(name=>'DIALOGS_'+name));
+const AUDIT_COMMANDS=new Set(['AUDIT_START','JOINT_GET','OPEN_CHATS','SHOW_CHAT','GET','LIST_TABS','BIND_TAB','UNBIND_TAB','START','STOP','SCAN','SETTINGS'].map(name=>'DIALOGS_'+name));
 
 export function dialogPlatform(url) {
   try {
@@ -84,6 +87,7 @@ export function createDialogMonitor({api=globalThis.chrome, fetchImpl=globalThis
     const release=String(api.runtime.getManifest?.()?.version || '').split('.').map(Number);
     if((release[0]>0||release[1]>=20)&&state.settings.workflowMigrationVersion!==1){state.settings.workflow24h=true;state.settings.showWorkingTab=true;state.settings.workflowMigrationVersion=1;state=normalizeDialogs(state,now());await api.storage.local.set({[DIALOGS_KEY]:state});}
     if(state.settings.workflow24h&&state.workflow.orderVersion!==2){const upgrading=state.workflow.orderVersion>0;state.workflow.orderVersion=2;state.workflow.cursor=0;state.workflow.sweepId=upgrading?state.workflow.sweepId+1:1;state.workflow.platformSince=now();state.workflow.list={};state.workflow.history={};for(const name of PLATFORMS){state.traversal[name].pending=null;state.traversal[name].backoff={};}await api.storage.local.set({[DIALOGS_KEY]:state});}
+    if((release[0]>0||release[1]>=21)&&!state.settings.wechatAudit){state.settings.wechatAudit=true;state.settings.autoDraft=false;state.running=false;await save(state);}
     if(!apiAutoAvailable()&&state.settings.autoDraft) {state.settings.autoDraft=false;await api.storage.local.set({[DIALOGS_KEY]:state});}
     return state;
   };
@@ -102,7 +106,7 @@ export function createDialogMonitor({api=globalThis.chrome, fetchImpl=globalThis
   const publicState = async state => {
     const config=await provider();
     const profiles=Object.fromEntries(Object.entries(config.profiles).map(([name,value])=>[name,{model:value.model,keyStored:!!value.apiKey}]));
-    if(state.settings.workflow24h)for(const item of Object.values(state.conversations)){const assessment=workflowAssessment(state,item,now());item.workflowAssessment={allowed:assessment.allowed,status:assessment.status,detail:assessment.detail,productId:assessment.memoryId || '',productName:assessment.memoryName || ''};}
+    if(state.settings.workflow24h&&!state.settings.wechatAudit)for(const item of Object.values(state.conversations)){const assessment=workflowAssessment(state,item,now());item.workflowAssessment={allowed:assessment.allowed,status:assessment.status,detail:assessment.detail,productId:assessment.memoryId || '',productName:assessment.memoryName || ''};}
     const current=state.workflow?.activity;
     return {ok:true,workflowActivity:current?{...current,action:current.phase,conversationKey:current.key}:null,workflowActivityHistory:state.events.filter(event=>event.type.startsWith('workflow_')).slice(-100).reverse(),state,folder:publicFolder(await loadFolder()),joint:await coordination(),productFingerprint:productFingerprint(state),ai:{provider:config.provider,model:config.model,keyStored:!!config.apiKey,providers:profiles,busy:!!providerTask}};
   };
@@ -321,7 +325,7 @@ export function createDialogMonitor({api=globalThis.chrome, fetchImpl=globalThis
     const before=micBootstrapSource(observed,tab.url);
     if(before.busy){managed.pending=false;markHealth(state,'mic','paused','В чате есть черновик или вы работаете во вкладке. Завершите ввод и повторите проверку подключения.');return;}
     if(!before.ready)return;
-    try {protectTestBinding(await loadFolder(),'mic',tab.id);}catch {managed.pending=false;markHealth(state,'mic','paused','Сначала завершите тестовый цикл в этом чате; сохранённый черновик не изменялся.');return;}
+    try {if(!state.settings.wechatAudit)protectTestBinding(await loadFolder(),'mic',tab.id);}catch {managed.pending=false;markHealth(state,'mic','paused','Сначала завершите тестовый цикл в этом чате; сохранённый черновик не изменялся.');return;}
     if(!api.scripting?.executeScript){managed.pending=false;markHealth(state,'mic','error','Браузер не поддерживает открытие полного чата Made-in-China. Обновите Chromium.');return;}
     try {
       const results=await timeout(api.scripting.executeScript({target:{tabId:tab.id,frameIds:[0]},world:'MAIN',func:captureMICChat}),5000);
@@ -354,7 +358,7 @@ export function createDialogMonitor({api=globalThis.chrome, fetchImpl=globalThis
     const before=micBootstrapSource(observed,tab.url);
     if(before.busy){managed.pending=false;markHealth(state,'mic','paused','Завершите ввод в чате и повторите проверку подключения. Черновик не изменялся.');return;}
     if(!before.ready||!/^[a-f\d]{8}-[a-f\d]{4}-[a-f\d]{4}-[a-f\d]{4}-[a-f\d]{12}$/i.test(before.documentToken)||managed.micInitDocumentToken===before.documentToken)return;
-    try {protectTestBinding(await loadFolder(),'mic',tab.id);}catch {managed.pending=false;markHealth(state,'mic','paused','Сначала завершите тестовый цикл в этом чате.');return;}
+    try {if(!state.settings.wechatAudit)protectTestBinding(await loadFolder(),'mic',tab.id);}catch {managed.pending=false;markHealth(state,'mic','paused','Сначала завершите тестовый цикл в этом чате.');return;}
     let hidden;
     try {const result=await timeout(api.scripting.executeScript({target:{tabId:tab.id,frameIds:[0]},world:'ISOLATED',func:()=>document.visibilityState==='hidden'}),3000);hidden=result?.length===1&&result[0].frameId===0&&result[0].result===true;}catch{return;}
     if(!hidden)return;
@@ -415,14 +419,14 @@ export function createDialogMonitor({api=globalThis.chrome, fetchImpl=globalThis
       try {
         let binding=state.bindings[name],tab=await managedTab(name,binding);
         if(!tab) {
-          protectTestBinding(folder,name,binding.tabId);
+          if(!state.settings.wechatAudit)protectTestBinding(folder,name,binding.tabId);
           // Recover the create->bind gap after an interrupted service worker.
           const previous=registry[name];
           if(previous&&Number.isInteger(previous.tabId)&&typeof previous.token==='string') {
             let candidate;try {candidate=await api.tabs.get(previous.tabId);}catch{}
             if(candidate&&candidate.windowId===previous.windowId&&managedChatRoute(name,candidate.url&&candidate.url!=='about:blank'?candidate.url:candidate.pendingUrl)&&(!candidate.pendingUrl||managedChatRoute(name,candidate.pendingUrl)))tab=candidate;
           }
-          for(const key of new Set([...Object.keys(state.conversations),...folder.jobs.map(job=>job.key)]))if(key.startsWith(name+':')){cancel(key);await folderCancelPending(folder,{key});}
+          if(!state.settings.wechatAudit)for(const key of new Set([...Object.keys(state.conversations),...folder.jobs.map(job=>job.key)]))if(key.startsWith(name+':')){cancel(key);await folderCancelPending(folder,{key});}
           if(!tab) {
             // The initiating window may have closed while another site opened.
             const window=await api.windows.get(windowId);if(window.type!=='normal')throw new Error('Рабочее окно закрыто. Повторно откройте OpenLinks в нужном окне.');
@@ -545,11 +549,11 @@ export function createDialogMonitor({api=globalThis.chrome, fetchImpl=globalThis
     // 1688 virtualizes its sidebar; the visible scroll bottom alone cannot
     // prove the server-side inbox is exhausted. The reader binds native list
     // metadata to its own one-use token, exact rows, geometry and document.
-    if(state.settings.workflow24h&&name==='1688'&&api.scripting?.executeScript)for(let index=0;index<valid.length;index++){
+    if(state.settings.workflow24h&&api.scripting?.executeScript)for(let index=0;index<valid.length;index++){
       const source=valid[index];
       if(source.status!=='ready'||typeof source.inboxEvidenceToken!=='string'||!source.inboxEvidenceToken||source.inboxEvidenceToken.length>200||!source.documentToken)continue;
       try {
-        const results=await timeout(api.scripting.executeScript({target:{tabId:tab.id,frameIds:[source.frameId]},world:'MAIN',files:['inbox-model-evidence.js']}));
+        const results=await timeout(api.scripting.executeScript({target:{tabId:tab.id,frameIds:[source.frameId]},world:'MAIN',files:[name==='1688'?'inbox-model-evidence.js':'non1688-inbox-evidence.js']}));
         if(results?.length!==1||results[0].frameId!==source.frameId)continue;
         const evidence=results[0].result;
         if(evidence?.platform!==name||evidence.url!==source.sourceUrl||!['ready','unsupported'].includes(evidence.status))continue;
@@ -591,7 +595,7 @@ export function createDialogMonitor({api=globalThis.chrome, fetchImpl=globalThis
     const detail=ambiguous.size?'Найдены противоречивые копии диалога в разных фреймах. Черновик для них недоступен.':'';
     markHealth(state,name,'ready',detail);
     mergeDialogSnapshot(state,{platform:name,status:'ready',url:tab.url,detail,conversations},now());
-    for(const row of conversations)if(!recoveryOnly && row.active===true && row.identityReliable===true && row.historyTailKnown===true && row.historyOrderReliable===true) {
+    for(const row of conversations)if(!recoveryOnly && !state.settings.wechatAudit && row.active===true && row.identityReliable===true && row.historyTailKnown===true && row.historyOrderReliable===true) {
       try {await attachmentResolver({api,state,key:conversationKey(name,row.id),rawConversation:row,tabId:tab.id,frameId:row.frameId,documentToken:row.documentToken,sourceUrl:row.sourceUrl,now:now()});}
       catch {const item=state.conversations[conversationKey(name,row.id)];if(item)item.detail='Не удалось прочитать вложение. Подготовка ответа остаётся заблокированной.';}
     }
@@ -1526,11 +1530,29 @@ export function createDialogMonitor({api=globalThis.chrome, fetchImpl=globalThis
     // Reassert the queued pause after any START already ahead of it completed.
     if(message.type==='DIALOGS_JOINT_PAUSE')await pauseOutreachForJoint();
     const state=await load(),folder=await loadFolder();
+    // A conditional stop owns one finite audit, not whichever run happens to
+    // be current when a delayed command reaches the serializer.
+    if(message.type==='DIALOGS_STOP'&&Object.hasOwn(message,'expectedRunId')){
+      if(!state.settings.wechatAudit||state.workflow.audit.runId!==message.expectedRunId)throw new Error('Проверка WeChat уже относится к другому запуску. Чужая проверка не приостановлена.');
+      pauseRequested=true;
+    }
+    if(state.settings.wechatAudit&&!AUDIT_COMMANDS.has(message.type))throw new Error('Включена только проверка WeChat. Подготовка и отправка ответов отключены.');
     const invalidates=['DIALOGS_JOINT_PAUSE','DIALOGS_STOP','DIALOGS_SETTINGS','DIALOGS_CONTEXT_EDITING','DIALOGS_PRODUCT_SAVE','DIALOGS_PRODUCT_APPROVE','DIALOGS_IMPORT_PRODUCT_RESULT','DIALOGS_BIND_TAB','DIALOGS_UNBIND_TAB'];
     const preservePause=state.settings.workflow24h&&['DIALOGS_STOP','DIALOGS_JOINT_PAUSE'].includes(message.type);
-    if(invalidates.includes(message.type)&&!preservePause&&!viewOnlySettings(message))await folderCancelPending(folder);
+    if(!state.settings.wechatAudit&&invalidates.includes(message.type)&&!preservePause&&!viewOnlySettings(message))await folderCancelPending(folder);
     else if(['DIALOGS_CONTROL','DIALOGS_SAVE_DRAFT','DIALOGS_DRAFT_EDITING','DIALOGS_SEND_DRAFT','DIALOGS_DISCARD_DRAFT'].includes(message.type))await folderCancelPending(folder,{key:message.key});
     switch(message.type) {
+      case 'DIALOGS_AUDIT_START': {
+        if(!state.settings.wechatAudit)throw new Error('Режим проверки WeChat не включён.');
+        if(Object.hasOwn(message,'runId')&&state.workflow.audit.runId===message.runId)return {...await publicState(state),auditStartReplayed:true};
+        if(!state.settings.wechat.trim())throw new Error('Укажите свой WeChat ID перед проверкой.');
+        if(PLATFORMS.some(name=>!Number.isInteger(state.bindings[name]?.tabId)))await openManagedChats(state,folder,{},sender);
+        if(typeof disableJointWork==='function')await disableJointWork();
+        cancel();pauseRequested=false;state.workflow.audit=startWechatAudit(state.workflow.audit,state.settings.wechat,now(),message.runId);
+        state.running=true;state.settings.autoDraft=false;
+        activity(state,'audit_running','Начинаю проверку сверху: 1688 → Alibaba → Made-in-China. Проверяю только наличие вашего WeChat ID.');
+        await schedule();break;
+      }
       case 'DIALOGS_JOINT_GET':return {ok:true,joint:await coordination()};
       case 'DIALOGS_JOINT_START': {
         pauseRequested=false;
@@ -1654,7 +1676,7 @@ export function createDialogMonitor({api=globalThis.chrome, fetchImpl=globalThis
           if(outreach?.queue?.some(job=>!['sent','attempted','attempt_unknown','skipped','failed'].includes(job.status) && [job.tabId,job.supplierTabId].includes(tab.id)))throw new Error('Вкладка занята очередью рассылки. Выберите отдельную вкладку для мониторинга.');
           cancel();
           const previous=state.bindings[name];
-          if(previous.tabId!==tab.id){protectTestBinding(folder,name,previous.tabId);await forgetManaged(name);}
+          if(previous.tabId!==tab.id){if(!state.settings.wechatAudit)protectTestBinding(folder,name,previous.tabId);await forgetManaged(name);}
           const managed=previous.tabId===tab.id?previous.managed:null;
           const protection=previous.tabId===tab.id?previous.discardProtection:null;
           if(previous.tabId!==tab.id)await releaseBoundTab(state,name);
@@ -1667,15 +1689,19 @@ export function createDialogMonitor({api=globalThis.chrome, fetchImpl=globalThis
         });
       }
       case 'DIALOGS_UNBIND_TAB': {
-        const name=platform(message.platform);protectTestBinding(folder,name,state.bindings[name].tabId);cancel();await releaseBoundTab(state,name);await forgetManaged(name);unbindDialogTab(state,name,now());await syncLaunchAlarm(state);break;
+        const name=platform(message.platform);if(!state.settings.wechatAudit)protectTestBinding(folder,name,state.bindings[name].tabId);cancel();await releaseBoundTab(state,name);await forgetManaged(name);unbindDialogTab(state,name,now());await syncLaunchAlarm(state);break;
       }
       case 'DIALOGS_START':
         pauseRequested=false;
         if(!Object.values(state.bindings).some(binding=>Number.isInteger(binding.tabId)))throw new Error('Сначала откройте чаты площадок.');
         if(typeof disableJointWork==='function')await disableJointWork();
+        if(state.settings.wechatAudit){
+          state.workflow.audit=resumeWechatAudit(state.workflow.audit,state.settings.wechat,now());state.running=state.workflow.audit.phase==='running';state.settings.autoDraft=false;
+          activity(state,state.running?'audit_running':'audit_blocked',state.running?'Продолжаю проверку WeChat с сохранённого места. Подготовка ответов отключена.':state.workflow.audit.blockedReason);if(state.running)await schedule();break;
+        }
         if(folder.enabled || !apiAutoAvailable())state.settings.autoDraft=false;
         state.running=true;state.readUnread=state.settings.workflow24h||message.readUnread===true;activity(state,'running','Обход чатов запущен: последние сутки → первое ваше сообщение → товар из памяти → ответ продавцу.');log(state,'monitor_started',`${state.settings.scanRead?'Мониторинг проверяет прочитанные диалоги и наличие вашего WeChat в доступной истории.':state.readUnread?'Мониторинг запущен с открытием существующих непрочитанных диалогов.':'Мониторинг запущен без переключения диалогов.'} ${folder.enabled&&folder.auto?'Автоматическая обработка через папку включена.':state.settings.autoDraft?'Авточерновики включены по утверждённому заданию.':'Автоматическая подготовка ответов отключена.'} ${folder.test.enabled?'Тестовый режим: отправка запрещена, один цикл запускается явной кнопкой.':folder.enabled&&folder.auto&&folder.autoSend?'Автоматическая отправка разрешена после проверки контекста и общего лимита.':'Ввод и отправка сообщений отключены.'}`);await schedule();break;
-      case 'DIALOGS_STOP': if(typeof disableJointWork==='function')await disableJointWork();cancel();state.running=false;if(!state.settings.workflow24h)for(const name of PLATFORMS)state.traversal[name].pending=null;activity(state,'paused','Обход приостановлен. Текущие чаты, черновики и задания Claude сохранены.');log(state,'monitor_stopped','Мониторинг приостановлен.');if(folder.enabled)await schedule();else await clearAlarm();break;
+      case 'DIALOGS_STOP': if(typeof disableJointWork==='function')await disableJointWork();cancel();state.running=false;if(state.settings.wechatAudit){state.workflow.audit=pauseWechatAudit(state.workflow.audit,now());activity(state,'paused','Проверка WeChat на паузе. Результаты и позиция сохранены.');await clearAlarm();break;}if(!state.settings.workflow24h)for(const name of PLATFORMS)state.traversal[name].pending=null;activity(state,'paused','Обход приостановлен. Текущие чаты, черновики и задания Claude сохранены.');log(state,'monitor_stopped','Мониторинг приостановлен.');if(folder.enabled)await schedule();else await clearAlarm();break;
       case 'DIALOGS_SCAN':
         for(const name of message.platform?[platform(message.platform)]:PLATFORMS) {
           if(state.bindings[name].managed?.pending)await checkManagedChat(state,name);else await scan(state,name);
@@ -1683,6 +1709,16 @@ export function createDialogMonitor({api=globalThis.chrome, fetchImpl=globalThis
         await save(state);await syncLaunchAlarm(state);return publicState(state);
       case 'DIALOGS_SETTINGS': {
         if(viewOnlySettings(message)){setDialogSettings(state,{...state.settings,showWorkingTab:message.settings.showWorkingTab===true},now());await save(state);return publicState(state);}
+        if(state.settings.wechatAudit){
+          const contact=message.settings?.wechat;
+          if(contact!==undefined&&(typeof contact!=='string'||contact.length>256||/[\r\n\0]/.test(contact)))throw new Error('Укажите один WeChat ID длиной до 256 символов.');
+          if(contact!==undefined&&contact!==state.settings.wechat){
+            cancel();state.running=false;state.workflow.audit=pauseWechatAudit(state.workflow.audit,now());state.settings.wechat=contact.trim();
+            if(state.workflow.audit.runId){state.workflow.audit.phase='blocked';state.workflow.audit.blockedReason='WeChat ID изменён. Начните новую проверку; прежний отчёт относится к прежнему ID.';}
+            activity(state,'paused','WeChat ID изменён. Начните новую проверку; прежний отчёт относится к прежнему ID.');await clearAlarm();
+          }
+          await save(state);return publicState(state);
+        }
         const config=await provider(), selected=validateProvider(message.provider ?? config.provider);
         const profile={...config.profiles[selected]};
         if(Object.hasOwn(message,'model'))profile.model=validateModel(message.model,selected);
@@ -1739,11 +1775,23 @@ export function createDialogMonitor({api=globalThis.chrome, fetchImpl=globalThis
   async function handle(message,sender) {
     if(!KNOWN_COMMANDS.has(message?.type))return {ok:false,error:'Неизвестная команда диалогов.'};
     if(!isUI(sender))return {ok:false,error:'Команда доступна только в интерфейсе расширения.'};
+    // Validate before any cancellation, tab opening or state migration. A
+    // private caller can retry a lost start acknowledgement using the same ID.
+    const namedAuditStart=message.type==='DIALOGS_AUDIT_START'&&Object.hasOwn(message,'runId');
+    if(namedAuditStart&&(typeof message.runId!=='string'||!/^[a-f\d]{8}-[a-f\d]{4}-4[a-f\d]{3}-[89ab][a-f\d]{3}-[a-f\d]{12}$/i.test(message.runId)))return {ok:false,error:'Некорректный идентификатор запуска проверки: требуется UUID версии 4.'};
+    const conditionalStop=message.type==='DIALOGS_STOP'&&Object.hasOwn(message,'expectedRunId');
+    if(conditionalStop&&(typeof message.expectedRunId!=='string'||!message.expectedRunId.trim()||message.expectedRunId.length>200||/[\u0000-\u001f\u007f]/.test(message.expectedRunId)))return {ok:false,error:'Некорректный идентификатор проверки для приостановки.'};
+    if(['DIALOGS_PRODUCT_EXTRACT','DIALOGS_GENERATE_DRAFT'].includes(message.type)&&(await load()).settings.wechatAudit)return {ok:false,error:'Включена только проверка WeChat. Запросы Claude и отправка отключены.'};
     if(['DIALOGS_PRODUCT_EXTRACT','DIALOGS_GENERATE_DRAFT'].includes(message.type)&&!apiAutoAvailable())return {ok:false,error:'Используйте подключённый Claude через локальную папку.'};
     if(message.type==='DIALOGS_PRODUCT_EXTRACT')return extractProduct(message);
     if(message.type==='DIALOGS_GENERATE_DRAFT')return generate(message.key);
-    if(['DIALOGS_STOP','DIALOGS_JOINT_PAUSE'].includes(message.type))pauseRequested=true;
-    if(!viewOnlySettings(message)&&(['DIALOGS_JOINT_PAUSE','DIALOGS_TEST_SKIP','DIALOGS_REVIEW_SEND','DIALOGS_REVIEW_SKIP','DIALOGS_FOLDER_CANCEL','DIALOGS_FOLDER_SETTINGS','DIALOGS_STOP','DIALOGS_SETTINGS','DIALOGS_CONTEXT_EDITING','DIALOGS_MEMORY_SAVE','DIALOGS_MEMORY_DELETE','DIALOGS_MEMORY_LOAD','DIALOGS_PRODUCT_SAVE','DIALOGS_PRODUCT_APPROVE','DIALOGS_IMPORT_PRODUCT_RESULT','DIALOGS_BIND_TAB','DIALOGS_UNBIND_TAB'].includes(message.type) || (message.type==='DIALOGS_AUTODRAFT' && message.enabled!==true)))cancel();
+    if(['DIALOGS_STOP','DIALOGS_JOINT_PAUSE'].includes(message.type)&&!conditionalStop)pauseRequested=true;
+    // An unmatched conditional stop may be queued behind its own START whose
+    // acknowledgement was lost. Leave early flags alone and check ownership
+    // inside command(). Checking storage before early cancellation is racy: a
+    // newer START could acquire ownership between that read and cancel(). A
+    // named START also waits for its idempotency check before cancelling.
+    if(!namedAuditStart&&!conditionalStop&&!viewOnlySettings(message)&&(['DIALOGS_AUDIT_START','DIALOGS_JOINT_PAUSE','DIALOGS_TEST_SKIP','DIALOGS_REVIEW_SEND','DIALOGS_REVIEW_SKIP','DIALOGS_FOLDER_CANCEL','DIALOGS_FOLDER_SETTINGS','DIALOGS_STOP','DIALOGS_SETTINGS','DIALOGS_CONTEXT_EDITING','DIALOGS_MEMORY_SAVE','DIALOGS_MEMORY_DELETE','DIALOGS_MEMORY_LOAD','DIALOGS_PRODUCT_SAVE','DIALOGS_PRODUCT_APPROVE','DIALOGS_IMPORT_PRODUCT_RESULT','DIALOGS_BIND_TAB','DIALOGS_UNBIND_TAB'].includes(message.type) || (message.type==='DIALOGS_AUTODRAFT' && message.enabled!==true)))cancel();
     else if(['DIALOGS_CONTROL','DIALOGS_SAVE_DRAFT','DIALOGS_DRAFT_EDITING','DIALOGS_SEND_DRAFT','DIALOGS_DISCARD_DRAFT'].includes(message.type))cancel(message.key);
     const commandEpoch=epoch(message.key);
     try {
@@ -1756,7 +1804,7 @@ export function createDialogMonitor({api=globalThis.chrome, fetchImpl=globalThis
       }
       // Enqueue immediately, preserving the order of subsequent user commands.
       const result=await exclusive(async()=>{if(earlyPause){const error=await earlyPause;if(error)throw error;}return command(message,commandEpoch,sender);});
-      if(result?.ok&&['DIALOGS_START','DIALOGS_JOINT_START','DIALOGS_TEST_NEXT','DIALOGS_TEST_PLATFORM','DIALOGS_TEST_SKIP','DIALOGS_REVIEW_SKIP','DIALOGS_REVIEW_SEND'].includes(message.type))kickWorkflow();
+      if(result?.ok&&!result.auditStartReplayed&&['DIALOGS_AUDIT_START','DIALOGS_START','DIALOGS_JOINT_START','DIALOGS_TEST_NEXT','DIALOGS_TEST_PLATFORM','DIALOGS_TEST_SKIP','DIALOGS_REVIEW_SKIP','DIALOGS_REVIEW_SEND'].includes(message.type))kickWorkflow();
       return result;
     }
     catch(error) { return {ok:false,error:error instanceof Error && /^[А-ЯЁ]/.test(error.message)?error.message:'Не удалось выполнить команду диалогов. Проверьте выбранную вкладку и настройки.'}; }
@@ -1770,7 +1818,13 @@ export function createDialogMonitor({api=globalThis.chrome, fetchImpl=globalThis
     if(alarm.name!==ALARM)return;
     let continuation=null;
     const autoKey=await exclusive(async()=>{
-      const cycleEpoch=cancelEpoch,state=await load(),folder=await loadFolder();if(!state.running){if(folder.enabled)await pollFolder(state,folder,{dialogs:!state.settings.workflow24h});return null;}
+      const cycleEpoch=cancelEpoch,state=await load(),folder=await loadFolder();
+      if(state.settings.wechatAudit){
+        if(!state.running)return null;
+        const turn=await dialogTurn(()=>createWechatAuditRunner({api,now,scanPlatform,activateWorkingTab,activity,save,cancelled:()=>cancelEpoch!==cycleEpoch||!state.running}).step(state));
+        continuation=turn.allowed?turn.value:null;return null;
+      }
+      if(!state.running){if(folder.enabled)await pollFolder(state,folder,{dialogs:!state.settings.workflow24h});return null;}
       if(state.settings.workflow24h&&folder.review?.phase!=='none'&&folder.review){activity(state,'awaiting_approval',folder.review.detail || 'Ответ введён в поле чата. Подтвердите отправку или пропустите продавца.',{key:folder.review.key,platform:state.conversations[folder.review.key]?.platform});await save(state);await pollFolder(state,folder,{dialogs:false});return null;}
       if(folder.test.enabled&&['paused','preparing','completed','blocked'].includes(folder.test.phase)){await pollFolder(state,folder);return null;}
       const turn=await dialogTurn(async()=>{
@@ -1833,7 +1887,14 @@ export function createDialogMonitor({api=globalThis.chrome, fetchImpl=globalThis
   };
   const resetBindings=()=>exclusive(async()=>{
     if(typeof disableJointWork==='function')await disableJointWork();
-    cancel();const state=await load(),folder=await loadFolder();state.running=false;if(folder.review?.phase!=='none'&&folder.review){folder.review.phase='blocked';folder.review.detail='Браузер или расширение перезапущены. Проверьте подготовленный текст; пропустите его для безопасной очистки перед продолжением.';}await folderCancelPending(folder);folder.enabled=false;folder.auto=false;folder.autoSend=false;if(folder.test.enabled&&!['completed','paused'].includes(folder.test.phase)){folder.test.phase='blocked';folder.test.detail='Chrome перезапущен. Тест остановлен; проверьте вкладки и начните цикл явно.';}await saveFolder(folder);
+    cancel();const state=await load(),folder=await loadFolder();state.running=false;
+    if(state.settings.wechatAudit)state.workflow.audit=pauseWechatAudit(state.workflow.audit,now());
+    else {
+      if(folder.review?.phase!=='none'&&folder.review){folder.review.phase='blocked';folder.review.detail='Браузер или расширение перезапущены. Проверьте подготовленный текст; пропустите его для безопасной очистки перед продолжением.';}
+      await folderCancelPending(folder);folder.enabled=false;folder.auto=false;folder.autoSend=false;
+      if(folder.test.enabled&&!['completed','paused'].includes(folder.test.phase)){folder.test.phase='blocked';folder.test.detail='Chrome перезапущен. Тест остановлен; проверьте вкладки и начните цикл явно.';}
+      await saveFolder(folder);
+    }
     for(const name of PLATFORMS)if(Number.isInteger(state.bindings[name]?.tabId)) {
       // An extension update may be delivered at browser startup before
       // onStartup. Neither event proves that persisted IDs still identify our

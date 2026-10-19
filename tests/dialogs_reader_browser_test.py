@@ -14,6 +14,7 @@ READER = ROOT / 'extension/dialogs-content.js'
 MODEL_EVIDENCE = (ROOT / 'extension/chat-model-evidence.js').read_text()
 HISTORY_MODEL_EVIDENCE = (ROOT / 'extension/history-model-evidence.js').read_text()
 INBOX_MODEL_EVIDENCE = (ROOT / 'extension/inbox-model-evidence.js').read_text()
+NON_1688_INBOX_MODEL_EVIDENCE = (ROOT / 'extension/non1688-inbox-evidence.js').read_text()
 checks = 0
 TRANSPORT = """
 window.readerListeners=[];
@@ -291,7 +292,7 @@ with sync_playwright() as p:
     passed('identical DOM signatures are ambiguous and cannot collapse two staff messages into one server ID')
 
     request=prepare_staff_evidence();page.evaluate('document.querySelector(".message-item:not(.self) .nick").textContent="Synthetic supplier"')
-    before=snapshot();assert 'modelEvidenceToken' not in before
+    before=snapshot();assert before['modelEvidenceToken'] and active(before)['messages'][-1]['direction']=='inbound'
     # Keep another staff row unknown so collection is requested while one known
     # incoming row contains deliberately contradictory account evidence.
     page.evaluate('document.querySelector(".message-item:not(.self)").setAttribute("data-direction","unknown")')
@@ -358,7 +359,7 @@ with sync_playwright() as p:
 
     def complete_1688():
         load_active1688()
-        page.evaluate('const history=document.querySelector(".message-list"),wrapper=document.createElement("div");wrapper.className="ww_message";history.parentElement.insertBefore(wrapper,history);wrapper.append(history);document.querySelector(".rc-scrollbars-view").insertAdjacentHTML("afterbegin","<div><span>暂无更多消息</span></div>")')
+        page.evaluate('const history=document.querySelector(".message-list"),wrapper=document.createElement("div");wrapper.className="ww_message";history.parentElement.insertBefore(wrapper,history);wrapper.append(history);document.querySelector(".rc-scrollbars-view").insertAdjacentHTML("afterbegin","<div><span>暂无更多消息</span></div>");for(const message of document.querySelectorAll(".message-item"))message.setAttribute("data-timestamp",String(Date.now()-1000))')
         active();page.wait_for_timeout(1100)
         assert active()['historyComplete']
     complete_1688()
@@ -721,47 +722,62 @@ with sync_playwright() as p:
     assert page.evaluate('document.querySelector(".window-center-messages-main").scrollTop')>0
     passed('MIC scrolls its transcript and notifies the exact native history handler even when the surrounding panel owns scroll geometry; no wheel or focus input')
 
+    def alibaba_inbox_snapshot():
+        # These long-list tests isolate reader scrolling from the separately
+        # tested native collector. Supply an explicit current native contract;
+        # geometry alone no longer grants order or end-of-list evidence.
+        source=snapshot()
+        if source.get('inboxEvidenceToken'):
+            evidence=page.evaluate("""()=>{
+              const sidebar=document.querySelector('.buyer-conversation-list'),list=document.querySelector('.normal-list-container'),rows=[...list.querySelectorAll('.contact-item-container')],html=sidebar.outerHTML;
+              let a=2166136261,b=2246822507;for(let i=0;i<html.length;i++){a=Math.imul(a^html.charCodeAt(i),16777619);b=Math.imul(b^html.charCodeAt(i),3266489909)}
+              return {status:'ready',platform:'alibaba',schema:'alibaba-inbox-pagination-v1',url:location.href,capturedAt:Date.now(),domSignature:`${(a>>>0).toString(16)}${(b>>>0).toString(16)}:${html.length}`,limited:false,firstScreenRequestEnds:true,loadedCount:rows.length,itemCount:rows.length,hasMore:true,loading:false,scrollTop:list.scrollTop,scrollHeight:list.scrollHeight,clientHeight:list.clientHeight,scrollOffset:list.scrollTop,startVerified:list.scrollTop<=3,endVerified:list.scrollHeight-list.clientHeight-list.scrollTop<=3,rowRanks:rows.map((row,index)=>({id:row.getAttribute('data-cid'),index}))};
+            }""")
+            result=page.evaluate('(request)=>OpenLinksDialogsReader.applyInboxEvidence(request)',{'expectedDocumentToken':source['documentToken'],'evidenceToken':source['inboxEvidenceToken'],'evidence':evidence})
+            assert result['ok'],result
+        return snapshot()
+
     load(OBSERVED_ALIBABA,'https://message.alibaba.com/message/default.htm')
     page.evaluate('''()=>{const list=document.querySelector('.normal-list-container');list.style.cssText='height:120px;overflow-y:auto';for(let i=0;i<8;i++){const row=list.firstElementChild.cloneNode(true);row.setAttribute('data-cid',`91000001${i}-910000009#11011@icbu`);list.append(row)}}''')
-    coverage=snapshot()['listCoverage'];assert coverage['hasMore'] and not coverage['complete'] and coverage['atStart']
-    request={'documentToken':snapshot()['documentToken'],'listToken':coverage['token']}
+    coverage=alibaba_inbox_snapshot()['listCoverage'];assert coverage['hasMore'] and not coverage['complete'] and coverage['atStart']
+    request={'documentToken':alibaba_inbox_snapshot()['documentToken'],'listToken':coverage['token']}
     effects=page.evaluate('({...readerSideEffects})')
     assert not page.evaluate('(r)=>OpenLinksDialogsReader.advanceList({...r,listToken:"stale"})',request)['ok']
     assert page.evaluate('(r)=>OpenLinksDialogsReader.advanceList(r)',request)['ok']
     assert page.evaluate('document.querySelector(".normal-list-container").scrollTop')>0 and page.evaluate('readerSideEffects')==effects
-    assert not snapshot()['listCoverage']['atStart']
+    assert not alibaba_inbox_snapshot()['listCoverage']['atStart']
     assert not page.evaluate('(r)=>OpenLinksDialogsReader.advanceList(r)',request)['ok']
-    coverage=snapshot()['listCoverage'];request={'documentToken':snapshot()['documentToken'],'listToken':coverage['token'],'direction':'start'}
+    coverage=alibaba_inbox_snapshot()['listCoverage'];request={'documentToken':alibaba_inbox_snapshot()['documentToken'],'listToken':coverage['token'],'direction':'start'}
     assert page.evaluate('(r)=>OpenLinksDialogsReader.advanceList(r)',request)['ok']
-    assert page.evaluate('document.querySelector(".normal-list-container").scrollTop')==0 and page.evaluate('selectedThreads')==[] and snapshot()['listCoverage']['atStart']
+    assert page.evaluate('document.querySelector(".normal-list-container").scrollTop')==0 and page.evaluate('selectedThreads')==[] and alibaba_inbox_snapshot()['listCoverage']['atStart']
     passed('inbox traversal scrolls only the verified list with one-use tokens, overlaps batches and resets to newest without selecting or closing chats')
 
     load(OBSERVED_ALIBABA,'https://message.alibaba.com/message/default.htm')
     page.evaluate('''()=>{const list=document.querySelector('.normal-list-container');list.style.cssText='height:100px;overflow-y:auto';list.firstElementChild.style.height='15000px'}''')
-    effects=page.evaluate('({...readerSideEffects})');previous=snapshot()['listCoverage']['progressToken']
+    effects=page.evaluate('({...readerSideEffects})');previous=alibaba_inbox_snapshot()['listCoverage']['progressToken']
     for step in range(1,101):
-        source=snapshot();coverage=source['listCoverage'];assert coverage['hasMore'] and coverage['status']=='ready' and coverage['stalledAttempts']==0
+        source=alibaba_inbox_snapshot();coverage=source['listCoverage'];assert coverage['hasMore'] and coverage['status']=='ready' and coverage['stalledAttempts']==0
         reply=page.evaluate('(r)=>OpenLinksDialogsReader.advanceList(r)',{'documentToken':source['documentToken'],'listToken':coverage['token']})
         assert reply['ok'] and reply['advanced'] and reply['steps']==step and reply['stalledAttempts']==0
         assert reply['progressToken']!=previous;previous=reply['progressToken']
-    assert snapshot()['listCoverage']['hasMore'] and page.evaluate('readerSideEffects')==effects and page.evaluate('selectedThreads')==[]
+    assert alibaba_inbox_snapshot()['listCoverage']['hasMore'] and page.evaluate('readerSideEffects')==effects and page.evaluate('selectedThreads')==[]
     passed('more than 64 legitimate inbox pages remain traversable while real scroll progress continues, without clicking or selecting chats')
 
     load(OBSERVED_ALIBABA,'https://message.alibaba.com/message/default.htm')
     page.evaluate('''()=>{const list=document.querySelector('.normal-list-container');list.style.cssText='height:100px;overflow-y:auto';list.firstElementChild.style.height='500px';Object.defineProperty(list,'scrollTop',{configurable:true,get:()=>0,set:()=>{}})}''')
-    previous=snapshot()['listCoverage']['progressToken']
+    previous=alibaba_inbox_snapshot()['listCoverage']['progressToken']
     for attempt in range(1,9):
-        source=snapshot();coverage=source['listCoverage'];assert coverage['hasMore'] and coverage['progressToken']==previous
+        source=alibaba_inbox_snapshot();coverage=source['listCoverage'];assert coverage['hasMore'] and coverage['progressToken']==previous
         reply=page.evaluate('(r)=>OpenLinksDialogsReader.advanceList(r)',{'documentToken':source['documentToken'],'listToken':coverage['token']})
         assert reply['ok'] and not reply['advanced'] and reply['stalledAttempts']==attempt and reply['progressToken']==previous
-    source=snapshot();coverage=source['listCoverage'];assert not coverage['hasMore'] and coverage['status']=='limited' and coverage['stalledAttempts']==8
+    source=alibaba_inbox_snapshot();coverage=source['listCoverage'];assert not coverage['hasMore'] and coverage['status']=='limited' and coverage['stalledAttempts']==8
     assert not page.evaluate('(r)=>OpenLinksDialogsReader.advanceList(r)',{'documentToken':source['documentToken'],'listToken':coverage['token']})['ok']
     page.evaluate('''()=>{const row=document.querySelector('.contact-item-container');row.setAttribute('data-cid','910000099-910000009#11011@icbu')}''')
-    source=snapshot();coverage=source['listCoverage'];assert coverage['hasMore'] and coverage['status']=='ready' and coverage['stalledAttempts']==0 and coverage['progressToken']!=previous
+    source=alibaba_inbox_snapshot();coverage=source['listCoverage'];assert coverage['hasMore'] and coverage['status']=='ready' and coverage['stalledAttempts']==0 and coverage['progressToken']!=previous
     reply=page.evaluate('(r)=>OpenLinksDialogsReader.advanceList(r)',{'documentToken':source['documentToken'],'listToken':coverage['token']})
     assert reply['stalledAttempts']==1 and not reply['advanced']
     page.evaluate("delete document.querySelector('.normal-list-container').scrollTop")
-    source=snapshot();reply=page.evaluate('(r)=>OpenLinksDialogsReader.advanceList(r)',{'documentToken':source['documentToken'],'listToken':source['listCoverage']['token']})
+    source=alibaba_inbox_snapshot();reply=page.evaluate('(r)=>OpenLinksDialogsReader.advanceList(r)',{'documentToken':source['documentToken'],'listToken':source['listCoverage']['token']})
     assert reply['advanced'] and reply['stalledAttempts']==0
     passed('eight identical inbox attempts stop; fresh virtual rows or actual scroll movement reset the stall guard, while fresh action tokens alone do not')
 
@@ -772,15 +788,15 @@ with sync_playwright() as p:
         const row=template.cloneNode(true);row.setAttribute('data-cid',`${930000000+index}-910000009#11011@icbu`);row.style.cssText='height:30px;min-height:30px;overflow:hidden';row.classList.toggle('selected',index===0);list.append(row);
       }
     }''')
-    effects=page.evaluate('({...readerSideEffects})');first=snapshot();assert len(first['conversations'])==200
+    effects=page.evaluate('({...readerSideEffects})');first=alibaba_inbox_snapshot();assert len(first['conversations'])==200
     assert not any('930000220-' in row['id'] for row in first['conversations'])
     page.evaluate('''()=>{const list=document.querySelector('.normal-list-container');list.scrollTop=list.children[220].getBoundingClientRect().top-list.getBoundingClientRect().top}''')
-    later=snapshot();ids=[row['id'] for row in later['conversations']]
+    later=alibaba_inbox_snapshot();ids=[row['id'] for row in later['conversations']]
     assert len(ids)<=200 and any('930000220-' in id for id in ids) and any('930000249-' in id for id in ids)
     assert any('930000000-' in row['id'] and row['active'] for row in later['conversations'])
     assert page.evaluate('readerSideEffects')==effects and page.evaluate('selectedThreads')==[]
     page.evaluate("document.querySelector('.buyer-conversation-list').style.transform='translateY(2000px)'")
-    clipped=snapshot()['listCoverage'];assert clipped['status']=='limited' and clipped['windowLimited'] and not clipped['hasMore'] and not clipped['complete']
+    clipped=alibaba_inbox_snapshot()['listCoverage'];assert clipped['status']=='limited' and clipped['windowLimited'] and not clipped['hasMore'] and not clipped['complete']
     passed('a nonvirtualized native inbox beyond 200 rows exposes the current viewport window after scrolling while retaining the active conversation and per-snapshot bound')
 
     load_active1688();page.evaluate('''()=>{const active=document.querySelector('.conversation-item.active');active.parentElement.append(active)}''')
@@ -997,6 +1013,279 @@ with sync_playwright() as p:
     request=alibaba_history_evidence();page.evaluate('nativeHistoryData.noMoreCache=Object.create({930000001:true})')
     assert page.evaluate(HISTORY_MODEL_EVIDENCE)['status']=='unsupported'
     passed('Alibaba boundary cache requires own plain data properties and never calls getters or trusts inherited flags')
+
+    def audit_wechat(contact='buyer_wechat_42', **overrides):
+        source=snapshot();row=active(source)
+        request={'documentToken':source['documentToken'],'conversationId':row['id'],'wechatId':contact,**overrides}
+        return page.evaluate('(request)=>OpenLinksDialogsReader.checkWechat(request)',request)
+
+    def known_1688_time_evidence(future=False, attachment=False, conflict=False):
+        prepare_staff_evidence()
+        page.evaluate('''([future,attachment,conflict])=>{
+          const rows=[...document.querySelectorAll('.message-item-line')];
+          document.querySelector('.message-item:not(.self) .nick').textContent='Synthetic supplier';
+          const label=document.querySelector('.conversation-item .time');if(label)label.textContent='10-18';
+          for(const node of document.querySelectorAll('.first-line > .time'))node.textContent='10-18 09:01';
+          const at=Date.now()+(future?600001:-1000);rows[0].__reactProps$synthetic.message.sendTime=at-1000;rows[2].__reactProps$synthetic.message.sendTime=at;
+          if(attachment)rows[2].querySelector('.content-row > .content').insertAdjacentHTML('beforeend','<img src="data:image/png;base64,c3ludGhldGlj" width="20" height="20">');
+          if(conflict)rows[2].querySelector('.message-item').setAttribute('data-timestamp',String(at-600000));
+          window.expectedNativeTime=at;
+        }''',[future,attachment,conflict])
+        current=snapshot();assert current['modelEvidenceToken'] and active(current)['coverage']['unknownSenders']==0
+        return {'documentToken':current['documentToken'],'modelEvidenceToken':current['modelEvidenceToken'],'evidence':page.evaluate(MODEL_EVIDENCE)}
+
+    request=known_1688_time_evidence(attachment=True)
+    assert page.evaluate('(r)=>OpenLinksDialogsReader.applyModelEvidence(r)',request)['ok']
+    active();page.wait_for_timeout(1100);row=active()
+    assert row['latestMessageAtReliable'] and row['latestMessageAt']==page.evaluate('expectedNativeTime') and row['coverage']['unreadAttachments']>0
+    assert not row['tailKnown'] and not row['historyComplete'] and row['messages'][-1]['id']=='server-staff'
+    passed('1688 exact native sendTime establishes age with known senders, yearless labels and unread photos while preserving reply coverage guards')
+
+    request=known_1688_time_evidence(future=True)
+    assert page.evaluate('(r)=>OpenLinksDialogsReader.applyModelEvidence(r)',request)['ok']
+    active();page.wait_for_timeout(1100);row=active()
+    assert not row['latestMessageAtReliable'] and 'at' not in row['messages'][-1]
+    request=known_1688_time_evidence(conflict=True)
+    assert page.evaluate('(r)=>OpenLinksDialogsReader.applyModelEvidence(r)',request)['ok']
+    active();page.wait_for_timeout(1100);row=active()
+    assert row['latestMessageAt']!=page.evaluate('expectedNativeTime') and row['messages'][-1]['at']==page.evaluate('expectedNativeTime-600000')
+    passed('1688 future or contradictory native sendTime cannot replace an independently dated DOM message or infer a yearless message date')
+
+    known_1688_time_evidence()
+    page.evaluate('''()=>{document.querySelector('.message-item.self').closest('.message-item-line').remove();document.querySelector('.message-item:not(.self) .nick').textContent='Synthetic supplier:Synthetic staff'}''')
+    current=snapshot();request={'documentToken':current['documentToken'],'modelEvidenceToken':current['modelEvidenceToken'],'evidence':page.evaluate(MODEL_EVIDENCE)}
+    result=page.evaluate('(r)=>OpenLinksDialogsReader.applyModelEvidence(r)',request)
+    assert result['ok'] and result['timestampsOnly']
+    active();page.wait_for_timeout(1100);row=active()
+    assert row['latestMessageAtReliable'] and row['latestMessageAt']==page.evaluate('expectedNativeTime')
+    assert row['messages'][-1]['direction']=='unknown' and row['coverage']['unknownSenders']==1 and not row['firstBuyerMessageReliable']
+    passed('a page with no buyer message can prove native message age without inventing sender direction or granting first-buyer context')
+
+    load_active1688()
+    page.evaluate('''()=>{
+      const history=document.querySelector('.message-list'),wrapper=document.createElement('div');wrapper.className='ww_message';history.parentElement.insertBefore(wrapper,history);wrapper.append(history);
+      const scroller=document.querySelector('.rc-scrollbars-view');scroller.style.cssText='height:100px;overflow:auto';for(const row of scroller.children)row.style.minHeight='140px';scroller.scrollTop=0;
+      for(const message of document.querySelectorAll('.message-item'))message.setAttribute('data-timestamp',String(Date.now()-1000));
+      document.querySelector('.message-item.self pre').textContent='My WeChat: buyer_wechat_42';
+    }''')
+    active();page.wait_for_timeout(1100);source=snapshot();row=active(source)
+    assert not row['historyTailKnown'] and not row['latestMessageAtReliable']
+    result=audit_wechat();assert result['reason']=='history_tail_missing' and not result['found']
+    request={'documentToken':source['documentToken'],'conversationId':row['id']}
+    assert page.evaluate('(r)=>OpenLinksDialogsReader.revealLatest(r)',request)['ok']
+    result=audit_wechat();assert result['status']=='found' and result['latestMessageAtReliable'] and active()['historyTailKnown']
+    page.evaluate('document.querySelector(".rc-scrollbars-view").scrollTop=0')
+    result=audit_wechat();assert result['status']=='found' and result['latestMessageAtReliable'] and not active()['historyTailKnown']
+    passed('a cold already-active chat with a visible ID must read its tail to establish age; exact audit proof permits that reveal and preserves a previously proven date')
+
+    load_active1688()
+    page.evaluate('''()=>{const originalNow=Date.now;window.ageProofClock=0;Date.now=()=>originalNow()+ageProofClock;document.querySelector('.message-item.self pre').textContent='WeChat: buyer_wechat_42'}''')
+    active();page.evaluate('ageProofClock+=1100')
+    result=audit_wechat();assert result['status']=='loading' and result['reason']=='latest_time_pending' and not result['found']
+    page.evaluate('ageProofClock+=3001')
+    for _ in range(3):
+        result=audit_wechat();assert result['status']=='incomplete' and result['reason']=='latest_time_unknown' and not result['found']
+        page.evaluate('ageProofClock+=1100')
+    passed('missing native time receives one bounded pending window and then stays explicitly incomplete instead of finalizing a visible ID or loading forever')
+
+    complete_1688();effects=page.evaluate('({...readerSideEffects})');request_count=len(requests)
+    result=audit_wechat()
+    assert result['status']=='not_found' and not result['found'] and result['complete'] and result['fullHistory'] and result['checkedMessages']==3
+    assert result['identityReliable'] and result['conversationId']==active()['id'] and result['documentToken']==snapshot()['documentToken']
+    assert page.evaluate('readerSideEffects')==effects and len(requests)==request_count
+    assert not audit_wechat(documentToken='old-document')['ok'] and not audit_wechat(conversationId='different-thread')['ok']
+    assert not audit_wechat('')['ok']
+    assert audit_wechat('x'*256)['ok'] and not audit_wechat('x'*257)['ok']
+    passed('WeChat audit proves a negative only from fresh complete history, binds exact document/recipient, and performs no clicks, input, focus or requests')
+
+    before=audit_wechat()
+    page.evaluate('document.querySelector(".message-item:not(.self) .nick").textContent="Cosmetic sender label";document.body.insertAdjacentHTML("beforeend","<div>Loading counter 12</div>")')
+    cosmetic=audit_wechat();assert cosmetic['historyProgress']==before['historyProgress'] and cosmetic['checkedMessages']==before['checkedMessages']
+    page.evaluate('document.querySelector(".message-item.self pre").textContent="A newly loaded older page with the same number of messages"')
+    changed=audit_wechat();assert changed['historyProgress']!=before['historyProgress'] and changed['checkedMessages']==before['checkedMessages']
+    assert len(changed['historyProgress'])<200
+    passed('fixed-size history pages expose real message-body progress while timestamps, sender labels and cosmetic UI cannot reset the stall guard')
+
+    page.evaluate('document.querySelector(".message-item:not(.self) .nick").textContent="Unknown sender";document.querySelector(".message-item:not(.self) pre").textContent="Add buyer_wechat_42, please"')
+    assert audit_wechat()['status']=='loading'
+    page.wait_for_timeout(1100);result=audit_wechat()
+    assert result['status']=='found' and result['found'] and result['matchDirection']=='unknown' and result['complete']
+    assert not active()['historyComplete'] and active()['historyTextComplete']
+    page.evaluate('document.querySelector(".message-item:not(.self) pre").textContent="No contact in this message"')
+    active();page.wait_for_timeout(1100)
+    assert audit_wechat()['status']=='not_found'
+    passed('WeChat auditing does not require sender classification; complete unknown-sender text is auditable while reply history safeguards remain strict')
+
+    page.evaluate('document.querySelector(".message-item-system").textContent="ID: ＢＵＹＥＲ＿ＷＥＣＨＡＴ＿４２"')
+    active();page.wait_for_timeout(1100);result=audit_wechat()
+    assert result['status']=='found' and result['matchDirection']=='system'
+    page.evaluate('document.querySelector(".message-item-system").textContent="prefixbuyer_wechat_42 and buyer_wechat_42suffix"')
+    active();page.wait_for_timeout(1100);assert audit_wechat()['status']=='not_found'
+    passed('audit accepts an exact normalized ID in any actual message and rejects IDs embedded inside a different account name')
+
+    complete_1688()
+    page.evaluate('''()=>{document.querySelector('.message-item:not(.self) .nick').textContent='buyer_wechat_42';document.querySelector('pre[contenteditable=true]').textContent='buyer_wechat_42';document.body.insertAdjacentHTML('beforeend','<div>buyer_wechat_42</div>');document.querySelector('.message-item.self pre').insertAdjacentHTML('beforeend','<span class=sender-name>buyer_wechat_42</span>')}''')
+    active();page.wait_for_timeout(1100);assert audit_wechat()['status']=='not_found'
+    page.evaluate('document.querySelector(".message-item:not(.self) .content-row > .content").innerHTML="<div class=file-msg><div class=file-name>buyer_wechat_42</div></div>"')
+    active();page.wait_for_timeout(1100);result=audit_wechat()
+    assert result['status']=='not_found' and not result['found'] and result['complete'] and result['textOnly'] and result['uncheckedAttachments']==1
+    assert result['detail']=='Ваш WeChat ID не найден в тексте сообщений. Вложения и QR-коды не проверялись.'
+    assert not active()['historyComplete'] and active()['historyTextComplete']
+    passed('sender labels, drafts, UI and attachment filenames cannot falsely complete an audit; text-only negatives explicitly exclude unread files and QR codes')
+    page.evaluate('document.querySelector(".rc-scrollbars-view").insertAdjacentHTML("beforeend","<div class=message-item-line><div>Unrecognized actual message text</div></div>")')
+    active();page.wait_for_timeout(1100);assert audit_wechat()['status']=='incomplete'
+    passed('excluding attachment bodies never hides unrecognized actual message text from an incomplete audit result')
+
+    complete_1688()
+    page.evaluate('''()=>{const first=document.querySelector('.message-item.self').closest('.message-item-line');first.querySelector('pre').textContent='Contact buyer_wechat_42';for(let i=0;i<90;i++){const row=first.cloneNode(true);row.querySelector('pre').textContent='Filler message '+i;first.parentElement.append(row)}}''')
+    active();page.wait_for_timeout(1100);result=audit_wechat()
+    assert result['status']=='found' and result['checkedMessages']==93
+    assert all('buyer_wechat_42' not in message['text'] for message in active()['messages'][-80:])
+    passed('fresh reader audit finds an early ID outside the last 80 messages retained by the persisted conversation cache')
+
+    complete_1688();current=active()
+    request={'conversationId':current['id'],'documentToken':snapshot()['documentToken'],'purpose':'wechat-audit'}
+    assert page.evaluate('(r)=>OpenLinksDialogsReader.loadHistoryStart(r)',request)['complete']
+    page.evaluate('document.querySelector(".rc-scrollbars-view > div:first-child").remove()')
+    active();page.wait_for_timeout(1100);assert active()['firstBuyerMessageReliable']
+    assert audit_wechat()['reason']=='history_start_missing'
+    response=page.evaluate('(r)=>OpenLinksDialogsReader.loadHistoryStart(r)',request)
+    assert response['status']=='loading' and not response.get('complete')
+    assert page.evaluate('(r)=>OpenLinksDialogsReader.loadHistoryStart({...r,purpose:"first-buyer"})',request)['complete']
+    passed('WeChat history loading does not mistake a cached first-buyer proof for a freshly loaded full history; legacy first-message behavior is preserved')
+
+    page.evaluate('const originalAuditNow=Date.now;window.auditClockAdvance=0;Date.now=()=>originalAuditNow()+auditClockAdvance')
+    for attempt in range(2,9):
+        page.evaluate('auditClockAdvance+=1100')
+        result=page.evaluate('(r)=>OpenLinksDialogsReader.loadHistoryStart(r)',request)
+        assert result['attempts']==attempt
+    page.evaluate('auditClockAdvance+=1100')
+    assert page.evaluate('(r)=>OpenLinksDialogsReader.loadHistoryStart(r)',request)['status']=='limited'
+    page.evaluate('document.querySelector(".rc-scrollbars-view").insertAdjacentHTML("afterbegin","<div class=message-item-line><div class=message-item-system>Newly loaded older message</div></div>")')
+    active();page.evaluate('auditClockAdvance+=1100')
+    assert page.evaluate('(r)=>OpenLinksDialogsReader.loadHistoryStart(r)',request)['attempts']==1
+    passed('audit history stops after eight real no-progress attempts but resets that counter when an older page actually adds message content')
+
+    complete_1688()
+    page.evaluate('const body=document.querySelector(".message-item.self pre");for(let i=0;i<3001;i++)body.append(document.createElement("span"))')
+    assert audit_wechat()['status']=='incomplete'
+    complete_1688()
+    page.evaluate('document.querySelector(".rc-scrollbars-view").style.cssText="height:60px;overflow:auto";document.querySelector(".rc-scrollbars-view").scrollTop=0')
+    assert audit_wechat()['reason']=='history_tail_missing'
+    passed('DOM traversal limits and an unvisited history tail never become a conclusive WeChat-not-found result')
+
+    for adapter,prepare in [('Alibaba',alibaba_history_evidence),('Made-in-China',mic_history_evidence)]:
+        request=prepare();assert page.evaluate('(r)=>OpenLinksDialogsReader.applyHistoryEvidence(r)',request)['ok']
+        result=audit_wechat();assert result['status']=='not_found' and result['complete'],(adapter,result)
+        selector='.session-rich-content' if adapter=='Alibaba' else '.msg-text'
+        page.evaluate('(selector)=>document.querySelector(selector).textContent="WeChat: buyer_wechat_42"',selector)
+        active();page.wait_for_timeout(1100)
+        result=audit_wechat();assert result['status']=='found' and not result['complete'],(adapter,result)
+        page.evaluate('(selector)=>document.querySelector(selector).parentElement.innerHTML="<img src=data:image/png;base64,c3ludGhldGlj style=width:32px;height:32px>"',selector)
+        active();page.wait_for_timeout(1100);source=snapshot()
+        evidence={'documentToken':source['documentToken'],'historyEvidenceToken':source['historyEvidenceToken'],'evidence':page.evaluate(HISTORY_MODEL_EVIDENCE)}
+        assert page.evaluate('(request)=>OpenLinksDialogsReader.applyHistoryEvidence(request)',evidence)['ok'],adapter
+        result=audit_wechat();assert result['status']=='not_found' and result['uncheckedAttachments']>=1 and result['textOnly'],(adapter,result)
+    passed('Alibaba and Made-in-China use fresh native whole-history evidence for negatives, while a real ID in a loaded message is sufficient for a positive')
+
+    page.evaluate('document.querySelector(".contact-chatInfo .msg-text").textContent="WeChat: buyer_wechat_42"')
+    active();page.wait_for_timeout(1100)
+
+    source=snapshot();current=active(source)
+    request={'type':'DIALOGS_CHECK_WECHAT','documentToken':source['documentToken'],'conversationId':current['id'],'wechatId':'buyer_wechat_42'}
+    assert page.evaluate('(message)=>new Promise(resolve=>readerListeners.at(-1)(message,{id:"dialogs-reader-test"},resolve))',request)['status']=='found'
+    assert page.evaluate('(message)=>new Promise(resolve=>readerListeners.at(-1)(message,{id:"foreign-extension"},resolve))',request)['status']=='error'
+    passed('dedicated WeChat audit command is exposed to the authenticated extension transport only')
+
+    load(OBSERVED_ALIBABA,'https://message.alibaba.com/message/default.htm')
+    page.evaluate('''()=>{
+      const scroller=document.querySelector('.normal-list-container'),template=scroller.firstElementChild.cloneNode(true),spacer=document.createElement('div');scroller.style.cssText='height:120px;width:350px;overflow-y:auto';spacer.style.cssText='height:400px;position:relative';scroller.replaceChildren(spacer);
+      const models=Array.from({length:8},(_,index)=>({cid:`91000000${index+1}-910000009#11011@icbu`})),keys=models.map((_,index)=>`synthetic-account-${index}`),store={list:keys,filterResultList:[...keys],listMap:Object.fromEntries(keys.map((key,index)=>[key,models[index]])),conversationPaginationDone:true,listDataFetched:true,queueFetchContactParams:null,orderedFilter:false,projectFilter:[],companyFilter:[],stayTopFoldedList:[],archiveListVisable:false};
+      const root={return:null};root.stateNode={current:root};const owner={memoizedState:{memoizedState:store,next:null},return:root},list={memoizedProps:{list:[...keys]},return:owner},widget={memoizedProps:{itemCount:8,itemData:models},memoizedState:{scrollOffset:0},return:list},host={stateNode:scroller,return:widget};root.child=owner;owner.child=list;list.child=widget;widget.child=host;Object.defineProperty(scroller,'__reactFiber$synthetic',{value:host});window.nativeInboxWidget=widget;
+      let previous=null;for(let index=0;index<8;index++){
+        const row=template.cloneNode(true);row.setAttribute('data-cid',models[index].cid);row.style.cssText=`position:absolute;box-sizing:border-box;padding:0;height:50px;top:${index*50}px;width:320px;overflow:hidden`;spacer.append(row);
+        const renderer={memoizedProps:{index,data:models,style:{top:index*50}},return:widget},item={memoizedProps:{index,item:models[index],RWStyle:{top:index*50}},return:renderer},rowHost={stateNode:row,return:item};renderer.child=item;item.child=rowHost;if(previous)previous.sibling=renderer;else host.child=renderer;previous=renderer;Object.defineProperty(row,'__reactFiber$synthetic',{value:rowHost});
+      }
+    }''')
+    for position in ['top','bottom']:
+        if position=='bottom':page.evaluate('const scroller=document.querySelector(".normal-list-container");scroller.scrollTop=scroller.scrollHeight;nativeInboxWidget.memoizedState.scrollOffset=scroller.scrollTop')
+        source=snapshot();effects=page.evaluate('({...readerSideEffects})');request_count=len(requests)
+        evidence=page.evaluate(NON_1688_INBOX_MODEL_EVIDENCE)
+        assert evidence['status']=='ready' and evidence['loadedCount']==8 and not evidence['hasMore'],evidence
+        request={'expectedDocumentToken':source['documentToken'],'evidenceToken':source['inboxEvidenceToken'],'evidence':evidence}
+        assert page.evaluate('(request)=>OpenLinksDialogsReader.applyInboxEvidence(request)',request)['ok']
+        coverage=snapshot()['listCoverage']
+        assert not coverage['nativePending'] and coverage['complete']==(position=='bottom') and coverage['atStart']==(position=='top')
+        assert page.evaluate('readerSideEffects')==effects and len(requests)==request_count
+    passed('production Alibaba native collector and isolated reader agree on actual DOM virtual ranks and full native pagination without clicks, focus or requests')
+
+    load(OBSERVED_MIC,'https://webim.made-in-china.com/super-tm/')
+    page.evaluate('''()=>{
+      const sidebar=document.querySelector('.conversation-record-lst'),template=sidebar.querySelector('.lst-item').cloneNode(true),scroller=document.createElement('div'),listElement=document.createElement('div');scroller.setAttribute('data-test-id','virtuoso-scroller');scroller.style.cssText='height:120px;width:350px;overflow-y:hidden;overflow-x:auto';listElement.setAttribute('data-test-id','virtuoso-item-list');listElement.style.cssText='height:400px;position:relative';sidebar.replaceChildren(scroller);scroller.append(listElement);
+      const models=Array.from({length:8},(_,index)=>({friend:{userId:`synthetic-native-${index}`},recent:{recentId:`synthetic-native-${index}`}})),recentList=models.map(model=>model.recent),user={contactsInited:true,hasMoreHistoryRecents:true},instance={isFetchingMore:false,dataSource:models},root={return:null};root.stateNode={current:root};
+      const filter={memoizedProps:{isTagFiltering:false,tagFilterId:null,recentList},memoizedState:{showSearchResult:false,conversationType:0},return:root},owner={memoizedProps:{recentList,user,OAList:[],isLoading:false,firstRowItem:null,lastRowItem:null,tagFilterId:null},stateNode:instance,return:filter},widget={memoizedProps:{data:models,context:{firstRowItem:null,lastRowItem:null}},return:owner},host={stateNode:scroller,return:widget},state={items:[],totalCount:8,offsetTop:0,offsetBottom:0,firstItemIndex:0,topListHeight:0,topItems:[]},renderer={memoizedState:{memoizedState:state,next:null},return:host},listHost={stateNode:listElement,return:renderer};
+      root.child=filter;filter.child=owner;owner.child=widget;widget.child=host;host.child=renderer;renderer.child=listHost;Object.defineProperty(scroller,'__reactFiber$synthetic',{value:host});Object.defineProperty(listElement,'__reactFiber$synthetic',{value:listHost});window.nativeMicAudit={owner,widget,user,scroller};
+      let previous=null;for(let index=0;index<8;index++){
+        const wrapper=document.createElement('div'),row=template.cloneNode(true);wrapper.setAttribute('data-index',String(index));wrapper.setAttribute('data-item-index',String(index));wrapper.style.cssText=`position:absolute;height:50px;top:${index*50}px;left:0;right:0`;row.id='friend-PERSON-'+models[index].friend.userId;row.style.cssText='box-sizing:border-box;height:50px;padding:0;overflow:hidden';wrapper.append(row);listElement.append(wrapper);
+        const wrapperFiber={stateNode:wrapper,memoizedProps:{'data-index':index,'data-item-index':index,'data-known-size':50},return:listHost},item={memoizedProps:models[index],return:wrapperFiber},rowHost={stateNode:row,return:item};wrapperFiber.child=item;item.child=rowHost;if(previous)previous.sibling=wrapperFiber;else listHost.child=wrapperFiber;previous=wrapperFiber;Object.defineProperty(wrapper,'__reactFiber$synthetic',{value:wrapperFiber});Object.defineProperty(row,'__reactFiber$synthetic',{value:rowHost});state.items.push({index,originalIndex:index,offset:index*50,size:50,data:models[index]});
+      }
+    }''')
+    for position in ['top','loaded_bottom','server_end']:
+        if position=='loaded_bottom':page.evaluate('nativeMicAudit.scroller.scrollTop=nativeMicAudit.scroller.scrollHeight')
+        if position=='server_end':page.evaluate('''()=>{const {owner,widget,user,scroller}=nativeMicAudit;user.hasMoreHistoryRecents=false;const footer={type:'div',props:{className:'conversation-record-lst-bottom-tip'}};owner.memoizedProps.lastRowItem=footer;widget.memoizedProps.context.lastRowItem=footer;scroller.insertAdjacentHTML('beforeend','<div class=conversation-record-lst-bottom-tip style="height:30px">All native conversations loaded</div>');scroller.scrollTop=scroller.scrollHeight}''')
+        source=snapshot();effects=page.evaluate('({...readerSideEffects})');request_count=len(requests)
+        evidence=page.evaluate(NON_1688_INBOX_MODEL_EVIDENCE)
+        assert evidence['status']=='ready' and evidence['loadedCount']==8 and evidence['hasMore']==(position!='server_end'),evidence
+        request={'expectedDocumentToken':source['documentToken'],'evidenceToken':source['inboxEvidenceToken'],'evidence':evidence}
+        assert page.evaluate('(request)=>OpenLinksDialogsReader.applyInboxEvidence(request)',request)['ok']
+        coverage=snapshot()['listCoverage']
+        assert not coverage['nativePending'] and coverage['complete']==(position=='server_end') and coverage['atStart']==(position=='top')
+        assert page.evaluate('readerSideEffects')==effects and len(requests)==request_count
+        if position=='top':
+            request={'documentToken':source['documentToken'],'listToken':coverage['token'],'direction':'next'}
+            result=page.evaluate('(request)=>OpenLinksDialogsReader.advanceList(request)',request)
+            assert result['ok'] and result['advanced'] and page.evaluate('nativeMicAudit.scroller.scrollTop')>0
+    passed('production MIC collector and reader traverse the real overflow-hidden Virtuoso viewport and distinguish a loaded-page bottom from explicit server completion')
+
+    for overflow in ['clip','visible']:
+        page.evaluate('(overflow)=>nativeMicAudit.scroller.style.overflow=overflow',overflow)
+        assert not snapshot()['listCoverage']['token'] and page.evaluate(NON_1688_INBOX_MODEL_EVIDENCE)['status']=='unsupported'
+    page.evaluate('''()=>{nativeMicAudit.scroller.style.overflow='hidden';nativeMicAudit.scroller.removeAttribute('data-test-id')}''')
+    assert not snapshot()['listCoverage']['token'] and page.evaluate(NON_1688_INBOX_MODEL_EVIDENCE)['status']=='unsupported'
+    passed('MIC hidden-overflow support is limited to its explicit Virtuoso viewport; clipped, visible and unrelated hidden ancestors remain unsupported')
+
+    for site,fixture,url in [('alibaba',OBSERVED_ALIBABA,'https://message.alibaba.com/message/default.htm'),('mic',OBSERVED_MIC,'https://webim.made-in-china.com/super-tm/')]:
+        load(fixture,url)
+        page.evaluate('''site=>{
+          if(site==='alibaba')document.querySelector('.normal-list-container').style.cssText='height:900px;overflow-y:auto';
+          else {const rows=document.querySelector('[data-test-id="virtuoso-item-list"]'),scroll=document.createElement('div');scroll.setAttribute('data-test-id','virtuoso-scroller');scroll.style.cssText='height:900px;overflow-y:auto';rows.parentElement.insertBefore(scroll,rows);scroll.append(rows)}
+          const originalNow=Date.now;window.nativeListClock=0;Date.now=()=>originalNow()+nativeListClock;
+        }''',site)
+        source=snapshot();coverage=source['listCoverage']
+        assert coverage['nativePending'] and not coverage['complete'] and not coverage['atStart'] and source['inboxEvidenceToken']
+        def current_list_proof():
+            source=snapshot()
+            evidence=page.evaluate('''site=>{
+              const sidebar=document.querySelector(site==='alibaba'?'.buyer-conversation-list':'.conversation-record-lst'),scroller=document.querySelector(site==='alibaba'?'.normal-list-container':'[data-test-id="virtuoso-scroller"]'),rows=[...sidebar.querySelectorAll(site==='alibaba'?'.contact-item-container':'.lst-item')],html=sidebar.outerHTML;
+              let a=2166136261,b=2246822507;for(let i=0;i<html.length;i++){a=Math.imul(a^html.charCodeAt(i),16777619);b=Math.imul(b^html.charCodeAt(i),3266489909)}
+              return {status:'ready',platform:site,schema:site+'-inbox-pagination-v1',url:location.href,capturedAt:Date.now(),domSignature:`${(a>>>0).toString(16)}${(b>>>0).toString(16)}:${html.length}`,limited:false,firstScreenRequestEnds:true,loadedCount:rows.length,itemCount:rows.length,hasMore:false,loading:false,scrollTop:scroller.scrollTop,scrollHeight:scroller.scrollHeight,clientHeight:scroller.clientHeight,scrollOffset:scroller.scrollTop,startVerified:true,endVerified:true,rowRanks:rows.map((row,index)=>({id:site==='alibaba'?row.getAttribute('data-cid'):row.id,index}))};
+            }''',site)
+            return {'expectedDocumentToken':source['documentToken'],'evidenceToken':source['inboxEvidenceToken'],'evidence':evidence}
+        request=current_list_proof();request['evidence']['platform']='1688'
+        assert not page.evaluate('(request)=>OpenLinksDialogsReader.applyInboxEvidence(request)',request)['ok']
+        page.evaluate('nativeListClock+=800');request=current_list_proof();request['evidence']['rowRanks'].reverse()
+        assert not page.evaluate('(request)=>OpenLinksDialogsReader.applyInboxEvidence(request)',request)['ok']
+        page.evaluate('nativeListClock+=800');request=current_list_proof();request['evidence']['endVerified']=False
+        assert not page.evaluate('(request)=>OpenLinksDialogsReader.applyInboxEvidence(request)',request)['ok']
+        page.evaluate('nativeListClock+=800');request=current_list_proof()
+        assert page.evaluate('(request)=>OpenLinksDialogsReader.applyInboxEvidence(request)',request)['ok']
+        source=snapshot();coverage=source['listCoverage']
+        assert coverage['atStart'] and coverage['complete'] and not coverage['hasMore'] and not coverage['nativePending']
+        assert [row['listOrder'] for row in source['conversations']]==[0,1]
+        assert not page.evaluate('(request)=>OpenLinksDialogsReader.applyInboxEvidence(request)',request)['ok']
+        page.evaluate('site=>document.querySelector(site==="alibaba"?".contact-item-container .name":".lst-item .name").textContent="Changed row"',site)
+        assert snapshot()['listCoverage']['nativePending'] and not snapshot()['listCoverage']['complete']
+        passed(site+': physical bottom alone is incomplete; exact per-platform fresh native rows and terminal proof grant start/end once and reject changed DOM, wrong platform or rank order')
 
     assert not errors, errors
     browser.close()

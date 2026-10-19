@@ -1,3 +1,5 @@
+import {normalizeWechatAudit,initialWechatAudit,wechatContactFingerprint,textContainsWechatContact} from './wechat-audit.js';
+export {wechatContactFingerprint,textContainsWechatContact} from './wechat-audit.js';
 import {normalizeManagedChat} from './chat-launch.js';
 import {initialProduct,normalizeProduct,saveProductState,invalidateProductSettings,productRequest,productExtractionPrompt,acceptExtractionState,approveProductState,requireProductApproval} from './product-brief.js';
 import {normalizeProductMemories,saveProductMemoryState,deleteProductMemoryState,loadProductMemoryState,normalizeFirstBuyerMessage,provenFirstBuyerMessage,assessProductMemory,chatFreshnessAssessment} from './product-memory.js';
@@ -45,7 +47,7 @@ export function conversationKey(platform,id) {
   return platform+':'+encodeURIComponent(id);
 }
 export function initialDialogs() {
-  return {version:1,running:false,readUnread:true,mode:'observe',bindings:Object.fromEntries(DIALOG_PLATFORMS.map(platform=>[platform,{tabId:null,url:'',status:'unbound',checkedAt:null,detail:''}])),traversal:Object.fromEntries(DIALOG_PLATFORMS.map(platform=>[platform,{pending:null,backoff:{},seenPreviews:{},unreadStates:{}}])),settings:{brief:'',wechat:'',language:'',autoDraft:false,scanRead:false,workflow24h:false,workflowMigrationVersion:0,showWorkingTab:false},workflow:{version:1,cursor:0,activity:null,visits:{},history:{},list:{}},contactLedger:{version:1,records:{},bytes:2,saturated:false},product:initialProduct(),productMemories:{version:1,entries:[]},conversations:{},events:[]};
+  return {version:1,running:false,readUnread:true,mode:'observe',bindings:Object.fromEntries(DIALOG_PLATFORMS.map(platform=>[platform,{tabId:null,url:'',status:'unbound',checkedAt:null,detail:''}])),traversal:Object.fromEntries(DIALOG_PLATFORMS.map(platform=>[platform,{pending:null,backoff:{},seenPreviews:{},unreadStates:{}}])),settings:{brief:'',wechat:'',language:'',autoDraft:false,scanRead:false,workflow24h:false,wechatAudit:false,workflowMigrationVersion:0,showWorkingTab:false},workflow:{version:1,cursor:0,activity:null,visits:{},history:{},list:{},audit:initialWechatAudit()},contactLedger:{version:1,records:{},bytes:2,saturated:false},product:initialProduct(),productMemories:{version:1,entries:[]},conversations:{},events:[]};
 }
 export function validateDialogSettings(value) {
   const input=object(value),result={};
@@ -54,7 +56,7 @@ export function validateDialogSettings(value) {
     result[key]=clean(input[key],max);
   }
   result.autoDraft=input.autoDraft===true;result.scanRead=input.scanRead===true;
-  result.workflow24h=input.workflow24h===true;result.workflowMigrationVersion=Math.min(integer(input.workflowMigrationVersion)??0,1);
+  result.wechatAudit=input.wechatAudit===true;result.workflow24h=input.workflow24h===true;result.workflowMigrationVersion=Math.min(integer(input.workflowMigrationVersion)??0,1);
   result.showWorkingTab=input.showWorkingTab===true;
   return result;
 }
@@ -67,7 +69,7 @@ export function addDialogEvent(state,type,detail,meta={},now=Date.now()) {
 }
 export function setDialogSettings(state,value,now=Date.now()) {
   const next=validateDialogSettings({...state.settings,...object(value)}),changed=JSON.stringify(next)!==JSON.stringify(state.settings);
-  const contextChanged=['brief','wechat','language'].some(key=>next[key]!==state.settings[key]),scanChanged=next.scanRead!==state.settings.scanRead||next.workflow24h!==state.settings.workflow24h;
+  const contextChanged=['brief','wechat','language'].some(key=>next[key]!==state.settings[key]),scanChanged=next.scanRead!==state.settings.scanRead||next.workflow24h!==state.settings.workflow24h||next.wechatAudit!==state.settings.wechatAudit;
   state.settings=next;if(contextChanged)invalidateProductSettings(state);
   if(contextChanged || scanChanged)for(const item of Object.values(state.conversations))item.draft=null;
   if(changed)addDialogEvent(state,'settings',contextChanged?'Задание покупателя изменено; требуется новое утверждение.':scanChanged?'Режим проверки прочитанных диалогов обновлён.':'Режим автоматических черновиков обновлён.',{},now);
@@ -233,21 +235,6 @@ export function supplierReplyAssessment(state,itemOrKey) {
 }
 // WeChat evidence is always from buyer-authored text, never from the seller's
 // contact, translation labels or an AI draft. Retain a digest after history pruning.
-export function wechatContactFingerprint(contact) {
-  const normalized=typeof contact==='string'?contact.normalize('NFKC').replace(/[\u200b-\u200d\ufeff]/g,'').trim().toLowerCase():'';
-  return normalized?digest(normalized):'';
-}
-export function textContainsWechatContact(text,contact) {
-  const normalize=value=>typeof value==='string'?value.normalize('NFKC').replace(/[\u200b-\u200d\ufeff]/g,'').toLowerCase():'';
-  const needle=normalize(contact).trim(),haystack=normalize(text);if(!needle)return false;
-  let at=haystack.indexOf(needle);
-  while(at!==-1) {
-    const before=haystack[at-1] || '',after=haystack[at+needle.length] || '';
-    if(!/[a-z0-9_-]/i.test(before)&&!/[a-z0-9_-]/i.test(after))return true;
-    at=haystack.indexOf(needle,at+1);
-  }
-  return false;
-}
 const validDigest=value=>typeof value==='string'&&/^[a-f0-9]{1,16}:\d{1,6}$/.test(value);
 const contactRecordKey=key=>digest(key);
 function normalizedEvidence(value) {
@@ -617,7 +604,7 @@ export function buildDraftPrompt(state,request,now=Date.now()) {
   };
 }
 function normalizeWorkflow(raw){
-  const input=object(raw),result={version:1,orderVersion:integer(input.orderVersion)??0,sweepId:Math.max(1,integer(input.sweepId)??1),platformSince:time(input.platformSince)??0,cursor:Math.min(integer(input.cursor)??0,1000000000),activity:null,visits:{},history:{},list:{},pinnedKeys:[...new Set((Array.isArray(input.pinnedKeys)?input.pinnedKeys:[]).filter(key=>typeof key==='string'&&key.length<=1600&&DIALOG_PLATFORMS.some(platform=>key.startsWith(platform+':'))))].slice(0,20)};
+  const input=object(raw),result={version:1,audit:normalizeWechatAudit(input.audit),orderVersion:integer(input.orderVersion)??0,sweepId:Math.max(1,integer(input.sweepId)??1),platformSince:time(input.platformSince)??0,cursor:Math.min(integer(input.cursor)??0,1000000000),activity:null,visits:{},history:{},list:{},pinnedKeys:[...new Set((Array.isArray(input.pinnedKeys)?input.pinnedKeys:[]).filter(key=>typeof key==='string'&&key.length<=1600&&DIALOG_PLATFORMS.some(platform=>key.startsWith(platform+':'))))].slice(0,20)};
   const activity=object(input.activity);
   if(typeof activity.phase==='string')result.activity={phase:clean(activity.phase,80),platform:platformOK(activity.platform)?activity.platform:'',key:clean(activity.key,1600),detail:clean(activity.detail,1200),at:time(activity.at)};
   // Traversal remembers lightweight list rows independently of the bounded

@@ -92,3 +92,19 @@ test('invalid scalars are omitted without coercion and collector errors produce 
   const result=f.run();assert.equal(coercions,0);for(const key of ['conversationCode','selfState','msgType','sender'])assert.ok(!Object.hasOwn(result.rows[0].model,key));
   f.row.__reactProps$synthetic=new Proxy({}, {getOwnPropertyDescriptor(){throw new Error('Unavailable object');}});assert.equal(f.run().status,'error');assert.deepEqual(f.run().rows,[]);
 });
+
+
+test('native sendTime preserves valid historical epochs, including seconds and milliseconds',()=>{
+  for(const sent of [1600000000000,'1600000000000',1600000000,'1600000000']){const f=fixture();f.row.__reactProps$synthetic={message:model({sendTime:sent})};const r=f.run();assert.equal(r.rows[0].model.sendTime,sent);assert.equal(r.rows[0].signature,signature(f.row._html));assert.equal(r.rows[0].model.conversationCode,THREAD);}
+});
+
+test('native sendTime rejects invalid, future, inherited, accessor and coercible values without side effects',()=>{
+  let calls=0;const coercible={toString(){calls++;return '1600000000000';}};
+  for(const sent of [Date.now()+3600000,Infinity,NaN,-1,0,true,'10-19 11:00','1600000000000x','1.6e12',1600000000000.5,coercible]){const f=fixture();f.row.__reactProps$synthetic={message:model({sendTime:sent})};assert.equal(f.run().rows[0].model.sendTime,undefined);}
+  const getter=fixture(),message=model();Object.defineProperty(message,'sendTime',{get(){calls++;return 1600000000000;}});getter.row.__reactProps$synthetic={message};assert.equal(getter.run().rows[0].model.sendTime,undefined);
+  const inherited=fixture(),other=Object.assign(Object.create({sendTime:1600000000000}),model());inherited.row.__reactProps$synthetic={message:other};assert.equal(inherited.run().rows[0].model.sendTime,undefined);assert.equal(calls,0);
+});
+
+test('conflicting epoch dates for the same rendered message do not authorize either date',()=>{
+  const f=fixture();f.row.__reactProps$one={message:model({sendTime:1600000000000})};f.row.__reactFiber$two={memoizedProps:{message:model({sendTime:1600000001000})},return:null};assert.deepEqual(f.run().rows,[]);
+});

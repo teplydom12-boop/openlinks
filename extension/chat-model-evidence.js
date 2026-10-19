@@ -56,6 +56,15 @@
       const message=own(props,'message');
       if(!message||typeof message!=='object')return null;
       const model=fields(message,['conversationCode','selfState','msgType']);
+      // The UI may show a date without a year. The native message model has
+      // an epoch sendTime, bound below to this exact DOM row and conversation.
+      // Never infer its value from the observation time or coerce an object.
+      const sent=own(message,'sendTime');
+      if(typeof sent==='string'||typeof sent==='number'&&Number.isSafeInteger(sent)){
+        const raw=String(sent),at=/^\d{10}(?:\d{3})?$/.test(raw)?Number(raw)*(raw.length===10?1000:1):null;
+        if(at!==null&&Number.isFinite(at)&&at>0&&at<=result.capturedAt+300000)model.sendTime=sent;
+      }
+
       for(const [key,names] of [['code',['messageId']],['sender',['targetId','targetType']],['receiver',['targetId','targetType']],['ext',['senderUserId','senderMainUserId','receiverUserId','receiverMainUserId']]]){
         const selected=fields(own(message,key),names);if(Object.keys(selected).length)model[key]=selected;
       }

@@ -2,6 +2,7 @@ import {displayTime} from './lib/time.js';
 import {setupProductUI} from './dialogs-product.js';
 import {canPrepareDraft, contactAssessment, draftRequest, supplierReplyAssessment, workflowAssessment} from './lib/dialogs.js';
 import {setupJointModeUI} from './joint-mode-ui.js';
+import {setupAuditUI} from './dialogs-audit-ui.js';
 
 const $=selector=>document.querySelector(selector);
 const PLATFORMS={'1688':'1688',alibaba:'Alibaba',mic:'Made-in-China'};
@@ -26,6 +27,7 @@ let assessmentCache=new WeakMap(),assessmentAt=Date.now(),reviewEdit=null,testPl
 
 function node(tag,text,className){const el=document.createElement(tag);if(text!==undefined)el.textContent=text;if(className)el.className=className;return el;}
 function feedback(text,error=false){const el=$('#dialogs-feedback');el.textContent=text;el.classList.toggle('error',error);el.hidden=!text;}
+function auditMode(){return state?.settings?.wechatAudit===true;}
 function workflowMode(){return state?.settings?.workflow24h===true;}
 function hasReplyContext(){return workflowMode()?productUI?.hasMemories():productUI?.isApproved();}
 function assessment(conversation){if(!conversation||typeof conversation!=='object')return workflowMode()?workflowAssessment(state,conversation,assessmentAt):supplierReplyAssessment(state,conversation);if(!assessmentCache.has(conversation))assessmentCache.set(conversation,workflowMode()?workflowAssessment(state,conversation,assessmentAt):supplierReplyAssessment(state,conversation));return assessmentCache.get(conversation);}
@@ -36,7 +38,7 @@ function reviewState(){return folderState.review||{phase:'none',operationId:'',k
 function reviewActive(){return reviewState().phase!=='none'&&!!reviewState().operationId;}
 function reviewSignature(review){const request=review.request||{};return JSON.stringify([review.operationId,review.key,review.context,review.text,request.revision,request.fingerprint,request.productFingerprint,request.settingsFingerprint]);}
 function testState(){return folderState.test||{enabled:false,phase:'off',sessionId:'',cycleId:'',key:'',text:'',at:null,completed:[]};}
-function testInProgress(){return state?.running===true&&testState().enabled&&['ready','generating','preparing'].includes(testState().phase);}
+function testInProgress(){return !auditMode()&&state?.running===true&&testState().enabled&&['ready','generating','preparing'].includes(testState().phase);}
 function resumableTest(){return workflowMode()&&!state?.running&&testState().enabled&&['ready','generating','preparing'].includes(testState().phase);}
 function testModeIntent(){const test=testState();return test.enabled?{testMode:true,testSessionId:test.sessionId,testCycleId:test.cycleId}:{testMode:false};}
 function sameTestIntent(intent){const current=testModeIntent();return intent.testMode===current.testMode&&(!intent.testMode||intent.testSessionId===current.testSessionId&&intent.testCycleId===current.testCycleId);}
@@ -389,6 +391,7 @@ async function disableLegacyDrafts(){
   if(state?.settings?.autoDraft)adopt(await command('AUTODRAFT',{enabled:false}));
 }
 async function enableAutomaticDrafts(){
+  if(auditMode())return;
   if(folderPausePromise)await folderPausePromise;
   if(!folderState.enabled||!hasReplyContext())return;
   await disableLegacyDrafts();
@@ -406,8 +409,25 @@ async function pauseFolderOnEdit(draftChanged=false,force=false){
   folderPausePromise=pending;
   return pending;
 }
+const auditOriginalText=new Map(['#dialogs-page-eyebrow','#dialogs-page-title','#dialogs-page-subtitle','#dialogs-monitor-step','#dialogs-tabs-heading','#dialogs-monitor-explanation','#dialogs-footer'].map(id=>[id,$(id).textContent]));
+function renderAuditShell(){
+  const audit=auditMode();document.body.classList.toggle('wechat-audit',audit);
+  for(const el of document.querySelectorAll('[data-dialog-reply-only]'))el.hidden=audit;
+  $('#dialogs-audit').hidden=!audit;$('#dialogs-audit-results').hidden=!audit;
+  $('#dialogs-sidebar-note').hidden=audit;
+  const text={'#dialogs-page-eyebrow':'OPENLINKS · БЛОК 2','#dialogs-page-title':'Проверка WeChat в чатах','#dialogs-page-subtitle':'1688 → Alibaba → Made-in-China. Читаем чаты за последние сутки и сохраняем результат по каждому.','#dialogs-monitor-step':'ПЛОЩАДКИ','#dialogs-tabs-heading':'Чаты для проверки','#dialogs-monitor-explanation':'Расширение откроет центры сообщений в вашем аккаунте. При необходимости войдите на площадку. Проверка идёт строго по порядку: 1688, Alibaba, Made-in-China.','#dialogs-footer':'OpenLinks · Проверка WeChat и отчёт'};
+  for(const [id,value] of auditOriginalText)$(id).textContent=audit?text[id]:value;
+}
 function render(){
-  if(!state)return;resetAssessments();
+  if(!state)return;resetAssessments();renderAuditShell();
+  if(auditMode()){
+    const phase=state.workflow?.audit?.phase||'idle';
+    $('#dialogs-run-state').textContent={idle:'Не запущено',running:'Проверка WeChat',paused:'На паузе',blocked:'Проверка остановлена',completed:'Обход завершён'}[phase]||'Проверка WeChat';
+    $('#dialogs-run-state').classList.toggle('running',!!state.running);
+    renderBindings();renderEvents();auditUI.render();
+    for(const id of busy)if($(id))$(id).disabled=true;
+    return;
+  }
   productUI?.render(state,{},productFingerprint);
   const bound=boundTabs();
   $('#dialogs-run-state').textContent=reviewActive()?'Ожидает вашего решения':testState().enabled?(testInProgress()?'Тест · один цикл':'Тест · ожидание'):state.running?(folderState.enabled&&folderState.auto?folderState.autoSend?'Автоматические ответы':'Черновики на проверку':'Только чтение'):'Мониторинг остановлен';
@@ -436,6 +456,7 @@ action('#dialogs-activity-resume',()=>{const button=$(testState().enabled?'#dial
 // Starting monitoring enables Claude drafts when the saved context is ready.
 action('#dialogs-open-chats',()=>openChats());
 action('#dialogs-start',async()=>{
+  if(auditMode()){await act('START',{},'Проверка WeChat продолжена.');return;}
   if(folderDirty)throw new Error('Сначала сохраните выбранную модель Claude.');
   await disableLegacyDrafts();await enableAutomaticDrafts();
   await act('START',{readUnread:$('#dialogs-read-unread').checked},folderState.enabled&&folderState.auto?(folderState.autoSend?'Мониторинг и автоматические ответы включены.':'Мониторинг включён. Черновики будут появляться для вашего одобрения.'):'Мониторинг читает сообщения. Подключите Claude и согласуйте товар для подготовки ответов.');
@@ -612,6 +633,7 @@ $('#dialogs-settings-form').addEventListener('submit',async event=>{
     settingsDirty=false;productUI?.setSettingsDirty(false);adopt(result);feedback('Контекст сохранён. Согласуйте сведения о товаре заново.');
   }catch(error){feedback(error.message,true);}finally{busy.delete('#dialogs-save-settings');if(state)render();}
 });
+const auditUI=setupAuditUI({command,adopt,feedback,getState:()=>state,isOpening:()=>openingChats});
 productUI=setupProductUI({command,adopt,feedback,getFolderState:()=>({...folderState,dirty:folderDirty}),onApproved:async()=>{if(state?.running)await enableAutomaticDrafts();},onDirty:()=>{if(state){if(productUI?.isDirty())reviewEpoch++;renderDetail();renderFolder();pauseFolderOnEdit();}}});
 chrome.storage.onChanged.addListener((changes,area)=>{if(area==='local'&&Object.keys(changes).some(key=>/dialog|claudeFolder/i.test(key)))refresh();});
 refresh();

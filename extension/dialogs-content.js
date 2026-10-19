@@ -9,6 +9,12 @@
   const INBOX_ALIBABA = '.buyer-conversation-list .contact-item-container[data-cid]';
   const INBOX_MIC = '.conversation-record-lst [data-test-id="virtuoso-item-list"] .lst-item[id^="friend-PERSON-"]';
   const INBOX = `${INBOX_1688},${INBOX_ALIBABA},${INBOX_MIC}`;
+  const INBOX_MODELS={
+    '1688':{scope:'.ww_conversation_list',rows:INBOX_1688,schema:'1688-inbox-pagination-v1'},
+    alibaba:{scope:'.buyer-conversation-list',rows:INBOX_ALIBABA,schema:'alibaba-inbox-pagination-v1'},
+    mic:{scope:'.conversation-record-lst',rows:INBOX_MIC,schema:'mic-inbox-pagination-v1'}
+  };
+  const inboxRowId=row=>row.matches(INBOX_ALIBABA)?row.getAttribute('data-cid'):row.id;
   const EDITORS = 'textarea,[contenteditable="true"],[contenteditable="plaintext-only"],[role="textbox"][contenteditable]';
   let rowTokens = new WeakMap(), micEpoch = crypto.randomUUID(), loginObserved = false;
   const usedTokens = new Set();
@@ -22,6 +28,11 @@
   // navigation, and are checked synchronously immediately before editing/clicking.
   let replyEvidence=new Map();
   const historyLoads=new Map();
+  const auditHistoryLoads=new Map();
+  // Only actual, recognized message bodies participate in an ID audit. Keep
+  // this evidence outside serialized transcripts: synthesized file labels,
+  // sender names and other UI text must never complete a conversation.
+  const auditMessageTexts=new WeakMap();
   const firstBuyerProofs=new Map();
   const latestMessageTimes=new Map();
   const HISTORY_LOAD_LIMIT=8;
@@ -34,6 +45,7 @@
   const MESSAGE = '[data-message-id],[data-chat-message],[data-message],.message-item,.chat-message,.im-message,.msg-item,.message-row,.msg-row,.message-item-system,.message-item-wrapper,.msg-box,.msg-list-system-tip,.chat-safe-tip-container';
   const CONTENT = '[data-message-text],[data-message-content],.message-text,.message-content,.msg-content,.text-content';
   const EXCLUDED = 'script,style,textarea,input,select,[contenteditable="true"],[contenteditable="plaintext-only"],blockquote,[data-quote],.quoted-message,.message-quote,.reply-preview,[data-message-preview],.message-preview,[data-sender-name],.sender-name,time,.message-time,.message-status,.file-operation,[aria-hidden="true"],[hidden]';
+  const AUDIT_EXCLUDED = '.file-msg,[data-attachment],a[download],.nick,.fromUserName,.avatar,.headPic,.session-translate,.translate-result,.chat-operations-box';
   const PENDING = '[aria-busy="true"],[data-loading="true"],[data-history-loading="true"],.history-loading,.messages-loading,.message-loading,.loading-spinner,[data-load-more],.load-more-messages';
   const IDS = [['data-thread-id','thread'],['data-conversation-id','conversation'],['data-peer-id','peer'],['data-user-id','peer']];
   const QUERY_IDS = [['threadId','thread'],['thread_id','thread'],['conversationId','conversation'],['conversation_id','conversation'],['touid','peer'],['peerId','peer'],['toUserId','peer']];
@@ -89,14 +101,14 @@
     if(!node?.matches('img.chat-text-sys-emotion')||!/^\[[^\[\]\u0000-\u001f]{1,64}\]$/.test(node.getAttribute('title')||''))return false;
     try{const url=new URL(node.src);return url.protocol==='https:'&&url.hostname==='webim.made-in-china.com'&&/^\/super-tm\/[a-f\d]{32}\.gif$/i.test(url.pathname)&&!url.search&&!url.hash&&!url.username&&!url.password;}catch{return false;}
   }
-  function textOf(node,max=LIMIT.text,allowPreview=false,withMicEmotions=false) {
+  function textOf(node,max=LIMIT.text,allowPreview=false,withMicEmotions=false,extraExcluded='') {
     if(!node)return '';
     const walker=document.createTreeWalker(node,withMicEmotions?NodeFilter.SHOW_TEXT|NodeFilter.SHOW_ELEMENT:NodeFilter.SHOW_TEXT);const parts=[];let cursor;
     while((cursor=walker.nextNode())){
       if(parts.length>=LIMIT.nodes)break;
       const element=cursor.nodeType===Node.ELEMENT_NODE,parent=element?cursor:cursor.parentElement;
       const excluded=parent?.closest(EXCLUDED);
-      if((excluded&&(!allowPreview||excluded!==node))||!visible(parent))continue;
+      if((excluded&&(!allowPreview||excluded!==node))||(extraExcluded&&parent?.closest(extraExcluded))||!visible(parent))continue;
       if(element){if(micEmotion(cursor))parts.push(cursor.getAttribute('title'));continue;}
       parts.push(cursor.textContent);
     }
@@ -223,7 +235,7 @@
     return attachments;
   }
   function readMessages(history,live1688=null,liveAlibaba=false,liveMic=null) {
-    const nodes=messageNodes(history,Boolean(live1688));let reliable=true,structuralReliable=true,unsupportedMedia=false,reason='',unsupportedMessages=0,unmatchedTextNodes=0,systemNotices=0,contentLimited=false;const result=[],records=[],ids=new Map();
+    const nodes=messageNodes(history,Boolean(live1688));let reliable=true,structuralReliable=true,unsupportedMedia=false,reason='',unsupportedMessages=0,unmatchedTextNodes=0,systemNotices=0,contentLimited=false,auditUnknownText=false;const result=[],records=[],ids=new Map();
     const modelSignatures=new Map(),modelSignatureCounts=new Map();
     if(live1688&&modelAccepted.threadId===live1688.id)for(const row of select(history,'.rc-scrollbars-view > .message-item-line')){const signature=rowSignature(row);modelSignatures.set(row,signature);modelSignatureCounts.set(signature,(modelSignatureCounts.get(signature)||0)+1);}
     if(nodes.length>LIMIT.messages){reliable=false;structuralReliable=false;reason='История превышает предел 500 сообщений.';}
@@ -266,6 +278,8 @@
       const attachments=attachmentsOf(attachmentScope,survey,liveAlibaba?'.session-translate':'',liveMic?micEmotion:null),unreadMedia=attachments.filter(item=>item.type!=='link');
       if(attachments.limited){contentLimited=true;reliable=false;reason||='Список вложений сообщения ограничен 30 элементами.';}
       const unknownFormat=Boolean(live1688&&node.matches('.message-item-line')&&!survey||liveAlibaba&&!aliBody||liveMic&&!micBody);
+      const auditText=textOf(body,LIMIT.text+1,false,Boolean(liveMic),AUDIT_EXCLUDED);
+      if(unknownFormat&&(auditText||!unreadMedia.length))auditUnknownText=true;
       if(unknownFormat){unsupportedMessages++;reliable=false;reason||='Сохранён текст сообщения с нераспознанным форматом.';}
       if(unreadMedia.length||unknownFormat){
         unsupportedMedia=true;
@@ -274,16 +288,17 @@
       }
       const modelRow=live1688&&node.closest('.message-item-line'),modelSignature=modelSignatures.get(modelRow);
       let accepted=modelRow&&modelSignature&&modelSignatureCounts.get(modelSignature)===1&&modelAccepted.threadId===live1688.id?modelAccepted.rows.get(modelSignature):null;
-      if(accepted){
+      if(accepted?.direction){
         const signals=node.hasAttribute('data-direction')||node.hasAttribute('data-message-direction')||node.hasAttribute('data-sender-role')||[...node.classList].some(cls=>Object.hasOwn(DIRECTION_CLASSES,cls));
         if(kind==='system')accepted=null;
         else if(kind!=='unknown'&&kind!==accepted.direction||kind==='unknown'&&signals){kind='unknown';accepted=null;reliable=false;structuralReliable=false;reason||='Направление сообщения в модели противоречит DOM; нужна проверка.';}
         else kind=accepted.direction;
       }
       const micId=liveMic?node.querySelector(':scope > .contact-chatInfo[id],:scope > .mine-chatInfo[id]')?.id:'',id=identifier(node.getAttribute('data-message-id'))||identifier(node.getAttribute('data-msg-id'))||(accepted?accepted.id:'')||(/^[a-f\d]{8}(?:-[a-f\d]{4}){3}-[a-f\d]{12}$/i.test(micId||'')?micId:'');
-      if(!full){reliable=false;unsupportedMessages++;full='[Сообщение без доступного текста]';reason||='Есть сообщение без доступного текста.';}
+      if(!full){reliable=false;unsupportedMessages++;auditUnknownText=true;full='[Сообщение без доступного текста]';reason||='Есть сообщение без доступного текста.';}
       if(full.length>LIMIT.text){reliable=false;contentLimited=true;reason||='Слишком длинный текст сообщения обрезан.';}
-      const entry={direction:kind,text:full.slice(0,LIMIT.text)};if(attachments.length)entry.attachments=attachments;if(unknownFormat)entry.format='unrecognized';if(id)entry.id=id;const at=timestamp(node);if(at!==null)entry.at=at;
+      const entry={direction:kind,text:full.slice(0,LIMIT.text)};if(attachments.length)entry.attachments=attachments;if(unknownFormat)entry.format='unrecognized';if(id)entry.id=id;const at=accepted?.at??timestamp(node);if(at!==null)entry.at=at;
+      if(!unknownFormat)auditMessageTexts.set(entry,auditText.slice(0,LIMIT.text));
       const aliases=[],alias=(text,direction,kind,ignoredAttachments=[])=>{if(text&&text.length<=6000&&aliases.length<4&&!aliases.some(value=>value.text===text&&value.direction===direction)){const value={text,direction,kind};if(ignoredAttachments.length)value.ignoredAttachments=ignoredAttachments.slice(0,4);aliases.push(value);}};
       const iconProof=icons=>[...new Map(icons.map(icon=>{const value={type:'image',name:clean(icon.getAttribute('alt')||icon.getAttribute('title')||'',300),url:attachmentUrl(icon.currentSrc||icon.src||'')};return [JSON.stringify(value),value];})).values()].filter(value=>value.url).slice(0,4);
       const oldMarker='[Вложение: содержимое не прочитано]',oldFormat='[Нераспознанный формат сообщения; доступный текст сохранён]';
@@ -300,7 +315,7 @@
       if(id)ids.set(id,entry);result.push(entry);records.push({node,entry});
       if(liveMic)for(const notice of select(node,':scope > .msg-system,:scope > .diversion-enhanced-reminder')){
         const text=textOf(notice);if(!text)continue;systemNotices++;
-        const system={direction:'system',text};if(id)system.id=id+':'+notice.classList[0];result.push(system);records.push({node:notice,entry:system});
+        const system={direction:'system',text};if(id)system.id=id+':'+notice.classList[0];auditMessageTexts.set(system,text);result.push(system);records.push({node:notice,entry:system});
       }
     }
     // A partly matched layout must not expose an older recognized message as
@@ -339,7 +354,7 @@
     const attachments=result.flatMap(message=>message.attachments||[]);
     const totalRows=nodes.length+systemNotices+unmatchedTextNodes+orphanMedia.length;
     const coverage={totalRows,capturedMessages:result.length,unknownSenders:result.filter(message=>message.direction==='unknown').length,attachments:attachments.length,unreadAttachments:attachments.filter(item=>item.type!=='link'&&!item.contentRead).length,unsupportedMessages:unsupportedMessages+unmatchedTextNodes,unmatchedTextNodes,limited:contentLimited||totalRows>LIMIT.messages||unmatchedTextNodes>=LIMIT.nodes||orphanMedia.length>30};
-    return {messages:result,reliable,structuralReliable:structuralReliable&&!coverage.limited,unsupportedMedia,reason,coverage,pendingFormat:Boolean(live1688)&&nodes.some(pending1688Format)};
+    return {messages:result,reliable,structuralReliable:structuralReliable&&!coverage.limited,unsupportedMedia,reason,coverage,auditTextReady:!auditUnknownText&&!unmatchedTextNodes,pendingFormat:Boolean(live1688)&&nodes.some(pending1688Format)};
   }
   function unread(root) {
     if(platform()==='1688'&&root.matches(INBOX_1688))return select(root,'.avatar > .avatar-unread').length>0;
@@ -385,8 +400,9 @@
     const markers=select(viewers[0],':scope > div:first-child > span');
     return markers.length===1&&!markers[0].closest(MESSAGE+','+EXCLUDED)&&textOf(markers[0])==='暂无更多消息';
   }
-  function wholeHistory(startKnown,readComplete,parsed,history) {
-    if(!startKnown||!readComplete||!parsed.reliable||!parsed.structuralReliable||parsed.coverage.limited||parsed.coverage.unknownSenders||parsed.coverage.unreadAttachments||parsed.coverage.unsupportedMessages)return false;
+  function wholeHistory(startKnown,readComplete,parsed,history,textOnly=false) {
+    if(!startKnown||!readComplete||!parsed.structuralReliable||parsed.coverage.limited)return false;
+    if(textOnly?!parsed.auditTextReady:!parsed.reliable||parsed.coverage.unknownSenders||parsed.coverage.unreadAttachments||parsed.coverage.unsupportedMessages)return false;
     // Lower-level selectors/text readers have a DOM traversal bound. Do not
     // promote a truncated traversal to proof of absence in the whole history.
     const walker=document.createTreeWalker(history,NodeFilter.SHOW_ELEMENT|NodeFilter.SHOW_TEXT);let count=0;
@@ -437,7 +453,7 @@
       const row=active[0],id=identity(row),parsed=readMessages(history,null,false,row),startKnown=historyStartKnown(history),fingerprint=JSON.stringify([id,parsed.messages]);
       if(!activeMicEvidence||activeMicEvidence.fingerprint!==fingerprint)activeMicEvidence={fingerprint,since:Date.now()};
       const stable=Date.now()-activeMicEvidence.since>=1000,readComplete=stable&&atTail(history)&&!parsed.pendingFormat,tailKnown=readComplete&&!parsed.unsupportedMedia;
-      return {id,identityReliable:true,title:title(row),url:safeUrl(location.href),unread:unread(row),active:true,orderReliable:parsed.reliable,historyStable:stable,readComplete,historyTailKnown:readComplete,historyOrderReliable:parsed.structuralReliable,historyStartKnown:startKnown,historyComplete:wholeHistory(startKnown,readComplete,parsed,history),tailKnown,messages:parsed.messages,coverage:parsed.coverage,needsRead:!tailKnown,detail:historyDetail('Made-in-China',stable,parsed,history)};
+      return {id,identityReliable:true,title:title(row),url:safeUrl(location.href),unread:unread(row),active:true,orderReliable:parsed.reliable,historyStable:stable,readComplete,historyTailKnown:readComplete,historyOrderReliable:parsed.structuralReliable,historyStartKnown:startKnown,historyComplete:wholeHistory(startKnown,readComplete,parsed,history),historyTextComplete:wholeHistory(startKnown,readComplete,parsed,history,true),tailKnown,messages:parsed.messages,coverage:parsed.coverage,needsRead:!tailKnown,detail:historyDetail('Made-in-China',stable,parsed,history)};
     }
     if(platform()==='alibaba'&&history.matches('.buyer-messenger-container .message-box .im-message-flow .scroll-box')){
       const active=select(document,INBOX_ALIBABA).filter(row=>rowActive(row));
@@ -445,7 +461,7 @@
       const row=active[0],id=identity(row),parsed=readMessages(history,null,true),startKnown=historyStartKnown(history),fingerprint=JSON.stringify([id,parsed.messages]);
       if(!activeAlibabaEvidence||activeAlibabaEvidence.fingerprint!==fingerprint)activeAlibabaEvidence={fingerprint,since:Date.now()};
       const stable=Date.now()-activeAlibabaEvidence.since>=1000,readComplete=stable&&atTail(history)&&!parsed.pendingFormat,tailKnown=readComplete&&!parsed.unsupportedMedia;
-      return {id,identityReliable:true,title:title(row),url:safeUrl(location.href),unread:unread(row),active:true,orderReliable:parsed.reliable,historyStable:stable,readComplete,historyTailKnown:readComplete,historyOrderReliable:parsed.structuralReliable,historyStartKnown:startKnown,historyComplete:wholeHistory(startKnown,readComplete,parsed,history),tailKnown,messages:parsed.messages,coverage:parsed.coverage,needsRead:!tailKnown,detail:historyDetail('Alibaba',stable,parsed,history)};
+      return {id,identityReliable:true,title:title(row),url:safeUrl(location.href),unread:unread(row),active:true,orderReliable:parsed.reliable,historyStable:stable,readComplete,historyTailKnown:readComplete,historyOrderReliable:parsed.structuralReliable,historyStartKnown:startKnown,historyComplete:wholeHistory(startKnown,readComplete,parsed,history),historyTextComplete:wholeHistory(startKnown,readComplete,parsed,history,true),tailKnown,messages:parsed.messages,coverage:parsed.coverage,needsRead:!tailKnown,detail:historyDetail('Alibaba',stable,parsed,history)};
     }
     // The full 1688 inbox can retain the original touid URL while another row
     // is selected. Until its current thread is proven, that URL is not identity.
@@ -456,7 +472,7 @@
       const startKnown=historyStartKnown(history),fingerprint=JSON.stringify([id,parsed.messages,startKnown]);
       if(!active1688Evidence||active1688Evidence.fingerprint!==fingerprint)active1688Evidence={fingerprint,since:Date.now()};
       const stable=Date.now()-active1688Evidence.since>=1000,readComplete=stable&&atTail(history)&&!parsed.pendingFormat,tailKnown=readComplete&&!parsed.unsupportedMedia;
-      return {id,identityReliable:true,title:title(row),url:safeUrl(location.href),unread:unread(row),active:true,orderReliable:parsed.reliable,historyStable:stable,readComplete,historyTailKnown:readComplete,historyOrderReliable:parsed.structuralReliable,historyStartKnown:startKnown,historyComplete:wholeHistory(startKnown,readComplete,parsed,history),tailKnown,messages:parsed.messages,coverage:parsed.coverage,needsRead:!tailKnown,detail:historyDetail('1688',stable,parsed,history)};
+      return {id,identityReliable:true,title:title(row),url:safeUrl(location.href),unread:unread(row),active:true,orderReliable:parsed.reliable,historyStable:stable,readComplete,historyTailKnown:readComplete,historyOrderReliable:parsed.structuralReliable,historyStartKnown:startKnown,historyComplete:wholeHistory(startKnown,readComplete,parsed,history),historyTextComplete:wholeHistory(startKnown,readComplete,parsed,history,true),tailKnown,messages:parsed.messages,coverage:parsed.coverage,needsRead:!tailKnown,detail:historyDetail('1688',stable,parsed,history)};
     }
     const root=history.closest(ROOT)||history,id=identity(root,count===1)||identity(history,count===1);
     if(!id)return null;
@@ -484,7 +500,10 @@
   function inboxScroller() {
     const site=platform(),selector=site==='1688'?'.ww_conversation_list .conversation-list-scroll':site==='alibaba'?'.buyer-conversation-list .normal-list-container':site==='mic'?'.conversation-record-lst [data-test-id="virtuoso-scroller"]':'';
     const direct=selector?select(document,selector):[];
-    if(direct.length===1&&/auto|scroll/.test(getComputedStyle(direct[0]).overflowY))return direct[0];
+    // MIC hides the native scrollbar on its explicit Virtuoso viewport while
+    // retaining programmatic scrolling. Do not broaden generic ancestor
+    // detection: overflow:clip/visible and unrelated hidden panels are not it.
+    if(direct.length===1&&(/auto|scroll/.test(getComputedStyle(direct[0]).overflowY)||site==='mic'&&getComputedStyle(direct[0]).overflowY==='hidden'))return direct[0];
     const rows=select(document,INBOX);if(!rows.length)return null;
     const boundary=rows[0].closest(site==='1688'?'.ww_conversation_list':site==='alibaba'?'.buyer-conversation-list':'.conversation-record-lst');
     if(!boundary||!rows.every(row=>boundary.contains(row)))return null;
@@ -494,13 +513,14 @@
     return overflowing.length===1?overflowing[0]:overflowing.length?null:candidates.length===1?candidates[0]:null;
   }
   function inboxModelContext() {
-    if(platform()!=='1688')return null;
-    const sidebars=select(document,'.ww_conversation_list'),scrollers=select(document,'.ww_conversation_list .conversation-list-scroll');
-    if(sidebars.length!==1||scrollers.length!==1||!sidebars[0].contains(scrollers[0])||inboxScroller()!==scrollers[0])return null;
-    const rows=select(document,INBOX_1688),scroller=scrollers[0],signature=rowSignature(sidebars[0],1000000);
-    if(!signature||!rows.length||!rows.every(row=>scroller.contains(row)&&liveThreadId(row))||new Set(rows.map(row=>row.id)).size!==rows.length)return null;
+    const site=platform(),spec=INBOX_MODELS[site];if(!spec)return null;
+    const sidebars=select(document,spec.scope),scroller=inboxScroller();
+    if(sidebars.length!==1||!scroller||!sidebars[0].contains(scroller))return null;
+    if(site==='1688'){const scrollers=select(document,'.ww_conversation_list .conversation-list-scroll');if(scrollers.length!==1||scrollers[0]!==scroller)return null;}
+    const rows=select(document,spec.rows),signature=rowSignature(sidebars[0],1000000);
+    if(!signature||!rows.length||!rows.every(row=>scroller.contains(row)&&liveThreadId(row))||new Set(rows.map(inboxRowId)).size!==rows.length)return null;
     const geometry=[scroller.scrollTop,scroller.scrollHeight,scroller.clientHeight];
-    return {signature,rows,scroller,geometry,fingerprint:JSON.stringify([signature,geometry])};
+    return {platform:site,schema:spec.schema,signature,rows,scroller,geometry,fingerprint:JSON.stringify([signature,geometry])};
   }
   function acceptedInboxModel(context) {
     if(!context||inboxModelAccepted?.fingerprint!==context.fingerprint)return null;
@@ -508,7 +528,7 @@
     return Date.now()-inboxModelAccepted.acceptedAt<ttl?inboxModelAccepted:null;
   }
   function requestInboxEvidence(result) {
-    if(result.platform!=='1688'||result.status!=='ready')return;
+    if(!INBOX_MODELS[result.platform]||result.status!=='ready')return;
     const context=inboxModelContext();if(!context||acceptedInboxModel(context))return;
     if(inboxModelAttempt.fingerprint===context.fingerprint&&inboxModelAttempt.count>=8&&Date.now()-inboxModelAttempt.at>=300000)inboxModelAttempt={fingerprint:context.fingerprint,at:0,count:0};
     if(inboxModelAttempt.fingerprint===context.fingerprint&&(inboxModelAttempt.count>=8||Date.now()-inboxModelAttempt.at<750))return;
@@ -521,12 +541,12 @@
     if(current.status!=='ready'||!context||!pending||context.fingerprint!==pending.fingerprint||request.evidenceToken!==pending.token)return {ok:false,detail:'Список диалогов изменился во время проверки.'};
     inboxModelAttempt={fingerprint:context.fingerprint,at:Date.now(),count:inboxModelAttempt.fingerprint===context.fingerprint?inboxModelAttempt.count+1:1};inboxModelRequest=null;
     const invalid=()=>({ok:false,detail:'Структура или полнота списка площадки ещё не подтверждена.'});
-    if(!evidence||evidence.status!=='ready'||evidence.platform!=='1688'||evidence.url!==location.href||evidence.schema!=='1688-inbox-pagination-v1'||evidence.domSignature!==context.signature||evidence.limited!==false||evidence.firstScreenRequestEnds!==true||typeof evidence.hasMore!=='boolean'||typeof evidence.loading!=='boolean'||typeof evidence.startVerified!=='boolean'||typeof evidence.endVerified!=='boolean'||!Number.isFinite(evidence.capturedAt)||Date.now()-evidence.capturedAt>5000||evidence.capturedAt-Date.now()>1000||!Number.isInteger(evidence.loadedCount)||evidence.loadedCount<1||evidence.loadedCount>10000||!Number.isInteger(evidence.itemCount)||evidence.itemCount<evidence.loadedCount||evidence.itemCount>evidence.loadedCount+1)return invalid();
+    if(!evidence||evidence.status!=='ready'||evidence.platform!==context.platform||evidence.url!==location.href||evidence.schema!==context.schema||evidence.domSignature!==context.signature||evidence.limited!==false||evidence.firstScreenRequestEnds!==true||typeof evidence.hasMore!=='boolean'||typeof evidence.loading!=='boolean'||typeof evidence.startVerified!=='boolean'||typeof evidence.endVerified!=='boolean'||!Number.isFinite(evidence.capturedAt)||Date.now()-evidence.capturedAt>5000||evidence.capturedAt-Date.now()>1000||!Number.isInteger(evidence.loadedCount)||evidence.loadedCount<1||evidence.loadedCount>10000||!Number.isInteger(evidence.itemCount)||evidence.itemCount<evidence.loadedCount||evidence.itemCount>evidence.loadedCount+(context.platform==='1688'?1:0))return invalid();
     if(![evidence.scrollTop,evidence.scrollHeight,evidence.clientHeight,evidence.scrollOffset].every(Number.isFinite)||Math.abs(evidence.scrollTop-context.geometry[0])>1||evidence.scrollHeight!==context.geometry[1]||evidence.clientHeight!==context.geometry[2]||Math.abs(evidence.scrollOffset-context.geometry[0])>3||!Array.isArray(evidence.rowRanks)||evidence.rowRanks.length!==context.rows.length)return invalid();
     const ranks=new Map(),usedRanks=new Set(),visualRows=[];
     for(let index=0;index<context.rows.length;index++){
       const row=evidence.rowRanks[index];
-      if(!row||row.id!==context.rows[index].id||!Number.isInteger(row.index)||row.index<0||row.index>=evidence.itemCount||usedRanks.has(row.index)||ranks.has(row.id))return invalid();
+      if(!row||row.id!==inboxRowId(context.rows[index])||!Number.isInteger(row.index)||row.index<0||row.index>=evidence.itemCount||usedRanks.has(row.index)||ranks.has(row.id))return invalid();
       ranks.set(row.id,row.index);usedRanks.add(row.index);visualRows.push({index:row.index,top:context.rows[index].getBoundingClientRect().top});
     }
     visualRows.sort((left,right)=>left.top-right.top);
@@ -542,7 +562,7 @@
   function listCoverage() {
     const rows=select(document,INBOX),scroller=inboxScroller();
     if(!scroller)return {token:'',hasMore:false,status:'unsupported',renderedRows:rows.length,complete:false};
-    const context=inboxModelContext(),native=acceptedInboxModel(context),nativeRequired=platform()==='1688'&&scroller.matches('.ww_conversation_list .conversation-list-scroll'),nativePending=nativeRequired&&!native,physicalMore=scroller.scrollHeight-scroller.clientHeight-scroller.scrollTop>3;
+    const context=inboxModelContext(),native=acceptedInboxModel(context),nativeRequired=platform()==='1688'?scroller.matches('.ww_conversation_list .conversation-list-scroll'):['alibaba','mic'].includes(platform()),nativePending=nativeRequired&&!native,physicalMore=scroller.scrollHeight-scroller.clientHeight-scroller.scrollTop>3;
     const signature=JSON.stringify([rows.map(row=>identity(row)),Math.round(scroller.scrollTop),scroller.scrollHeight,scroller.clientHeight,inboxModelAccepted?.loadedCount??null]);
     // A consumed action token is not list progress. Keep a separate token for
     // actual row/geometry changes, including delayed virtual-list rendering.
@@ -600,14 +620,19 @@
     if(Object.values(current.busy).some(Boolean))return {ok:false,busy:true,detail:'История не прокручивается во время ввода пользователя или при открытом черновике.'};
     const active=current.conversations.filter(row=>row.active&&row.identityReliable),row=active[0];
     if(active.length!==1||row.id!==request.conversationId)return {ok:false,detail:'Открытый адресат не подтверждён.'};
-    if(row.historyStable!==true)return {ok:false,status:'loading',detail:'Ожидаю устойчивую историю перед чтением первого сообщения.'};
-    if(row.firstBuyerMessageReliable){pendingReveal={platform:platform(),id:row.id,documentToken:DOCUMENT_TOKEN,at:Date.now(),historyOperation:true};return {ok:true,status:'complete',complete:true,detail:'Первое ваше сообщение подтверждено началом истории.'};}
+    const audit=request.purpose==='wechat-audit';
+    if(row.historyStable!==true)return {ok:false,status:'loading',detail:audit?'Ожидаю загрузку истории перед проверкой WeChat.':'Ожидаю устойчивую историю перед чтением первого сообщения.'};
+    if(audit?row.historyStartKnown:row.firstBuyerMessageReliable){pendingReveal={platform:platform(),id:row.id,documentToken:DOCUMENT_TOKEN,at:Date.now(),historyOperation:true};return {ok:true,status:'complete',complete:true,detail:audit?'Начало текущей истории подтверждено; можно проверить ID и последние сообщения.':'Первое ваше сообщение подтверждено началом истории.'};}
     const scroller=historyScroller();if(!scroller)return {ok:false,status:'unsupported',detail:'Не подтверждён контейнер ранней истории этой площадки.'};
-    let load=historyLoads.get(row.id);if(!load){load={attempts:0,lastAt:0,status:'loading',detail:''};historyLoads.set(row.id,load);}
+    const loads=audit?auditHistoryLoads:historyLoads,progressSignature=audit?JSON.stringify(row.messages.map(message=>[message.id,message.text])):'';
+    let load=loads.get(row.id);if(!load){load={attempts:0,lastAt:0,status:'loading',detail:'',progressSignature};loads.set(row.id,load);}
+    // A long history may need more than eight real pages. Only repeated
+    // attempts without newly observed message content exhaust an audit.
+    if(audit&&load.progressSignature!==progressSignature){load.attempts=0;load.progressSignature=progressSignature;}
     if(load.attempts>=HISTORY_LOAD_LIMIT&&Date.now()-load.lastAt>=300000){load.attempts=0;load.lastAt=0;load.status='loading';}
-    if(load.attempts>=HISTORY_LOAD_LIMIT)return {ok:false,status:'limited',attempts:load.attempts,detail:'Начало переписки не подтверждено после 8 попыток. Видимое сообщение не считается первым.'};
+    if(load.attempts>=HISTORY_LOAD_LIMIT)return {ok:false,status:'limited',attempts:load.attempts,detail:audit?'Начало переписки не подтверждено после 8 попыток без новых сообщений. Отсутствие WeChat не установлено.':'Начало переписки не подтверждено после 8 попыток. Видимое сообщение не считается первым.'};
     if(load.lastAt&&Date.now()-load.lastAt<1000)return {ok:false,status:'loading',attempts:load.attempts,detail:'Ожидаю загрузку предыдущей части истории.'};
-    load.attempts++;load.lastAt=Date.now();load.status=load.attempts>=HISTORY_LOAD_LIMIT?'limited':'loading';load.detail='Загружаю раннюю историю: требуется подтверждение начала переписки.';
+    load.attempts++;load.lastAt=Date.now();load.status=load.attempts>=HISTORY_LOAD_LIMIT?'limited':'loading';load.detail=audit?'Загружаю более ранние сообщения для поиска вашего WeChat ID.':'Загружаю раннюю историю: требуется подтверждение начала переписки.';
     pendingReveal={platform:platform(),id:row.id,documentToken:DOCUMENT_TOKEN,at:Date.now(),historyOperation:true};
     const target=scrollBoundary(scroller,true);
     // A one-pixel movement retriggers a native load-at-top observer without
@@ -627,8 +652,45 @@
       // button or an application method. The same eight-attempt cap applies.
       scroller.dispatchEvent(new Event('scroll'));
     }
-    for(const key of [...historyLoads.keys()].slice(0,-100))historyLoads.delete(key);
+    for(const key of [...loads.keys()].slice(0,-100))loads.delete(key);
     return {ok:true,status:'loading',attempts:load.attempts,maxAttempts:HISTORY_LOAD_LIMIT,detail:load.detail};
+  }
+  function checkWechat(request) {
+    const invalid=detail=>({ok:false,status:'incomplete',reason:'identity_changed',detail});
+    if(request?.documentToken!==DOCUMENT_TOKEN||typeof request.conversationId!=='string')return invalid('Документ или выбранный диалог изменились. Проверка ID не выполнена.');
+    const normalize=value=>String(value||'').normalize('NFKC').replace(/[\u200b-\u200d\ufeff]/g,'').toLowerCase();
+    const needle=typeof request.wechatId==='string'?normalize(request.wechatId).trim():'';
+    if(!needle||needle.length>256||/[\u0000-\u001f\u007f]/u.test(needle))return {ok:false,status:'incomplete',reason:'missing_contact',detail:'В настройках не указан корректный WeChat ID для проверки.'};
+    const current=snapshot(),rows=current.conversations.filter(row=>row.active&&row.identityReliable),row=rows[0];
+    if(current.status!=='ready'||rows.length!==1||row.id!==request.conversationId)return invalid('Не подтверждена история выбранного диалога. Проверка ID не выполнена.');
+    const digest=text=>{let a=2166136261,b=2246822507;for(let index=0;index<text.length;index++){a=Math.imul(a^text.charCodeAt(index),16777619);b=Math.imul(b^text.charCodeAt(index),3266489909);}return `${(a>>>0).toString(16)}${(b>>>0).toString(16)}:${text.length}`;};
+    const fullHistory=row.historyTextComplete===true;
+    // Virtualized history can replace a page while keeping the same row count.
+    // Only message identity, actual body text and order are progress; polling
+    // timestamps, read receipts, sender labels and loading UI are not.
+    const historyProgress=digest(JSON.stringify(row.messages.map(message=>[message.id||'',auditMessageTexts.get(message)||''])));
+    const base={ok:true,observedAt:Date.now(),platform:current.platform,conversationId:row.id,documentToken:DOCUMENT_TOKEN,sourceUrl:location.href,contactFingerprint:digest(needle),identityReliable:true,latestMessageAt:row.latestMessageAt,latestMessageAtReliable:row.latestMessageAtReliable===true,found:false,complete:fullHistory,fullHistory,textOnly:true,uncheckedAttachments:row.coverage?.unreadAttachments||0,checkedMessages:row.messages.length,historyProgress};
+    if(row.historyStable!==true)return {...base,status:'loading',reason:'stable_wait',complete:false,fullHistory:false,detail:'Ожидаю загрузку сообщений выбранного чата.'};
+    // A contact found in an older visible page does not establish whether this
+    // chat was active in the last day. Read its tail before finalizing even a
+    // positive result when no independent latest-message date is available.
+    if(!base.latestMessageAtReliable||!Number.isFinite(base.latestMessageAt)){
+      if(!row.historyTailKnown){
+        pendingReveal={platform:current.platform,id:row.id,documentToken:DOCUMENT_TOKEN,at:Date.now(),historyOperation:true};
+        return {...base,status:'incomplete',reason:'history_tail_missing',complete:false,detail:'Дочитываю последние сообщения, чтобы подтвердить дату активности чата перед итогом проверки.'};
+      }
+      // A fresh native model read can still be in flight. Give that exact
+      // request a small bounded window, not an endless loading state.
+      if(current.modelEvidenceToken&&modelRequest&&Date.now()-modelRequest.requestedAt<3000)return {...base,status:'loading',reason:'latest_time_pending',retryAfterMs:500,complete:false,detail:'Ожидаю подтверждение времени последнего сообщения из модели площадки.'};
+      return {...base,status:'incomplete',reason:'latest_time_unknown',complete:false,detail:'Не удалось достоверно определить дату последнего сообщения.'};
+    }
+    const contains=text=>{const value=normalize(text);for(let at=value.indexOf(needle);at!==-1;at=value.indexOf(needle,at+1))if(!/[a-z0-9_-]/i.test(value[at-1]||'')&&!/[a-z0-9_-]/i.test(value[at+needle.length]||''))return true;return false;};
+    const match=row.messages.find(message=>auditMessageTexts.has(message)&&contains(auditMessageTexts.get(message)));
+    if(match)return {...base,status:'found',found:true,matchDirection:match.direction,...(match.id?{matchMessageKey:'id:'+encodeURIComponent(match.id)}:{}),reason:'contact_found',detail:'Ваш WeChat ID найден в тексте сообщения участника этого чата.'};
+    if(fullHistory)return {...base,status:'not_found',reason:'complete_history',detail:'Ваш WeChat ID не найден в тексте сообщений. Вложения и QR-коды не проверялись.'};
+    if(!row.historyStartKnown)return {...base,status:'incomplete',reason:'history_start_missing',detail:'Ранние сообщения ещё не загружены. Отсутствие WeChat ID пока не установлено.'};
+    if(!row.historyTailKnown)return {...base,status:'incomplete',reason:'history_tail_missing',detail:'Начало истории проверено; нужно дочитать последние сообщения.'};
+    return {...base,status:'incomplete',reason:'history_unreadable',detail:'Текст истории прочитан не полностью. Отсутствие WeChat ID не установлено.'};
   }
   function modelContext(){
     if(platform()!=='1688')return null;
@@ -670,9 +732,9 @@
     return {ok:true,startKnown,latestMessageAtKnown:timeKnown===true};
   }
   function requestModelEvidence(result){
-    if(result.platform!=='1688'||result.status!=='ready'||!result.conversations.some(row=>row.active&&row.identityReliable&&row.messages.some(message=>message.direction==='unknown')))return;
+    if(result.platform!=='1688'||result.status!=='ready'||!result.conversations.some(row=>row.active&&row.identityReliable&&row.messages.length&&(!row.latestMessageAtReliable||row.messages.some(message=>message.direction==='unknown'))))return;
     const context=modelContext();if(!context||context.fingerprint===modelAttempt)return;
-    if(modelRequest?.fingerprint!==context.fingerprint)modelRequest={...context,token:crypto.randomUUID()};
+    if(modelRequest?.fingerprint!==context.fingerprint)modelRequest={...context,token:crypto.randomUUID(),requestedAt:Date.now()};
     result.modelEvidenceToken=modelRequest.token;
   }
   function applyModelEvidence(request){
@@ -689,7 +751,13 @@
       const model=record.model,ext=model?.ext,sender=model?.sender,receiver=model?.receiver,id=identifier(model?.code?.messageId);
       const from=numeric(ext?.senderMainUserId),to=numeric(ext?.receiverMainUserId),fromUser=numeric(ext?.senderUserId),toUser=numeric(ext?.receiverUserId),senderId=numeric(sender?.targetId),receiverId=numeric(receiver?.targetId);
       if(!members||!id||model?.conversationCode!==context.threadId||!from||!to||from===to||![members[1],members[2]].includes(from)||![members[1],members[2]].includes(to)||!fromUser||!toUser||senderId!==fromUser||![to,toUser].includes(receiverId)||String(sender?.targetType)!=='8'||String(receiver?.targetType)!=='8')continue;
-      const value={id,from,to};if(bySignature.has(record.signature)&&JSON.stringify(bySignature.get(record.signature))!==JSON.stringify(value))conflicts.add(record.signature);else bySignature.set(record.signature,value);
+      // 1688 bubbles often omit the year even when the native message has an
+      // exact sendTime. The timestamp shares the same nonce, account pair and
+      // unchanged row signature as sender evidence; media readability is not
+      // a prerequisite for knowing when that message was sent.
+      const time=nativeTimestamp(String(model?.sendTime)),domAt=timestamp(messages[0]);
+      const timeConsistent=domAt===null||time&&Math.floor(domAt/60000)===Math.floor(time.at/60000);
+      const value={id,from,to,...(time?.reliable&&timeConsistent?{at:time.at}:{})};if(bySignature.has(record.signature)&&JSON.stringify(bySignature.get(record.signature))!==JSON.stringify(value))conflicts.add(record.signature);else bySignature.set(record.signature,value);
     }
     for(const signature of conflicts)bySignature.delete(signature);
     const buyers=new Set();
@@ -698,11 +766,20 @@
       if(model&&messages.length===1&&self1688Message(messages[0]))buyers.add(model.from);
     }
     modelAttempt=context.fingerprint;modelRequest=null;
-    if(buyers.size!==1)return {ok:false,detail:'Аккаунт покупателя не подтверждён собственным сообщением в этой истории.'};
+    if(buyers.size!==1){
+      // An incoming-only page still has a dated native message for this exact
+      // thread. Preserve only that age/ID evidence until an actual self row
+      // identifies the buyer; never invent its incoming/outgoing direction.
+      if(buyers.size===0){
+        const dated=new Map([...bySignature].filter(([,model])=>model.at).map(([signature,model])=>[signature,{id:model.id,at:model.at}]));
+        if(dated.size){modelAccepted={threadId:context.threadId,rows:dated};return {ok:true,applied:dated.size,timestampsOnly:true};}
+      }
+      return {ok:false,detail:'Аккаунт покупателя не подтверждён собственным сообщением в этой истории.'};
+    }
     const buyer=[...buyers][0],peer=members[1]===buyer?members[2]:members[1],accepted=new Map();
     for(const [signature,model] of bySignature){
       const direction=model.from===buyer&&model.to===peer?'outbound':model.from===peer&&model.to===buyer?'inbound':null;
-      if(direction)accepted.set(signature,{id:model.id,direction});
+      if(direction)accepted.set(signature,{id:model.id,direction,...(model.at?{at:model.at}:{})});
     }
     modelAccepted={threadId:context.threadId,rows:accepted};
     return {ok:true,applied:accepted.size};
@@ -714,7 +791,7 @@
     try {
       if(select(document,'#nc_1_wrapper,.nc-container,.geetest_panel,[id*="captcha" i],[class*="captcha" i],iframe[src*="captcha" i],iframe[src*="recaptcha" i],iframe[src*="hcaptcha" i],iframe[src*="_____tmd_____/punish"],#baxia-dialog-content').length){result.status='captcha';result.detail='Видна проверка CAPTCHA; мониторинг ничего не нажимает.';return result;}
       if(select(document,'input[type="password"],[data-login-required="true"],.login-panel').length||/\/(?:login|signin)(?:[/.?]|$)/i.test(location.pathname+location.hash)){
-        if(!loginObserved){micEpoch=crypto.randomUUID();rowTokens=new WeakMap();usedTokens.clear();historyLoads.clear();firstBuyerProofs.clear();latestMessageTimes.clear();historyBoundaryProofs.clear();historyModelTimes.clear();historyModelRequest=null;historyModelAttempt={fingerprint:'',at:0};inboxModelRequest=null;inboxModelAccepted=null;inboxModelAttempt={fingerprint:'',at:0,count:0};active1688Evidence=null;activeAlibabaEvidence=null;activeMicEvidence=null;pendingReveal=null;modelRequest=null;modelAttempt='';modelAccepted={threadId:'',rows:new Map()};}loginObserved=true;
+        if(!loginObserved){micEpoch=crypto.randomUUID();rowTokens=new WeakMap();usedTokens.clear();historyLoads.clear();auditHistoryLoads.clear();firstBuyerProofs.clear();latestMessageTimes.clear();historyBoundaryProofs.clear();historyModelTimes.clear();historyModelRequest=null;historyModelAttempt={fingerprint:'',at:0};inboxModelRequest=null;inboxModelAccepted=null;inboxModelAttempt={fingerprint:'',at:0,count:0};active1688Evidence=null;activeAlibabaEvidence=null;activeMicEvidence=null;pendingReveal=null;modelRequest=null;modelAttempt='';modelAccepted={threadId:'',rows:new Map()};}loginObserved=true;
         result.status='login';result.detail='Нужен вход в аккаунт этой площадки.';return result;
       }
       loginObserved=false;
@@ -723,8 +800,8 @@
       const leafHistories=histories.filter(node=>!histories.some(other=>other!==node&&node.contains(other)));
       const conversations=leafHistories.map(history=>readHistory(history,leafHistories.length)).filter(Boolean).map(workflowEvidence);
       const byId=new Map();
-      for(const entry of conversations){if(byId.has(entry.id)){const other=byId.get(entry.id);other.orderReliable=false;other.tailKnown=false;other.readComplete=false;other.historyTailKnown=false;other.historyOrderReliable=false;other.historyStartKnown=false;other.historyComplete=false;other.firstBuyerMessage=null;other.firstBuyerMessageReliable=false;other.latestMessageAtReliable=false;firstBuyerProofs.delete(entry.id);other.detail='Найдено несколько историй одного диалога; нужно уточнить структуру страницы.';}else byId.set(entry.id,entry);}
-      const rowWindow=inboxSnapshotRows(),nativeInbox=acceptedInboxModel(inboxModelContext()),nativeOrder=new Map(select(document,INBOX).map((item,index)=>[item,nativeInbox?.ranks.get(item.id)??index]));
+      for(const entry of conversations){if(byId.has(entry.id)){const other=byId.get(entry.id);other.orderReliable=false;other.tailKnown=false;other.readComplete=false;other.historyTailKnown=false;other.historyOrderReliable=false;other.historyStartKnown=false;other.historyComplete=false;other.historyTextComplete=false;other.firstBuyerMessage=null;other.firstBuyerMessageReliable=false;other.latestMessageAtReliable=false;firstBuyerProofs.delete(entry.id);other.detail='Найдено несколько историй одного диалога; нужно уточнить структуру страницы.';}else byId.set(entry.id,entry);}
+      const rowWindow=inboxSnapshotRows(),nativeInbox=acceptedInboxModel(inboxModelContext()),nativeOrder=new Map(select(document,INBOX).map((item,index)=>[item,nativeInbox?.ranks.get(inboxRowId(item))??index]));
       for(const item of rowWindow.rows){
         const id=identity(item);if(!id)continue;
         const previewNode=select(item,'[data-message-preview],.message-preview,.conversation-preview,.last-message'+(platform()==='1688'&&item.matches(INBOX_1688)?',.conversation-secondary-line > .desc':platform()==='alibaba'&&item.matches(INBOX_ALIBABA)?',.msg-wrapper .latest-msg > div':platform()==='mic'&&item.matches(INBOX_MIC)?',.rg-last-msg .last-msg':''))[0];const preview=textOf(previewNode,LIMIT.text,true);
@@ -808,10 +885,10 @@
     return {ok:true,revealedId:request.conversationId};
   }
   for(const type of ['keydown','pointerdown','input','wheel','touchstart'])document.addEventListener(type,event=>{if(event.isTrusted){lastTrustedInput=Date.now();pendingReveal=null;}},{capture:true,passive:true});
-  globalThis.OpenLinksDialogsReader=Object.freeze({snapshot,openConversation,revealLatest,loadHistoryStart,advanceList,applyModelEvidence,applyHistoryEvidence,applyInboxEvidence,guardReply,guardPreviewCleanup});
+  globalThis.OpenLinksDialogsReader=Object.freeze({snapshot,openConversation,revealLatest,loadHistoryStart,checkWechat,advanceList,applyModelEvidence,applyHistoryEvidence,applyInboxEvidence,guardReply,guardPreviewCleanup});
   globalThis.chrome?.runtime?.onMessage?.addListener((message,sender,respond)=>{
-    if(!['DIALOGS_SNAPSHOT','DIALOGS_OPEN_CONVERSATION','DIALOGS_REVEAL_LATEST','DIALOGS_LOAD_HISTORY_START','DIALOGS_ADVANCE_LIST','DIALOGS_APPLY_INBOX_EVIDENCE','DIALOGS_APPLY_HISTORY_EVIDENCE','DIALOGS_APPLY_MODEL_EVIDENCE'].includes(message?.type))return;
+    if(!['DIALOGS_SNAPSHOT','DIALOGS_OPEN_CONVERSATION','DIALOGS_REVEAL_LATEST','DIALOGS_LOAD_HISTORY_START','DIALOGS_CHECK_WECHAT','DIALOGS_ADVANCE_LIST','DIALOGS_APPLY_INBOX_EVIDENCE','DIALOGS_APPLY_HISTORY_EVIDENCE','DIALOGS_APPLY_MODEL_EVIDENCE'].includes(message?.type))return;
     if(sender?.id!==chrome.runtime.id){respond({status:'error',detail:'Источник запроса не подтверждён.'});return;}
-    respond(message.type==='DIALOGS_SNAPSHOT'?snapshot():message.type==='DIALOGS_OPEN_CONVERSATION'?openConversation(message):message.type==='DIALOGS_LOAD_HISTORY_START'?loadHistoryStart(message):message.type==='DIALOGS_ADVANCE_LIST'?advanceList(message):message.type==='DIALOGS_APPLY_INBOX_EVIDENCE'?applyInboxEvidence(message):message.type==='DIALOGS_APPLY_HISTORY_EVIDENCE'?applyHistoryEvidence(message):message.type==='DIALOGS_APPLY_MODEL_EVIDENCE'?applyModelEvidence(message):revealLatest(message));
+    respond(message.type==='DIALOGS_SNAPSHOT'?snapshot():message.type==='DIALOGS_OPEN_CONVERSATION'?openConversation(message):message.type==='DIALOGS_LOAD_HISTORY_START'?loadHistoryStart(message):message.type==='DIALOGS_CHECK_WECHAT'?checkWechat(message):message.type==='DIALOGS_ADVANCE_LIST'?advanceList(message):message.type==='DIALOGS_APPLY_INBOX_EVIDENCE'?applyInboxEvidence(message):message.type==='DIALOGS_APPLY_HISTORY_EVIDENCE'?applyHistoryEvidence(message):message.type==='DIALOGS_APPLY_MODEL_EVIDENCE'?applyModelEvidence(message):revealLatest(message));
   });
 })();

@@ -2215,3 +2215,128 @@ test('exact-source unsupported inbox evidence consumes the reader failure budget
   h.api.tabs.sendMessage=async(id,message,options)=>{if(message.type==='DIALOGS_APPLY_INBOX_EVIDENCE'){failed++;assert.equal(message.expectedDocumentToken,'doc-1');assert.equal(message.evidenceToken,'unsupported-once');assert.equal(message.evidence.status,'unsupported');delete snap.inboxEvidenceToken;snap.listCoverage={token:'native-limited',nativePending:true,status:'limited',hasMore:false};return {ok:false,reason:'unsupported'};}return native(id,message,options);};
   await h.command('START');await poll(h);assert.equal(failed,1);assert.equal(h.storage[DIALOGS_KEY].workflow.list['1688'].failed,true);assert.equal(h.storage[DIALOGS_KEY].workflow.list['1688'].atEnd,false);assert.ok(h.storage[DIALOGS_KEY].events.some(event=>event.type==='workflow_list_limited'));
 });
+
+async function auditReady(h){
+  for(const [index,name] of ['1688','alibaba','mic'].entries())await h.command('BIND_TAB',{platform:name,tabId:index+1});
+  await h.command('SETTINGS',{settings:{wechat:'buyer-wechat',wechatAudit:true,workflow24h:true,showWorkingTab:true}});
+  for(const [index,name] of ['1688','alibaba','mic'].entries()){
+    const snap=h.replies.get(index+1);snap.listCoverage={token:'audit-list-'+name,atStart:true,hasMore:false,complete:true};
+    snap.conversations[0]={...snap.conversations[0],listOrder:0,historyStable:true,latestMessageAt:h.time,latestMessageAtReliable:true};
+  }
+  const native=h.api.tabs.sendMessage;
+  h.api.tabs.sendMessage=async(id,message,options)=>{
+    if(message.type==='DIALOGS_CHECK_WECHAT'){
+      h.calls.push({id,...message});const row=h.replies.get(id).conversations[0];
+      const {wechatContactFingerprint}=await import('../extension/lib/wechat-audit.js');
+      return {ok:true,status:'not_found',found:false,complete:true,fullHistory:true,conversationId:row.id,documentToken:'doc-1',sourceUrl:urls[['1688','alibaba','mic'][id-1]],identityReliable:true,observedAt:h.time,contactFingerprint:wechatContactFingerprint(message.wechatId),latestMessageAt:h.time,latestMessageAtReliable:true,checkedMessages:2};
+    }
+    return native(id,message,options);
+  };
+}
+test('audit-only checks all three platforms without product, Claude, editor, or legacy test prerequisites',async()=>{
+  let attachments=0,sends=0,nativeCalls=0;const h=harness({attachmentResolver:async()=>{attachments++;},folderSender:async()=>{sends++;throw new Error('audit cannot send');}});await auditReady(h);
+  h.api.runtime.sendNativeMessage=async()=>{nativeCalls++;throw new Error('audit cannot contact worker');};
+  h.storage.openlinksClaudeFolder=normalizeFolder({enabled:true,auto:true,autoSend:true,test:{enabled:true,phase:'completed'}});
+  const before=structuredClone(h.storage.openlinksClaudeFolder);
+  assert.equal((await h.command('AUDIT_START')).ok,true);
+  for(let i=0;i<20&&h.storage[DIALOGS_KEY].running;i++){await poll(h);h.advanceTime(2000);}
+  const state=h.storage[DIALOGS_KEY];assert.equal(state.workflow.audit.phase,'completed');assert.equal(state.workflow.audit.cursor,3);assert.equal(state.running,false);
+  assert.equal(Object.keys(state.workflow.audit.records).length,3);assert.ok(Object.values(state.workflow.audit.records).every(row=>row.status==='not_found'));
+  assert.deepEqual(h.calls.filter(call=>call.type==='DIALOGS_CHECK_WECHAT').map(call=>call.id),[1,2,3]);
+  assert.equal(sends,0);assert.equal(nativeCalls,0);assert.equal(attachments,0);assert.equal(h.fetches,0);assert.deepEqual(h.storage.openlinksClaudeFolder,before);
+});
+test('audit command boundary rejects old reply and test actions, and paused alarms never poll Claude',async()=>{
+  const h=harness();await auditReady(h);let worker=0;h.api.runtime.sendNativeMessage=async()=>{worker++;throw new Error('unexpected worker');};
+  for(const command of ['FOLDER_DRAFT','FOLDER_PRODUCT','FOLDER_RETRY','FOLDER_POLL','FOLDER_SETTINGS','TEST_NEXT','TEST_PLATFORM','REVIEW_SEND','SEND_DRAFT','GENERATE_DRAFT','PRODUCT_EXTRACT','JOINT_START'])assert.equal((await h.command(command,{key,enabled:true,autoSend:true})).ok,false,command);
+  await h.command('AUDIT_START');await h.command('STOP');const before=h.calls.length;await poll(h);assert.equal(h.calls.length,before);assert.equal(worker,0);
+  assert.equal(h.storage[DIALOGS_KEY].workflow.audit.phase,'paused');
+});
+test('changing audit contact preserves saved product and drafts and cannot resume the old report',async()=>{
+  const h=harness();await ready(h);await auditReady(h);await h.command('AUDIT_START');await h.command('STOP');
+  const state=h.storage[DIALOGS_KEY];state.conversations[key].draft={text:'User draft',status:'draft'};const product=structuredClone(state.product),draft=structuredClone(state.conversations[key].draft);
+  assert.equal((await h.command('SETTINGS',{settings:{wechat:'different-wechat'}})).ok,true);
+  assert.deepEqual(h.storage[DIALOGS_KEY].product,product);assert.equal((h.storage[DIALOGS_KEY].conversations[key].draft||h.storage[DIALOGS_KEY].conversations[key].previousDraft).text,draft.text);
+  await h.command('START');assert.equal(h.storage[DIALOGS_KEY].running,false);assert.equal(h.storage[DIALOGS_KEY].workflow.audit.phase,'blocked');
+});
+test('0.21 migration and restart retain legacy folder jobs and keep audit stopped',async()=>{
+  const h=harness();await ready(h);h.storage.openlinksClaudeFolder=normalizeFolder({enabled:true,auto:true,autoSend:false});const before=structuredClone(h.storage.openlinksClaudeFolder);
+  h.api.runtime.getManifest=()=>({version:'0.21.0'});let worker=0;h.api.runtime.sendNativeMessage=async()=>{worker++;throw new Error('unexpected worker');};
+  let response=await h.command('GET');assert.equal(response.state.settings.wechatAudit,true);assert.equal(response.state.running,false);
+  await h.monitor.onStartup();await poll(h);response=await h.command('GET');assert.equal(response.state.running,false);assert.equal(response.state.settings.wechatAudit,true);
+  assert.deepEqual(h.storage.openlinksClaudeFolder,before);assert.equal(worker,0);
+});
+test('audit opens separate managed tabs despite a retained legacy preview and preserves its folder state',async()=>{
+  const h=harness();await h.command('SETTINGS',{settings:{wechat:'buyer-wechat',wechatAudit:true,workflow24h:true}});
+  const folder=normalizeFolder({enabled:true,auto:true,test:{enabled:true,sessionId:crypto.randomUUID(),cycleId:crypto.randomUUID(),phase:'completed',key,jobId:crypto.randomUUID(),text:'Saved unsent preview',source:{tabId:1,frameId:0,documentToken:'doc-1',sourceUrl:urls['1688']}}});
+  h.storage.openlinksClaudeFolder=folder;const before=structuredClone(folder);h.storage[DIALOGS_KEY].readUnread=false;
+  const result=await h.command('AUDIT_START');assert.equal(result.ok,true);assert.equal(h.tabCreates.length,3);
+  assert.equal(h.storage[DIALOGS_KEY].settings.wechatAudit,true);assert.equal(h.storage[DIALOGS_KEY].readUnread,false);
+  assert.deepEqual(h.storage.openlinksClaudeFolder,before);assert.equal(h.tabs.get(1).url,urls['1688']);
+});
+test('audit preserves actual queued Claude work across start, pause and restart without contacting the worker',async()=>{
+  const h=harness(),host=await workflowReady(h,{folder:true});await h.command('START');await poll(h);assert.equal(host.jobs.size,1);
+  await h.command('STOP');assert.ok(h.storage.openlinksClaudeFolder.jobs.length>0);h.storage[DIALOGS_KEY].settings.wechatAudit=true;
+  await auditReady(h);const before=structuredClone(h.storage.openlinksClaudeFolder);let worker=0;
+  h.api.runtime.sendNativeMessage=async()=>{worker++;throw new Error('unexpected Claude call');};
+  await h.command('AUDIT_START');await poll(h);await h.command('STOP');await poll(h);await h.monitor.onStartup();await poll(h);
+  assert.equal(worker,0);assert.deepEqual(h.storage.openlinksClaudeFolder,before);
+});
+
+const AUDIT_RUN_A='11111111-1111-4111-8111-111111111111';
+const AUDIT_RUN_B='22222222-2222-4222-8222-222222222222';
+async function holdAuditCheck(h){
+  await auditReady(h);await h.command('AUDIT_START',{runId:AUDIT_RUN_A});await poll(h);
+  const entered=deferred(),release=deferred(),native=h.api.tabs.sendMessage;
+  h.api.tabs.sendMessage=async(id,message,options)=>{if(message.type==='DIALOGS_CHECK_WECHAT'){entered.resolve();await release.promise;}return native(id,message,options);};
+  const flight=poll(h);await entered.promise;return {flight,release:()=>release.resolve()};
+}
+test('audit protocol validates supplied UUID v4 before cancellation, state changes or tab opening',async()=>{
+  const h=harness();const held=await holdAuditCheck(h),before=structuredClone(h.storage[DIALOGS_KEY]);
+  for(const runId of ['',undefined,null,123,'not-a-uuid','11111111-1111-3111-8111-111111111111','11111111-1111-4111-1111-111111111111'])assert.equal((await h.command('AUDIT_START',{runId})).ok,false);
+  assert.deepEqual(h.storage[DIALOGS_KEY],before);assert.equal(h.tabCreates.length,0);
+  held.release();await held.flight;
+  assert.equal(Object.keys(h.storage[DIALOGS_KEY].workflow.audit.records).length,1,'invalid start must not cancel a current read');
+});
+test('audit protocol repeats the same run id without restarting or resuming a paused audit',async()=>{
+  let disabled=0;const h=harness({disableJointWork:async()=>{disabled++;}});await auditReady(h);
+  let result=await h.command('AUDIT_START',{runId:AUDIT_RUN_A});assert.equal(result.state.workflow.audit.runId,AUDIT_RUN_A);
+  await poll(h);await poll(h);await h.command('STOP',{expectedRunId:AUDIT_RUN_A});
+  const before=structuredClone(h.storage[DIALOGS_KEY]),calls=h.calls.length,alarms=h.alarms.length,disabledBefore=disabled;
+  result=await h.command('AUDIT_START',{runId:AUDIT_RUN_A});assert.equal(result.ok,true);assert.equal(result.auditStartReplayed,true);
+  assert.deepEqual(h.storage[DIALOGS_KEY],before);assert.equal(result.state.workflow.audit.phase,'paused');assert.equal(h.calls.length,calls);assert.equal(h.alarms.length,alarms);assert.equal(disabled,disabledBefore);
+});
+test('audit protocol idempotent START does not cancel an in-flight read',async()=>{
+  const h=harness(),held=await holdAuditCheck(h),replayed=h.command('AUDIT_START',{runId:AUDIT_RUN_A});
+  await new Promise(resolve=>setImmediate(resolve));held.release();await held.flight;
+  assert.equal((await replayed).auditStartReplayed,true);assert.equal(Object.keys(h.storage[DIALOGS_KEY].workflow.audit.records).length,1);assert.equal(h.storage[DIALOGS_KEY].running,true);
+});
+test('audit protocol foreign conditional STOP does not cancel a read, pause or disable joint work',async()=>{
+  let disabled=0;const h=harness({disableJointWork:async()=>{disabled++;}}),held=await holdAuditCheck(h),disabledBefore=disabled;
+  const stopped=h.command('STOP',{expectedRunId:AUDIT_RUN_B});await new Promise(resolve=>setImmediate(resolve));held.release();await held.flight;
+  assert.equal((await stopped).ok,false);assert.equal(disabled,disabledBefore);assert.equal(h.storage[DIALOGS_KEY].running,true);assert.equal(h.storage[DIALOGS_KEY].workflow.audit.runId,AUDIT_RUN_A);assert.equal(Object.keys(h.storage[DIALOGS_KEY].workflow.audit.records).length,1);
+});
+test('audit protocol owned conditional STOP serializes after a bounded read and pauses only that run',async()=>{
+  const h=harness(),held=await holdAuditCheck(h),stopped=h.command('STOP',{expectedRunId:AUDIT_RUN_A});
+  await new Promise(resolve=>setImmediate(resolve));held.release();await held.flight;
+  assert.equal((await stopped).ok,true);assert.equal(h.storage[DIALOGS_KEY].running,false);assert.equal(h.storage[DIALOGS_KEY].workflow.audit.phase,'paused');assert.equal(Object.keys(h.storage[DIALOGS_KEY].workflow.audit.records).length,1);
+});
+test('audit protocol conditional STOP queued behind an unacknowledged START stops the eventual owned run',async()=>{
+  const entered=deferred(),release=deferred();let disabled=0;
+  const h=harness({disableJointWork:async()=>{disabled++;if(disabled===1){entered.resolve();await release.promise;}}});await auditReady(h);
+  const started=h.command('AUDIT_START',{runId:AUDIT_RUN_A});await entered.promise;
+  assert.equal(h.storage[DIALOGS_KEY].workflow.audit.runId,'');
+  const stopped=h.command('STOP',{expectedRunId:AUDIT_RUN_A});await new Promise(resolve=>setImmediate(resolve));release.resolve();
+  assert.equal((await started).ok,true);assert.equal((await stopped).ok,true);assert.equal(h.storage[DIALOGS_KEY].workflow.audit.runId,AUDIT_RUN_A);assert.equal(h.storage[DIALOGS_KEY].workflow.audit.phase,'paused');assert.equal(h.storage[DIALOGS_KEY].running,false);
+});
+test('audit protocol rechecks conditional STOP ownership after a queued new START changes the run',async()=>{
+  const entered=deferred(),release=deferred();let disabled=0;
+  const h=harness({disableJointWork:async()=>{disabled++;if(disabled===2){entered.resolve();await release.promise;}}});await auditReady(h);await h.command('AUDIT_START',{runId:AUDIT_RUN_A});
+  const newer=h.command('AUDIT_START',{runId:AUDIT_RUN_B});await entered.promise;
+  const oldStop=h.command('STOP',{expectedRunId:AUDIT_RUN_A});await new Promise(resolve=>setImmediate(resolve));release.resolve();
+  assert.equal((await newer).ok,true);assert.equal((await oldStop).ok,false);assert.equal(disabled,2);assert.equal(h.storage[DIALOGS_KEY].running,true);assert.equal(h.storage[DIALOGS_KEY].workflow.audit.runId,AUDIT_RUN_B);
+});
+test('audit protocol rejects malformed conditional STOP identifiers without touching the current run',async()=>{
+  const h=harness();await auditReady(h);await h.command('AUDIT_START',{runId:AUDIT_RUN_A});const before=structuredClone(h.storage[DIALOGS_KEY]);
+  for(const expectedRunId of ['',undefined,null,123,' '.repeat(3),'x'.repeat(201),'with\nnewline'])assert.equal((await h.command('STOP',{expectedRunId})).ok,false);
+  assert.deepEqual(h.storage[DIALOGS_KEY],before);
+});
