@@ -139,3 +139,8 @@ test('ordered sweep progress and bounded factual chat results survive normalizat
   const result=normalizeDialogs(state,now).workflow;assert.equal(result.orderVersion,1);assert.equal(result.sweepId,8);assert.equal(result.cursor,1);assert.equal(result.platformSince,now);assert.equal(result.list.alibaba.jobsChecked,true);assert.equal(result.list.alibaba.stalls,2);assert.equal(result.visits[key].lastResult.status,'test_completed');assert.equal(result.visits[key].lastResult.fingerprint,'old-context');assert.equal(result.visits[key].title,'Supplier');
   state.workflow.visits[key].url='https://malicious.example/private';assert.equal(normalizeDialogs(state,now).workflow.visits[key].url,'');
 });
+
+test('native list-start retries and history settling survive storage without resetting their limits',()=>{
+  const state=stateWithMemory();state.workflow.list={'1688':{sweepId:5,positioned:false,startAttempts:2,nextAt:now+1000}};state.workflow.history={[key]:{phase:'start',attempts:1,nextAt:now+1100,startedAt:now,documentToken:'document',frameId:0}};
+  const restored=normalizeDialogs(normalizeDialogs(state,now),now);assert.equal(restored.workflow.list['1688'].positioned,false);assert.equal(restored.workflow.list['1688'].startAttempts,2);assert.equal(restored.workflow.history[key].nextAt,now+1100);state.workflow.list['1688'].startAttempts=100;assert.equal(normalizeDialogs(state,now).workflow.list['1688'].startAttempts,3);
+});

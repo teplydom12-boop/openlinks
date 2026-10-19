@@ -26,6 +26,7 @@
   const latestMessageTimes=new Map();
   const HISTORY_LOAD_LIMIT=8;
   let inboxTraversal={token:'',signature:'',progressSignature:'',progressToken:'',steps:0,stalledAttempts:0,scroller:null};
+  let inboxModelRequest=null,inboxModelAccepted=null,inboxModelAttempt={fingerprint:'',at:0,count:0};
   const LIMIT = {conversations: 200, messages: 500, text: 12000, nodes: 3000};
   const HISTORY = '[data-message-history],[data-chat-history],[data-message-list],[role="log"],.message-list,.messages-list,.chat-messages,.message-history,.chat-history,.buyer-messenger-container .message-box .im-message-flow .scroll-box,.conversation-area .window-center-messages-main > .msg-list';
   const ROOT = '[data-dialog-root],[data-chat-root],[data-conversation-root],.chat-panel,.chat-window,.conversation-panel,.message-panel,.ww_box,.buyer-messenger-container .message-box,.conversation-area .conversation-window,.conversation-area';
@@ -492,17 +493,65 @@
     const overflowing=candidates.filter(node=>node.scrollHeight-node.clientHeight>3);
     return overflowing.length===1?overflowing[0]:overflowing.length?null:candidates.length===1?candidates[0]:null;
   }
+  function inboxModelContext() {
+    if(platform()!=='1688')return null;
+    const sidebars=select(document,'.ww_conversation_list'),scrollers=select(document,'.ww_conversation_list .conversation-list-scroll');
+    if(sidebars.length!==1||scrollers.length!==1||!sidebars[0].contains(scrollers[0])||inboxScroller()!==scrollers[0])return null;
+    const rows=select(document,INBOX_1688),scroller=scrollers[0],signature=rowSignature(sidebars[0],1000000);
+    if(!signature||!rows.length||!rows.every(row=>scroller.contains(row)&&liveThreadId(row))||new Set(rows.map(row=>row.id)).size!==rows.length)return null;
+    const geometry=[scroller.scrollTop,scroller.scrollHeight,scroller.clientHeight];
+    return {signature,rows,scroller,geometry,fingerprint:JSON.stringify([signature,geometry])};
+  }
+  function acceptedInboxModel(context) {
+    if(!context||inboxModelAccepted?.fingerprint!==context.fingerprint)return null;
+    const atEnd=context.geometry[1]-context.geometry[2]-context.geometry[0]<=3,ttl=inboxModelAccepted.loading||atEnd&&inboxModelAccepted.hasMore?750:5000;
+    return Date.now()-inboxModelAccepted.acceptedAt<ttl?inboxModelAccepted:null;
+  }
+  function requestInboxEvidence(result) {
+    if(result.platform!=='1688'||result.status!=='ready')return;
+    const context=inboxModelContext();if(!context||acceptedInboxModel(context))return;
+    if(inboxModelAttempt.fingerprint===context.fingerprint&&inboxModelAttempt.count>=8&&Date.now()-inboxModelAttempt.at>=300000)inboxModelAttempt={fingerprint:context.fingerprint,at:0,count:0};
+    if(inboxModelAttempt.fingerprint===context.fingerprint&&(inboxModelAttempt.count>=8||Date.now()-inboxModelAttempt.at<750))return;
+    if(inboxModelRequest?.fingerprint!==context.fingerprint)inboxModelRequest={...context,token:crypto.randomUUID()};
+    result.inboxEvidenceToken=inboxModelRequest.token;
+  }
+  function applyInboxEvidence(request) {
+    if(request?.expectedDocumentToken!==DOCUMENT_TOKEN||!inboxModelRequest||request.evidenceToken!==inboxModelRequest.token)return {ok:false,detail:'Разрешение проверки списка диалогов устарело.'};
+    const current=snapshot(),context=inboxModelContext(),pending=inboxModelRequest,evidence=request.evidence;
+    if(current.status!=='ready'||!context||!pending||context.fingerprint!==pending.fingerprint||request.evidenceToken!==pending.token)return {ok:false,detail:'Список диалогов изменился во время проверки.'};
+    inboxModelAttempt={fingerprint:context.fingerprint,at:Date.now(),count:inboxModelAttempt.fingerprint===context.fingerprint?inboxModelAttempt.count+1:1};inboxModelRequest=null;
+    const invalid=()=>({ok:false,detail:'Структура или полнота списка площадки ещё не подтверждена.'});
+    if(!evidence||evidence.status!=='ready'||evidence.platform!=='1688'||evidence.url!==location.href||evidence.schema!=='1688-inbox-pagination-v1'||evidence.domSignature!==context.signature||evidence.limited!==false||evidence.firstScreenRequestEnds!==true||typeof evidence.hasMore!=='boolean'||typeof evidence.loading!=='boolean'||typeof evidence.startVerified!=='boolean'||typeof evidence.endVerified!=='boolean'||!Number.isFinite(evidence.capturedAt)||Date.now()-evidence.capturedAt>5000||evidence.capturedAt-Date.now()>1000||!Number.isInteger(evidence.loadedCount)||evidence.loadedCount<1||evidence.loadedCount>10000||!Number.isInteger(evidence.itemCount)||evidence.itemCount<evidence.loadedCount||evidence.itemCount>evidence.loadedCount+1)return invalid();
+    if(![evidence.scrollTop,evidence.scrollHeight,evidence.clientHeight,evidence.scrollOffset].every(Number.isFinite)||Math.abs(evidence.scrollTop-context.geometry[0])>1||evidence.scrollHeight!==context.geometry[1]||evidence.clientHeight!==context.geometry[2]||Math.abs(evidence.scrollOffset-context.geometry[0])>3||!Array.isArray(evidence.rowRanks)||evidence.rowRanks.length!==context.rows.length)return invalid();
+    const ranks=new Map(),usedRanks=new Set(),visualRows=[];
+    for(let index=0;index<context.rows.length;index++){
+      const row=evidence.rowRanks[index];
+      if(!row||row.id!==context.rows[index].id||!Number.isInteger(row.index)||row.index<0||row.index>=evidence.itemCount||usedRanks.has(row.index)||ranks.has(row.id))return invalid();
+      ranks.set(row.id,row.index);usedRanks.add(row.index);visualRows.push({index:row.index,top:context.rows[index].getBoundingClientRect().top});
+    }
+    visualRows.sort((left,right)=>left.top-right.top);
+    if(visualRows.some((row,index)=>index>0&&(row.top<=visualRows[index-1].top||row.index<=visualRows[index-1].index)))return invalid();
+    // The native cache stores membership in a different order from the UI.
+    // Use verified virtual renderer indices, including its real header/footer
+    // slots, and require an observed boundary instead of guessing an offset.
+    if(context.geometry[0]<=3&&!evidence.startVerified||context.geometry[1]-context.geometry[2]-context.geometry[0]<=3&&!evidence.endVerified)return invalid();
+    inboxModelAccepted={fingerprint:context.fingerprint,acceptedAt:Date.now(),loadedCount:evidence.loadedCount,hasMore:evidence.hasMore,loading:evidence.loading,startVerified:evidence.startVerified,endVerified:evidence.endVerified,ranks};
+    inboxModelAttempt={fingerprint:context.fingerprint,at:Date.now(),count:0};
+    return {ok:true,loadedRows:evidence.loadedCount,nativeHasMore:evidence.hasMore,loading:evidence.loading};
+  }
   function listCoverage() {
     const rows=select(document,INBOX),scroller=inboxScroller();
     if(!scroller)return {token:'',hasMore:false,status:'unsupported',renderedRows:rows.length,complete:false};
-    const signature=JSON.stringify([rows.map(row=>identity(row)),Math.round(scroller.scrollTop),scroller.scrollHeight,scroller.clientHeight]);
+    const context=inboxModelContext(),native=acceptedInboxModel(context),nativeRequired=platform()==='1688'&&scroller.matches('.ww_conversation_list .conversation-list-scroll'),nativePending=nativeRequired&&!native,physicalMore=scroller.scrollHeight-scroller.clientHeight-scroller.scrollTop>3;
+    const signature=JSON.stringify([rows.map(row=>identity(row)),Math.round(scroller.scrollTop),scroller.scrollHeight,scroller.clientHeight,inboxModelAccepted?.loadedCount??null]);
     // A consumed action token is not list progress. Keep a separate token for
     // actual row/geometry changes, including delayed virtual-list rendering.
     // Successful traversal has no page-count ceiling; only repeated stalls do.
     if(inboxTraversal.progressSignature!==signature)Object.assign(inboxTraversal,{progressSignature:signature,progressToken:crypto.randomUUID(),stalledAttempts:0});
     if(inboxTraversal.signature!==signature||inboxTraversal.scroller!==scroller)inboxTraversal={...inboxTraversal,token:crypto.randomUUID(),signature,scroller};
-    const limited=inboxTraversal.stalledAttempts>=8,hasMore=scroller.scrollHeight-scroller.clientHeight-scroller.scrollTop>3&&!limited;
-    return {token:inboxTraversal.token,progressToken:inboxTraversal.progressToken,stalledAttempts:inboxTraversal.stalledAttempts,hasMore,status:limited?'limited':hasMore?'ready':'end_visible',renderedRows:rows.length,complete:false};
+    const limited=inboxTraversal.stalledAttempts>=8||nativePending&&(!context||inboxModelAttempt.fingerprint===context.fingerprint&&inboxModelAttempt.count>=8&&Date.now()-inboxModelAttempt.at<300000);
+    const loading=!limited&&(nativePending||native?.loading===true),hasMore=!limited&&(physicalMore||nativePending||native?.hasMore===true||native?.loading===true);
+    return {token:inboxTraversal.token,progressToken:inboxTraversal.progressToken,stalledAttempts:inboxTraversal.stalledAttempts,atStart:Math.abs(scroller.scrollTop-scrollBoundary(scroller,true))<=3&&(!nativeRequired||native?.startVerified===true),scrollTop:Math.round(scroller.scrollTop),scrollHeight:scroller.scrollHeight,clientHeight:scroller.clientHeight,hasMore,status:limited?'limited':nativePending?'metadata_pending':loading?'loading':hasMore?'ready':'end_visible',renderedRows:rows.length,complete:Boolean(native?.endVerified&&!physicalMore&&!hasMore&&!limited),...(nativeRequired?{nativePending,loading,retryAfterMs:loading?1000:0,nativeHasMore:native?.hasMore??null,loadedRows:native?.loadedCount??null}:{} )};
   }
   function inboxSnapshotRows() {
     const items=select(document,ITEM);
@@ -527,10 +576,19 @@
     if(Object.values(current.busy).some(Boolean))return {ok:false,busy:true,detail:'Список не прокручивается во время работы пользователя или при открытом черновике.'};
     const coverage=current.listCoverage,scroller=inboxTraversal.scroller,start=request.direction==='start';
     if(request.listToken!==coverage.token||!scroller||inboxScroller()!==scroller||(!start&&!coverage.hasMore))return {ok:false,detail:'Список диалогов изменился либо доступная часть уже просмотрена.'};
+    if(!start&&coverage.loading)return {ok:false,status:'loading',retryAfterMs:1000,detail:'Ожидаю загрузку и подтверждение текущего окна списка площадки.'};
     const before=inboxTraversal.progressSignature;
     inboxTraversal.token='';inboxTraversal.signature='';
-    if(start){scroller.scrollTop=0;inboxTraversal.steps=0;inboxTraversal.stalledAttempts=0;}
-    else {scroller.scrollTop=Math.min(scroller.scrollHeight-scroller.clientHeight,scroller.scrollTop+Math.max(1,Math.floor(scroller.clientHeight*0.8)));inboxTraversal.steps++;}
+    if(start){scroller.scrollTop=scrollBoundary(scroller,true);inboxTraversal.steps=0;inboxTraversal.stalledAttempts=0;}
+    else {
+      const target=Math.min(scroller.scrollHeight-scroller.clientHeight,scroller.scrollTop+Math.max(1,Math.floor(scroller.clientHeight*0.8)));
+      // 1688's native virtual widget ignores an unchanged scroll offset.
+      // A bounded one-pixel retry notifies that same widget when a server page
+      // is still available at the spacer's end; it does not select a chat.
+      const retryAtEnd=platform()==='1688'&&coverage.nativeHasMore===true&&target===scroller.scrollTop&&target>0;
+      if(retryAtEnd){scroller.scrollTop=target-1;scroller.dispatchEvent(new Event('scroll'));}
+      scroller.scrollTop=target;if(retryAtEnd)scroller.dispatchEvent(new Event('scroll'));inboxTraversal.steps++;
+    }
     listCoverage();
     const advanced=inboxTraversal.progressSignature!==before;
     if(!start&&!advanced)inboxTraversal.stalledAttempts++;
@@ -656,7 +714,7 @@
     try {
       if(select(document,'#nc_1_wrapper,.nc-container,.geetest_panel,[id*="captcha" i],[class*="captcha" i],iframe[src*="captcha" i],iframe[src*="recaptcha" i],iframe[src*="hcaptcha" i],iframe[src*="_____tmd_____/punish"],#baxia-dialog-content').length){result.status='captcha';result.detail='Видна проверка CAPTCHA; мониторинг ничего не нажимает.';return result;}
       if(select(document,'input[type="password"],[data-login-required="true"],.login-panel').length||/\/(?:login|signin)(?:[/.?]|$)/i.test(location.pathname+location.hash)){
-        if(!loginObserved){micEpoch=crypto.randomUUID();rowTokens=new WeakMap();usedTokens.clear();historyLoads.clear();firstBuyerProofs.clear();latestMessageTimes.clear();historyBoundaryProofs.clear();historyModelTimes.clear();historyModelRequest=null;historyModelAttempt={fingerprint:'',at:0};active1688Evidence=null;activeAlibabaEvidence=null;activeMicEvidence=null;pendingReveal=null;modelRequest=null;modelAttempt='';modelAccepted={threadId:'',rows:new Map()};}loginObserved=true;
+        if(!loginObserved){micEpoch=crypto.randomUUID();rowTokens=new WeakMap();usedTokens.clear();historyLoads.clear();firstBuyerProofs.clear();latestMessageTimes.clear();historyBoundaryProofs.clear();historyModelTimes.clear();historyModelRequest=null;historyModelAttempt={fingerprint:'',at:0};inboxModelRequest=null;inboxModelAccepted=null;inboxModelAttempt={fingerprint:'',at:0,count:0};active1688Evidence=null;activeAlibabaEvidence=null;activeMicEvidence=null;pendingReveal=null;modelRequest=null;modelAttempt='';modelAccepted={threadId:'',rows:new Map()};}loginObserved=true;
         result.status='login';result.detail='Нужен вход в аккаунт этой площадки.';return result;
       }
       loginObserved=false;
@@ -666,15 +724,18 @@
       const conversations=leafHistories.map(history=>readHistory(history,leafHistories.length)).filter(Boolean).map(workflowEvidence);
       const byId=new Map();
       for(const entry of conversations){if(byId.has(entry.id)){const other=byId.get(entry.id);other.orderReliable=false;other.tailKnown=false;other.readComplete=false;other.historyTailKnown=false;other.historyOrderReliable=false;other.historyStartKnown=false;other.historyComplete=false;other.firstBuyerMessage=null;other.firstBuyerMessageReliable=false;other.latestMessageAtReliable=false;firstBuyerProofs.delete(entry.id);other.detail='Найдено несколько историй одного диалога; нужно уточнить структуру страницы.';}else byId.set(entry.id,entry);}
-      const rowWindow=inboxSnapshotRows();
+      const rowWindow=inboxSnapshotRows(),nativeInbox=acceptedInboxModel(inboxModelContext()),nativeOrder=new Map(select(document,INBOX).map((item,index)=>[item,nativeInbox?.ranks.get(item.id)??index]));
       for(const item of rowWindow.rows){
         const id=identity(item);if(!id)continue;
         const previewNode=select(item,'[data-message-preview],.message-preview,.conversation-preview,.last-message'+(platform()==='1688'&&item.matches(INBOX_1688)?',.conversation-secondary-line > .desc':platform()==='alibaba'&&item.matches(INBOX_ALIBABA)?',.msg-wrapper .latest-msg > div':platform()==='mic'&&item.matches(INBOX_MIC)?',.rg-last-msg .last-msg':''))[0];const preview=textOf(previewNode,LIMIT.text,true);
-        const existing=byId.get(id);if(existing){if(unread(item)!==null)existing.unread=unread(item);if(!existing.title)existing.title=title(item);if(preview)existing.preview=preview;mergeRowTime(existing,item,preview);continue;}
-        const cached=latestMessageTimes.get(id),entry={id,identityReliable:provenAccount(item),title:title(item),url:safeUrl(item.matches('a[href]')?item.href:select(item,'a[href]')[0]?.href||location.href),unread:unread(item),active:item.matches(INBOX)&&rowActive(item),orderReliable:false,tailKnown:false,historyStartKnown:false,historyComplete:false,firstBuyerMessage:null,firstBuyerMessageReliable:false,latestMessageAt:cached?.at??null,latestMessageAtReliable:Boolean(cached),latestMessageAtSource:cached?'remembered-native-message':'',preview,needsRead:true,messages:[],...selectable(item,id)};
+        const listOrder=nativeOrder.get(item)??null;
+        const existing=byId.get(id);if(existing){existing.listOrder=listOrder;if(unread(item)!==null)existing.unread=unread(item);if(!existing.title)existing.title=title(item);if(preview)existing.preview=preview;mergeRowTime(existing,item,preview);continue;}
+        const cached=latestMessageTimes.get(id),entry={id,listOrder,identityReliable:provenAccount(item),title:title(item),url:safeUrl(item.matches('a[href]')?item.href:select(item,'a[href]')[0]?.href||location.href),unread:unread(item),active:item.matches(INBOX)&&rowActive(item),orderReliable:false,tailKnown:false,historyStartKnown:false,historyComplete:false,firstBuyerMessage:null,firstBuyerMessageReliable:false,latestMessageAt:cached?.at??null,latestMessageAtReliable:Boolean(cached),latestMessageAtSource:cached?'remembered-native-message':'',preview,needsRead:true,messages:[],...selectable(item,id)};
         mergeRowTime(entry,item,preview);byId.set(id,entry);
       }
-      result.conversations=[...byId.values()].slice(0,LIMIT.conversations);result.listCoverage=listCoverage();
+      // Preserve the bounded active history, but do not promote it ahead of
+      // earlier sidebar rows merely because its messages were parsed first.
+      result.conversations=[...byId.values()].slice(0,LIMIT.conversations).sort((left,right)=>(Number.isInteger(left.listOrder)?left.listOrder:Infinity)-(Number.isInteger(right.listOrder)?right.listOrder:Infinity));result.listCoverage=listCoverage();
       if(rowWindow.limited)Object.assign(result.listCoverage,{status:'limited',hasMore:false,windowLimited:true,detail:'В длинном списке не подтверждено текущее окно диалогов. Проверка всего списка не завершена.'});
       const nextReplyEvidence=new Map();
       for(const row of result.conversations.filter(item=>item.active)){
@@ -686,7 +747,7 @@
       if(result.conversations.length){result.status='ready';result.detail=result.conversations.some(item=>item.active)?'Прочитаны доступные сообщения. Предпросмотры других диалогов требуют открытия пользователем.':'Доступен только список диалогов. Откройте нужную переписку, чтобы прочитать сообщения.';}
       else if(select(document,PENDING+(platform()==='mic'?',.conversation-lst .ant-skeleton-active':'')).length){result.status='loading';result.detail='История чата ещё загружается.';}
       else if(result.frames.some(frame=>frame.visible)){result.detail='Чат может находиться во вложенном фрейме; требуется отдельное чтение фрейма.';}
-      requestModelEvidence(result);requestHistoryEvidence(result);return result;
+      requestModelEvidence(result);requestHistoryEvidence(result);requestInboxEvidence(result);return result;
     } catch {return {...result,status:'error',detail:'Не удалось прочитать структуру чата. Отправка и ввод не выполнялись.',conversations:[]};}
   }
   function guardReply(expected) {
@@ -747,10 +808,10 @@
     return {ok:true,revealedId:request.conversationId};
   }
   for(const type of ['keydown','pointerdown','input','wheel','touchstart'])document.addEventListener(type,event=>{if(event.isTrusted){lastTrustedInput=Date.now();pendingReveal=null;}},{capture:true,passive:true});
-  globalThis.OpenLinksDialogsReader=Object.freeze({snapshot,openConversation,revealLatest,loadHistoryStart,advanceList,applyModelEvidence,applyHistoryEvidence,guardReply,guardPreviewCleanup});
+  globalThis.OpenLinksDialogsReader=Object.freeze({snapshot,openConversation,revealLatest,loadHistoryStart,advanceList,applyModelEvidence,applyHistoryEvidence,applyInboxEvidence,guardReply,guardPreviewCleanup});
   globalThis.chrome?.runtime?.onMessage?.addListener((message,sender,respond)=>{
-    if(!['DIALOGS_SNAPSHOT','DIALOGS_OPEN_CONVERSATION','DIALOGS_REVEAL_LATEST','DIALOGS_LOAD_HISTORY_START','DIALOGS_ADVANCE_LIST','DIALOGS_APPLY_HISTORY_EVIDENCE','DIALOGS_APPLY_MODEL_EVIDENCE'].includes(message?.type))return;
+    if(!['DIALOGS_SNAPSHOT','DIALOGS_OPEN_CONVERSATION','DIALOGS_REVEAL_LATEST','DIALOGS_LOAD_HISTORY_START','DIALOGS_ADVANCE_LIST','DIALOGS_APPLY_INBOX_EVIDENCE','DIALOGS_APPLY_HISTORY_EVIDENCE','DIALOGS_APPLY_MODEL_EVIDENCE'].includes(message?.type))return;
     if(sender?.id!==chrome.runtime.id){respond({status:'error',detail:'Источник запроса не подтверждён.'});return;}
-    respond(message.type==='DIALOGS_SNAPSHOT'?snapshot():message.type==='DIALOGS_OPEN_CONVERSATION'?openConversation(message):message.type==='DIALOGS_LOAD_HISTORY_START'?loadHistoryStart(message):message.type==='DIALOGS_ADVANCE_LIST'?advanceList(message):message.type==='DIALOGS_APPLY_HISTORY_EVIDENCE'?applyHistoryEvidence(message):message.type==='DIALOGS_APPLY_MODEL_EVIDENCE'?applyModelEvidence(message):revealLatest(message));
+    respond(message.type==='DIALOGS_SNAPSHOT'?snapshot():message.type==='DIALOGS_OPEN_CONVERSATION'?openConversation(message):message.type==='DIALOGS_LOAD_HISTORY_START'?loadHistoryStart(message):message.type==='DIALOGS_ADVANCE_LIST'?advanceList(message):message.type==='DIALOGS_APPLY_INBOX_EVIDENCE'?applyInboxEvidence(message):message.type==='DIALOGS_APPLY_HISTORY_EVIDENCE'?applyHistoryEvidence(message):message.type==='DIALOGS_APPLY_MODEL_EVIDENCE'?applyModelEvidence(message):revealLatest(message));
   });
 })();

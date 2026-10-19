@@ -46,9 +46,9 @@ const timeout = async (promise, ms = 7000) => {
   finally { clearTimeout(timer); }
 };
 
-export function createDialogMonitor({api=globalThis.chrome, fetchImpl=globalThis.fetch, now=()=>Date.now(),imageLoader=loadProductImage,attachmentResolver=resolveChatAttachments,folderBridge,folderSender=sendDialogReply,testCleaner=clearDialogTestDraft,testRecovery=recoverDialogTestDraftEmpty,pauseOutreachForTest,reserveDialogSendQuota,getWorkCoordination,withDialogTurn,startOutreachForJoint,pauseOutreachForJoint,disableJointWork,micInitializationWait=()=>new Promise(resolve=>setTimeout(resolve,2500))}={}) {
+export function createDialogMonitor({api=globalThis.chrome, fetchImpl=globalThis.fetch, now=()=>Date.now(),imageLoader=loadProductImage,attachmentResolver=resolveChatAttachments,folderBridge,folderSender=sendDialogReply,testCleaner=clearDialogTestDraft,testRecovery=recoverDialogTestDraftEmpty,pauseOutreachForTest,reserveDialogSendQuota,getWorkCoordination,withDialogTurn,startOutreachForJoint,pauseOutreachForJoint,disableJointWork,micInitializationWait=()=>new Promise(resolve=>setTimeout(resolve,2500)),workflowBatchSize=12,workflowAutoKick=true,workflowStepWait=ms=>new Promise(resolve=>setTimeout(resolve,ms))}={}) {
   let serial = Promise.resolve();
-  let providerTask=null, cancelEpoch=0, pauseRequested=false;
+  let providerTask=null, cancelEpoch=0, pauseRequested=false,workflowDrain=null,workflowTimer=null,workflowKickPending=false;
   const keyEpochs=new Map();
   const epoch=key=>`${cancelEpoch}:${keyEpochs.get(key) || 0}`;
   const pending = new Map();
@@ -83,7 +83,7 @@ export function createDialogMonitor({api=globalThis.chrome, fetchImpl=globalThis
     const raw=(await api.storage.local.get(DIALOGS_KEY))[DIALOGS_KEY];let state=normalizeDialogs(raw,now());
     const release=String(api.runtime.getManifest?.()?.version || '').split('.').map(Number);
     if((release[0]>0||release[1]>=20)&&state.settings.workflowMigrationVersion!==1){state.settings.workflow24h=true;state.settings.showWorkingTab=true;state.settings.workflowMigrationVersion=1;state=normalizeDialogs(state,now());await api.storage.local.set({[DIALOGS_KEY]:state});}
-    if(state.settings.workflow24h&&state.workflow.orderVersion!==1){state.workflow.orderVersion=1;state.workflow.cursor=0;state.workflow.sweepId=1;state.workflow.platformSince=now();await api.storage.local.set({[DIALOGS_KEY]:state});}
+    if(state.settings.workflow24h&&state.workflow.orderVersion!==2){const upgrading=state.workflow.orderVersion>0;state.workflow.orderVersion=2;state.workflow.cursor=0;state.workflow.sweepId=upgrading?state.workflow.sweepId+1:1;state.workflow.platformSince=now();state.workflow.list={};state.workflow.history={};for(const name of PLATFORMS){state.traversal[name].pending=null;state.traversal[name].backoff={};}await api.storage.local.set({[DIALOGS_KEY]:state});}
     if(!apiAutoAvailable()&&state.settings.autoDraft) {state.settings.autoDraft=false;await api.storage.local.set({[DIALOGS_KEY]:state});}
     return state;
   };
@@ -107,6 +107,7 @@ export function createDialogMonitor({api=globalThis.chrome, fetchImpl=globalThis
     return {ok:true,workflowActivity:current?{...current,action:current.phase,conversationKey:current.key}:null,workflowActivityHistory:state.events.filter(event=>event.type.startsWith('workflow_')).slice(-100).reverse(),state,folder:publicFolder(await loadFolder()),joint:await coordination(),productFingerprint:productFingerprint(state),ai:{provider:config.provider,model:config.model,keyStored:!!config.apiKey,providers:profiles,busy:!!providerTask}};
   };
   const cancel = key => {
+    if(workflowTimer!==null){clearTimeout(workflowTimer);workflowTimer=null;}workflowKickPending=false;
     if(key)keyEpochs.set(key,(keyEpochs.get(key) || 0)+1);else {cancelEpoch++;keyEpochs.clear();}
     for (const [id,task] of pending) if (!key || id===key) { task.controller.abort();pending.delete(id); }
   };
@@ -541,6 +542,24 @@ export function createDialogMonitor({api=globalThis.chrome, fetchImpl=globalThis
         else valid[index]={...source,status:'loading',conversations:[]};
       } catch { /* Missing/ambiguous evidence never grants a first-message proof. */ }
     }
+    // 1688 virtualizes its sidebar; the visible scroll bottom alone cannot
+    // prove the server-side inbox is exhausted. The reader binds native list
+    // metadata to its own one-use token, exact rows, geometry and document.
+    if(state.settings.workflow24h&&name==='1688'&&api.scripting?.executeScript)for(let index=0;index<valid.length;index++){
+      const source=valid[index];
+      if(source.status!=='ready'||typeof source.inboxEvidenceToken!=='string'||!source.inboxEvidenceToken||source.inboxEvidenceToken.length>200||!source.documentToken)continue;
+      try {
+        const results=await timeout(api.scripting.executeScript({target:{tabId:tab.id,frameIds:[source.frameId]},world:'MAIN',files:['inbox-model-evidence.js']}));
+        if(results?.length!==1||results[0].frameId!==source.frameId)continue;
+        const evidence=results[0].result;
+        if(evidence?.platform!==name||evidence.url!==source.sourceUrl||!['ready','unsupported'].includes(evidence.status))continue;
+        const applied=await timeout(api.tabs.sendMessage(tab.id,{type:'DIALOGS_APPLY_INBOX_EVIDENCE',expectedDocumentToken:source.documentToken,evidenceToken:source.inboxEvidenceToken,evidence},{frameId:source.frameId}));
+        if(applied?.ok!==true&&evidence.status!=='unsupported')continue;
+        const refreshed=await timeout(api.tabs.sendMessage(tab.id,{type:'DIALOGS_SNAPSHOT'},{frameId:source.frameId}));
+        if(refreshed?.platform===name&&refreshed.url===source.sourceUrl&&refreshed.documentToken===source.documentToken&&['ready','loading','login','captcha','unsupported','error'].includes(refreshed.status)&&Array.isArray(refreshed.conversations))valid[index]={...refreshed,frameId:source.frameId,sourceUrl:source.sourceUrl};
+        else valid[index]={...source,status:'loading',conversations:[]};
+      }catch { /* Native inbox metadata never grants authority if binding fails. */ }
+    }
     try {
       const latest=await api.tabs.get(tab.id);
       if(unavailableTab(state,name,latest))return [];
@@ -706,7 +725,8 @@ export function createDialogMonitor({api=globalThis.chrome, fetchImpl=globalThis
     if(cancelEpoch!==checkEpoch||!state.running)return;
     try {await timeout(api.tabs.sendMessage(state.bindings[name].tabId,{type:'DIALOGS_REVEAL_LATEST',conversationId:row.id,documentToken:row.documentToken},{frameId:row.frameId}));}catch { /* The next safe selection can continue; no text is entered. */ }
   }
-  // One bounded action per alarm across all marketplaces. Observations remain
+  // One bounded action per step across all marketplaces. The scheduler drains
+  // ready steps promptly and keeps a durable alarm for worker suspension. Observations remain
   // read-only; row selection/history loading use the reader's identity tokens.
   async function scanWorkflow(state,selected,{autoConfig=null,folderConfig=null}={}) {
     const result=Object.assign([],{folderKeys:[]}),cycleEpoch=cancelEpoch;
@@ -722,10 +742,10 @@ export function createDialogMonitor({api=globalThis.chrome, fetchImpl=globalThis
       const observed=await scanPlatform(state,name);result.push(...observed);
       if(cancelEpoch!==cycleEpoch)break;
       if(acted)continue;
-      const binding=state.bindings[name],rows=observed.rows || [],sources=observed.sources || [],traversal=state.traversal[name];
+      const binding=state.bindings[name],rows=[...(observed.rows || [])].sort((a,b)=>(Number.isInteger(a.listOrder)?a.listOrder:Infinity)-(Number.isInteger(b.listOrder)?b.listOrder:Infinity)),sources=observed.sources || [],traversal=state.traversal[name];
       state.workflow.list ||= {};
       const priorPage=state.workflow.list[name];
-      if(!priorPage||priorPage.sweepId!==state.workflow.sweepId)state.workflow.list[name]={sweepId:state.workflow.sweepId,attempts:0,startedAt:now(),nextAt:0,atEnd:false,needsStart:!!priorPage?.hasPagination,hasPagination:false,failed:false,jobsChecked:false,progressToken:'',stalls:0};
+      if(!priorPage||priorPage.sweepId!==state.workflow.sweepId)state.workflow.list[name]={sweepId:state.workflow.sweepId,attempts:0,startedAt:now(),nextAt:0,atEnd:false,needsStart:!!priorPage?.hasPagination,hasPagination:false,failed:false,jobsChecked:false,progressToken:'',stalls:0,positioned:false};
       const page=state.workflow.list[name];
       if(sources.some(source=>source.listCoverage?.token))page.hasPagination=true;
       const busy=sources.some(source=>source.busy===true||source.busy&&typeof source.busy==='object'&&Object.values(source.busy).some(value=>value===true));
@@ -736,6 +756,31 @@ export function createDialogMonitor({api=globalThis.chrome, fetchImpl=globalThis
         }
         advanceWorkflowPlatform(state,name,{single});continue;
       }
+      const nativeWaiting=sources.find(source=>source.listCoverage?.nativePending===true||source.listCoverage?.loading===true);
+      if(nativeWaiting){
+        result.blockFolder=true;await activateWorkingTab(state,name,cycleEpoch);
+        page.metadataSince ||= now();
+        if(nativeWaiting.listCoverage.status==='limited'||now()-page.metadataSince>=READ_TIMEOUT_MS){page.failed=true;page.atEnd=false;activity(state,'list_limited','Не удалось подтвердить загрузку полного списка чатов. Площадка пропущена до следующего круга.',{platform:name});advanceWorkflowPlatform(state,name,{single});continue;}
+        activity(state,'waiting_list','Ожидаю подтверждённый список и порядок чатов площадки.',{platform:name});result.nextDelay=Math.max(750,Math.min(5000,nativeWaiting.listCoverage.retryAfterMs || 1000));held=true;break;
+      }
+      page.metadataSince=0;
+      const listSource=sources.find(source=>source.listCoverage?.token),listCoverage=listSource?.listCoverage;
+      if(page.nextAt>now()){result.blockFolder=true;activity(state,'waiting_list','Ожидаю обновления списка чатов после прокрутки.',{platform:name});result.nextDelay=page.nextAt-now();held=true;break;}
+      if(!page.positioned){
+        if(listCoverage?.atStart===true){page.positioned=true;page.needsStart=false;}
+        else if(listCoverage?.token&&(listCoverage.atStart===false||page.needsStart)){
+          result.blockFolder=true;
+          if((page.startAttempts || 0)>=3){page.failed=true;activity(state,'list_limited','Начало списка чатов не подтверждено после повторных проверок. Площадка пропущена до следующего круга.',{platform:name});advanceWorkflowPlatform(state,name,{single});continue;}
+          page.startAttempts=(page.startAttempts || 0)+1;
+          await activateWorkingTab(state,name,cycleEpoch);activity(state,'reading_list','Возвращаю список чатов в начало перед обходом сверху вниз.',{platform:name});await save(state);
+          if(cancelEpoch!==cycleEpoch)break;
+          try {const reply=await timeout(api.tabs.sendMessage(binding.tabId,{type:'DIALOGS_ADVANCE_LIST',documentToken:listSource.documentToken,listToken:listCoverage.token,direction:'start'},{frameId:listSource.frameId}));
+            if(reply?.ok===true){page.positioned=listCoverage.atStart===undefined;page.needsStart=false;page.nextAt=now()+Math.max(1000,Math.min(5000,reply.retryAfterMs || 0));}
+            else {page.failed=true;activity(state,'list_limited','Не удалось подтвердить начало списка. Площадка пропущена; повторю в следующем круге.',{platform:name});advanceWorkflowPlatform(state,name,{single});continue;}
+          }catch{page.failed=true;activity(state,'list_limited','Не удалось перейти к началу списка чатов; повторю в следующем круге.',{platform:name});advanceWorkflowPlatform(state,name,{single});continue;}
+          acted=true;break;
+        }else page.positioned=true;
+      }
       const keyOf=row=>{try{return conversationKey(name,row.id);}catch{return '';}};
       const rowItem=row=>{
         const key=keyOf(row),cached=state.conversations[key];
@@ -744,16 +789,28 @@ export function createDialogMonitor({api=globalThis.chrome, fetchImpl=globalThis
         else if(cached?.preview!==metadata.preview)Object.assign(metadata,{latestMessageAt:null,latestMessageAtReliable:false});
         return metadata;
       };
+      const eligibleRow=row=>{
+        const key=keyOf(row),item=rowItem(row);
+        if(!key||!row.identityReliable||row.selectionBusy||item.paused||item.takeover||traversal.backoff[key]>now())return false;
+        if(!row.active&&(!row.canSelect||!row.selectionToken||!row.documentToken))return false;
+        const assessment=workflowAssessment(state,item,now());
+        if(['completed','expired','future_date'].includes(assessment.status)){if(state.workflow.visits[key]?.status!==assessment.status)workflowVisit(state,key,assessment.status,assessment.detail,{item});return false;}
+        const visit=state.workflow.visits[key],readyJob=folderConfig?.jobs.some(job=>job.key===key&&(job.status==='done'||job.status==='awaiting_limit'&&now()>=(job.retryAt || 0)||!rows.some(row=>row.active)&&folderPending(job)));
+        return readyJob||!visit||visit.preview!==String(item.preview || '')||visit.sweepId!==state.workflow.sweepId||row.active&&visit.fingerprint!==item.fingerprint;
+      };
       let active=rows.find(row=>row.active&&row.identityReliable);
       if(traversal.pending) {
         const read=traversal.pending,source=sources.find(row=>row.frameId===read.frameId);
         if(source&&source.documentToken!==read.documentToken){finishRead(state,name,'Страница изменилась при открытии чата. Перехожу к другим.',{failed:true});acted=true;}
-        else if(active?.id===read.id&&active.frameId===read.frameId&&active.documentToken===read.documentToken){traversal.pending=null;}
+        else if(active?.id===read.id&&active.frameId===read.frameId&&active.documentToken===read.documentToken&&active.historyStable!==false){traversal.pending=null;}
         else if(now()-read.startedAt>=READ_TIMEOUT_MS){finishRead(state,name,'Чат не открылся за 120 секунд. Повторная проверка через 5 минут.',{failed:true});acted=true;}
         else {activity(state,'opening','Ожидаю загрузки выбранного чата на текущей площадке.',{platform:name,key:conversationKey(name,read.id)});held=true;break;}
       }
       if(acted)break;
-      if(active) {
+      const activeLocked=active&&(state.workflow.history[keyOf(active)]||folderConfig?.jobs.some(job=>job.key===keyOf(active)&&folderPending(job)));
+      const earlierRow=active&&!activeLocked&&rows.slice(0,rows.indexOf(active)).find(eligibleRow);
+      if(active&&!earlierRow) {
+        if(active.historyStable===false&&!state.conversations[keyOf(active)]?.paused&&!state.conversations[keyOf(active)]?.takeover&&!(traversal.backoff[keyOf(active)]>now())){traversal.pending ||= {id:active.id,startedAt:now(),documentToken:active.documentToken,frameId:active.frameId,sourceUrl:active.sourceUrl || binding.url,preview:String(active.preview || '').slice(0,1000)};activity(state,'opening','Ожидаю стабилизации истории выбранного чата.',{platform:name,key:keyOf(active)});result.nextDelay=1100;held=true;break;}
         const key=keyOf(active),item=state.conversations[key],visit=state.workflow.visits[key];
         if(item&&!item.paused&&!item.takeover&&!(traversal.backoff[key]>now())) {
           const assessment=workflowAssessment(state,item,now()),history=state.workflow.history[key];
@@ -761,18 +818,20 @@ export function createDialogMonitor({api=globalThis.chrome, fetchImpl=globalThis
           if(historyNeeded&&(!!history||item.latestMessageAtReliable&&now()-item.latestMessageAt<=86400000)) {
             const operation=history || {phase:'start',attempts:0,startedAt:now(),documentToken:active.documentToken,frameId:active.frameId};
             state.workflow.history[key]=operation;
+            if(operation.nextAt>now()){activity(state,'history_retry','Ожидаю загрузки истории; повторный запрос пока не нужен.',{platform:name,key});result.nextDelay=operation.nextAt-now();held=true;break;}
             const sourceValid=operation.documentToken===active.documentToken&&operation.frameId===active.frameId;
             if(!sourceValid||operation.attempts>=8||now()-operation.startedAt>=READ_TIMEOUT_MS) {
               if(sourceValid)await restoreWorkflowTail(state,name,active,cycleEpoch);
               traversal.backoff[key]=now()+READ_BACKOFF_MS;delete state.workflow.history[key];workflowVisit(state,key,'history_unavailable','Не удалось подтвердить первое ваше сообщение за ограниченное число проверок. Чат пропущен; повтор через 5 минут.',{result:true});
             } else {
               if(item.firstBuyerMessageReliable)operation.phase='latest';
-              const type=operation.phase==='latest'?'DIALOGS_REVEAL_LATEST':'DIALOGS_LOAD_HISTORY_START';operation.attempts++;
+              const type=operation.phase==='latest'?'DIALOGS_REVEAL_LATEST':'DIALOGS_LOAD_HISTORY_START';operation.attempts++;operation.nextAt=now()+1100;
               await activateWorkingTab(state,name,cycleEpoch);
               activity(state,operation.phase==='latest'?'reading_latest':'reading_first',operation.phase==='latest'?'Возвращаюсь к последним сообщениям после чтения первого обращения.':'Загружаю начало переписки, чтобы определить товар по первому вашему сообщению.',{platform:name,key});await save(state);
               if(cancelEpoch!==cycleEpoch)break;
               try {
                 const reply=await timeout(api.tabs.sendMessage(binding.tabId,{type,conversationId:active.id,documentToken:active.documentToken},{frameId:active.frameId}));
+                if(['loading','busy'].includes(reply?.status)){operation.attempts=Math.max(0,operation.attempts-1);operation.nextAt=now()+Math.max(1100,Math.min(5000,reply.retryAfterMs || 0));}
                 if(reply?.ok===false&&!['loading','busy'].includes(reply.status)||['unsupported','limited'].includes(reply?.status)) {await restoreWorkflowTail(state,name,active,cycleEpoch);traversal.backoff[key]=now()+READ_BACKOFF_MS;delete state.workflow.history[key];workflowVisit(state,key,'history_unavailable','Площадка не разрешила безопасно прочитать начало истории. Чат пропущен; повтор через 5 минут.',{result:true});}
                 else if(operation.phase==='latest'&&reply?.ok===true)delete state.workflow.history[key];
               } catch {activity(state,'history_retry','Ответ страницы потерян. Проверю историю на следующем обходе; отправка не выполнялась.',{platform:name,key});}
@@ -803,22 +862,7 @@ export function createDialogMonitor({api=globalThis.chrome, fetchImpl=globalThis
       if(!acted) {
         const waitingJob=folderConfig?.jobs.find(job=>job.kind==='dialog'&&job.key.startsWith(name+':')&&folderPending(job)&&(job.status==='awaiting_limit'?now()>=(job.retryAt || 0)&&now()-state.workflow.platformSince<600000:now()-job.createdAt<600000||job.status==='done'&&now()-state.workflow.platformSince<600000)&&active&&job.key===keyOf(active));
         if(waitingJob){activity(state,'waiting_claude','Ожидаю ответ Claude на текущей площадке. Задание сохранено; повторный запрос не создаётся.',{platform:name,key:waitingJob.key});held=true;break;}
-        const candidates=rows.filter(row=>{
-          const key=keyOf(row),item=rowItem(row);
-          if(!key||row.active||!row.canSelect||!row.identityReliable||row.selectionBusy||item.paused||item.takeover||traversal.backoff[key]>now())return false;
-          if(!row.selectionToken||!row.documentToken)return false;
-          const assessment=workflowAssessment(state,item,now());
-          if(['completed','expired','future_date'].includes(assessment.status)) {if(state.workflow.visits[key]?.status!==assessment.status)workflowVisit(state,key,assessment.status,assessment.detail,{item});return false;}
-          // Unknown row dates may become known only after opening its real tail.
-          // The core reply guard still refuses any response without a date.
-          const visit=state.workflow.visits[key],preview=String(item.preview || '');
-          const readyJob=folderConfig?.jobs.some(job=>job.key===key&&(job.status==='done'||job.status==='awaiting_limit'&&now()>=(job.retryAt || 0)||!active&&folderPending(job)));
-          const anotherSweep=visit&&visit.sweepId!==state.workflow.sweepId;
-          return readyJob||!visit||visit.preview!==preview||anotherSweep;
-        }).sort((a,b)=>{
-          const first=state.workflow.visits[keyOf(a)]?.at || 0,last=state.workflow.visits[keyOf(b)]?.at || 0;
-          return first-last;
-        });
+        const candidates=rows.filter(row=>!row.active&&eligibleRow(row));
         const target=candidates[0];
         if(target){
           const key=keyOf(target);
@@ -837,6 +881,7 @@ export function createDialogMonitor({api=globalThis.chrome, fetchImpl=globalThis
         } else {
           const source=sources.find(source=>source.listCoverage?.status==='limited'||source.listCoverage?.windowLimited)||sources.find(source=>source.listCoverage?.token),coverage=source?.listCoverage;
           const limited=coverage?.status==='limited'||coverage?.windowLimited===true;
+          if(coverage?.loading===true){activity(state,'waiting_list','Площадка загружает следующую часть списка чатов.',{platform:name});result.nextDelay=Math.max(500,Math.min(5000,coverage.retryAfterMs || 1000));held=true;break;}
           if(limited&&(!page.needsStart||coverage.windowLimited||!coverage.token)){
             page.failed=true;page.atEnd=false;
             activity(state,'list_limited','Не удалось завершить чтение списка чатов этой площадки. Перехожу дальше и повторю чтение в следующем круге.',{platform:name});
@@ -844,12 +889,12 @@ export function createDialogMonitor({api=globalThis.chrome, fetchImpl=globalThis
             if(!page.needsStart&&!coverage.hasMore)page.atEnd=true;
             else if(page.stalls>=8){page.failed=true;activity(state,'list_limited','Список чатов не продвигается после повторных проверок. Вернусь к площадке в следующем круге.',{platform:name});}
             else {
-              const restart=page.needsStart;page.needsStart=false;page.attempts++;
+              const restart=page.needsStart;page.needsStart=false;page.attempts++;page.nextAt=now()+2000;
               const progress=coverage.progressToken || JSON.stringify(rows.map(row=>row.id));page.stalls=page.progressToken===progress?page.stalls+1:0;page.progressToken=progress;
               await activateWorkingTab(state,name,cycleEpoch);
               activity(state,'reading_list',restart?'Возвращаюсь к началу списка для нового круга.':'Проверяю следующую часть списка чатов текущей площадки.',{platform:name});await save(state);
               if(cancelEpoch!==cycleEpoch)break;
-              try {const reply=await timeout(api.tabs.sendMessage(binding.tabId,{type:'DIALOGS_ADVANCE_LIST',documentToken:source.documentToken,listToken:coverage.token,...(restart?{direction:'start'}:{})},{frameId:source.frameId}));if(reply?.ok!==true)page.failed=true;}
+              try {const reply=await timeout(api.tabs.sendMessage(binding.tabId,{type:'DIALOGS_ADVANCE_LIST',documentToken:source.documentToken,listToken:coverage.token,...(restart?{direction:'start'}:{})},{frameId:source.frameId}));if(reply?.ok!==true&&!['loading','busy'].includes(reply?.status))page.failed=true;page.nextAt=now()+Math.max(1000,Math.min(5000,reply?.retryAfterMs || 2000));}
               catch{page.failed=true;}
               acted=true;
             }
@@ -865,6 +910,8 @@ export function createDialogMonitor({api=globalThis.chrome, fetchImpl=globalThis
       }
     }
     if(!acted&&!held&&cancelEpoch===cycleEpoch&&state.running)activity(state,'waiting','Круг проверки завершён. Незавершённые чаты и ограничения чтения проверю повторно; результаты сохранены в журнале.');
+    result.continueWorkflow=(acted||held)&&['opening','reading_first','reading_latest','history_retry','reading_list','waiting_list','failed','history_unavailable'].includes(state.workflow.activity?.phase);
+    result.nextDelay ||= ['reading_first','reading_latest','history_retry'].includes(state.workflow.activity?.phase)?1100:state.workflow.activity?.phase==='opening'&&state.bindings[state.workflow.activity.platform]?.status==='loading'?1000:250;
     await save(state);return result;
   }
 
@@ -1708,17 +1755,20 @@ export function createDialogMonitor({api=globalThis.chrome, fetchImpl=globalThis
         earlyPause=Promise.resolve().then(()=>pauseOutreachForJoint()).then(()=>null,error=>error);
       }
       // Enqueue immediately, preserving the order of subsequent user commands.
-      return await exclusive(async()=>{if(earlyPause){const error=await earlyPause;if(error)throw error;}return command(message,commandEpoch,sender);});
+      const result=await exclusive(async()=>{if(earlyPause){const error=await earlyPause;if(error)throw error;}return command(message,commandEpoch,sender);});
+      if(result?.ok&&['DIALOGS_START','DIALOGS_JOINT_START','DIALOGS_TEST_NEXT','DIALOGS_TEST_PLATFORM','DIALOGS_TEST_SKIP','DIALOGS_REVIEW_SKIP','DIALOGS_REVIEW_SEND'].includes(message.type))kickWorkflow();
+      return result;
     }
     catch(error) { return {ok:false,error:error instanceof Error && /^[А-ЯЁ]/.test(error.message)?error.message:'Не удалось выполнить команду диалогов. Проверьте выбранную вкладку и настройки.'}; }
   }
-  const onAlarm=async alarm=>{
+  const alarmStep=async alarm=>{
     if(alarm.name===LAUNCH_ALARM)return exclusive(async()=>{
       const state=await load();
       for(const name of PLATFORMS)if(state.bindings[name].managed?.pending)await checkManagedChat(state,name);
       await save(state);await syncLaunchAlarm(state);
     });
     if(alarm.name!==ALARM)return;
+    let continuation=null;
     const autoKey=await exclusive(async()=>{
       const cycleEpoch=cancelEpoch,state=await load(),folder=await loadFolder();if(!state.running){if(folder.enabled)await pollFolder(state,folder,{dialogs:!state.settings.workflow24h});return null;}
       if(state.settings.workflow24h&&folder.review?.phase!=='none'&&folder.review){activity(state,'awaiting_approval',folder.review.detail || 'Ответ введён в поле чата. Подтвердите отправку или пропустите продавца.',{key:folder.review.key,platform:state.conversations[folder.review.key]?.platform});await save(state);await pollFolder(state,folder,{dialogs:false});return null;}
@@ -1732,15 +1782,23 @@ export function createDialogMonitor({api=globalThis.chrome, fetchImpl=globalThis
         }
         const observed=folder.test.enabled&&folder.test.phase==='generating'?Object.assign([],{folderKeys:[]}):await scan(state,undefined,{traverse:true,autoConfig:config,folderConfig:folder.enabled?folder:null});
         if(cancelEpoch!==cycleEpoch)return null;
+        let jobsBefore=new Map();
         if(folder.enabled) {
           for(const key of observed.folderKeys) {
             if(cancelEpoch!==cycleEpoch||folder.test.enabled&&folder.test.phase!=='ready')break;
             try {await enqueueFolder(state,folder,{key,automatic:true,observed});}
-            catch {workflowVisit(state,key,'failed','Не удалось подготовить задание папки. Проверьте вложения и локальный обработчик.',{result:true});log(state,'folder_failed','Не удалось подготовить задание папки. Проверьте вложения и локальный обработчик.',{key,level:'warning'});}
+            catch {if(state.settings.workflow24h)state.traversal[state.conversations[key]?.platform].backoff[key]=now()+READ_BACKOFF_MS;workflowVisit(state,key,'failed','Не удалось подготовить задание папки. Проверьте вложения и локальный обработчик.',{result:true});log(state,'folder_failed','Не удалось подготовить задание папки. Проверьте вложения и локальный обработчик.',{key,level:'warning'});}
           }
-          if(cancelEpoch===cycleEpoch)await pollFolder(state,folder);
+          jobsBefore=new Map(folder.jobs.filter(job=>job.kind==='dialog'&&folderPending(job)).map(job=>[job.id,job.status]));
+          if(cancelEpoch===cycleEpoch)await pollFolder(state,folder,{dialogs:observed.blockFolder!==true});
         }
         if(globalThis.indexedDB)await pruneChatAttachmentCache({api,state,now:now()}).catch(()=>{});
+        const holding=folder.review?.phase!=='none'||folder.test.enabled&&['paused','preparing','completed','blocked'].includes(folder.test.phase);
+        if(state.running&&state.settings.workflow24h&&!holding&&cancelEpoch===cycleEpoch){
+          if(folder.jobs.some(job=>jobsBefore.has(job.id)&&!folderPending(job)))continuation={delay:250};
+          else if(observed.continueWorkflow||observed.folderKeys.length&&state.workflow.activity?.phase==='failed')continuation={delay:observed.nextDelay || 250};
+          else if(folder.jobs.some(job=>job.kind==='dialog'&&folderPending(job)&&job.key.startsWith(workflowPlatform(state,folder)+':')&&now()-job.createdAt<600000))continuation={delay:2000,waiting:true};
+        }
         return observed.autoKey || null;
       });
       if(turn.status?.enabled&&state.events.filter(event=>event.type==='joint_phase').at(-1)?.detail!==turn.status.detail){log(state,'joint_phase',turn.status.detail);await save(state);}
@@ -1748,6 +1806,30 @@ export function createDialogMonitor({api=globalThis.chrome, fetchImpl=globalThis
       return turn.value;
     });
     if(autoKey)await generate(autoKey,{automatic:true});
+    return continuation;
+  };
+  function kickWorkflow(delay=0){
+    if(workflowBatchSize<=1||!workflowAutoKick||workflowTimer!==null)return;
+    if(workflowDrain&&delay===0){workflowKickPending=true;return;}
+    workflowTimer=setTimeout(()=>{workflowTimer=null;void onAlarm({name:ALARM}).catch(()=>{});},Math.max(0,delay));
+  }
+  const onAlarm=async alarm=>{
+    if(alarm.name!==ALARM)return alarmStep(alarm);
+    if(workflowTimer!==null){clearTimeout(workflowTimer);workflowTimer=null;}
+    if(workflowBatchSize<=1||(await api.storage.local.get(DIALOGS_KEY))[DIALOGS_KEY]?.settings?.workflow24h!==true)return alarmStep(alarm);
+    if(workflowDrain)return workflowDrain;
+    const cycleEpoch=cancelEpoch;
+    workflowDrain=(async()=>{
+      const started=Date.now();let next=null;
+      for(let count=0;count<Math.max(1,Math.min(24,workflowBatchSize));count++){
+        if(cancelEpoch!==cycleEpoch)break;
+        next=await alarmStep(alarm);
+        if(!next||cancelEpoch!==cycleEpoch||workflowBatchSize<=1)break;
+        if(next.waiting||Date.now()-started>=8000||count+1>=workflowBatchSize){kickWorkflow(next.delay);break;}
+        await workflowStepWait(Math.max(100,Math.min(5000,next.delay)));
+      }
+    })().finally(()=>{workflowDrain=null;if(workflowKickPending){workflowKickPending=false;kickWorkflow();}});
+    return workflowDrain;
   };
   const resetBindings=()=>exclusive(async()=>{
     if(typeof disableJointWork==='function')await disableJointWork();

@@ -635,9 +635,9 @@ function normalizeWorkflow(raw){
   for(const [key,rawHistory] of Object.entries(object(input.history)).slice(-DIALOG_LIMITS.conversations)){
     if(key.length>1600||!DIALOG_PLATFORMS.some(platform=>key.startsWith(platform+':')))continue;
     const history=object(rawHistory);if(!['start','latest'].includes(history.phase))continue;
-    result.history[key]={phase:history.phase,attempts:Math.min(integer(history.attempts)??0,1000),startedAt:time(history.startedAt),documentToken:clean(history.documentToken,200),frameId:integer(history.frameId)};
+    result.history[key]={phase:history.phase,nextAt:time(history.nextAt)??0,attempts:Math.min(integer(history.attempts)??0,1000),startedAt:time(history.startedAt),documentToken:clean(history.documentToken,200),frameId:integer(history.frameId)};
   }
-  for(const platform of DIALOG_PLATFORMS){const list=object(object(input.list)[platform]);if(Object.keys(list).length)result.list[platform]={sweepId:integer(list.sweepId)??0,needsStart:list.needsStart===true,hasPagination:list.hasPagination===true,failed:list.failed===true,jobsChecked:list.jobsChecked===true,progressToken:clean(list.progressToken,40000),stalls:Math.min(integer(list.stalls)??0,100),attempts:Math.min(integer(list.attempts)??0,1000),startedAt:time(list.startedAt),nextAt:time(list.nextAt),atEnd:list.atEnd===true};}
+  for(const platform of DIALOG_PLATFORMS){const list=object(object(input.list)[platform]);if(Object.keys(list).length)result.list[platform]={sweepId:integer(list.sweepId)??0,metadataSince:time(list.metadataSince)??0,positioned:list.positioned===true,startAttempts:Math.min(integer(list.startAttempts)??0,3),needsStart:list.needsStart===true,hasPagination:list.hasPagination===true,failed:list.failed===true,jobsChecked:list.jobsChecked===true,progressToken:clean(list.progressToken,40000),stalls:Math.min(integer(list.stalls)??0,100),attempts:Math.min(integer(list.attempts)??0,1000),startedAt:time(list.startedAt),nextAt:time(list.nextAt),atEnd:list.atEnd===true};}
   return result;
 }
 function normalizePreviousDraft(value,now=Date.now()){

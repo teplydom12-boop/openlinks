@@ -13,6 +13,7 @@ OBSERVED_MIC = (ROOT / 'tests/fixtures/dialogs-mic-observed-structure.html').rea
 READER = ROOT / 'extension/dialogs-content.js'
 MODEL_EVIDENCE = (ROOT / 'extension/chat-model-evidence.js').read_text()
 HISTORY_MODEL_EVIDENCE = (ROOT / 'extension/history-model-evidence.js').read_text()
+INBOX_MODEL_EVIDENCE = (ROOT / 'extension/inbox-model-evidence.js').read_text()
 checks = 0
 TRANSPORT = """
 window.readerListeners=[];
@@ -722,16 +723,17 @@ with sync_playwright() as p:
 
     load(OBSERVED_ALIBABA,'https://message.alibaba.com/message/default.htm')
     page.evaluate('''()=>{const list=document.querySelector('.normal-list-container');list.style.cssText='height:120px;overflow-y:auto';for(let i=0;i<8;i++){const row=list.firstElementChild.cloneNode(true);row.setAttribute('data-cid',`91000001${i}-910000009#11011@icbu`);list.append(row)}}''')
-    coverage=snapshot()['listCoverage'];assert coverage['hasMore'] and not coverage['complete']
+    coverage=snapshot()['listCoverage'];assert coverage['hasMore'] and not coverage['complete'] and coverage['atStart']
     request={'documentToken':snapshot()['documentToken'],'listToken':coverage['token']}
     effects=page.evaluate('({...readerSideEffects})')
     assert not page.evaluate('(r)=>OpenLinksDialogsReader.advanceList({...r,listToken:"stale"})',request)['ok']
     assert page.evaluate('(r)=>OpenLinksDialogsReader.advanceList(r)',request)['ok']
     assert page.evaluate('document.querySelector(".normal-list-container").scrollTop')>0 and page.evaluate('readerSideEffects')==effects
+    assert not snapshot()['listCoverage']['atStart']
     assert not page.evaluate('(r)=>OpenLinksDialogsReader.advanceList(r)',request)['ok']
     coverage=snapshot()['listCoverage'];request={'documentToken':snapshot()['documentToken'],'listToken':coverage['token'],'direction':'start'}
     assert page.evaluate('(r)=>OpenLinksDialogsReader.advanceList(r)',request)['ok']
-    assert page.evaluate('document.querySelector(".normal-list-container").scrollTop')==0 and page.evaluate('selectedThreads')==[]
+    assert page.evaluate('document.querySelector(".normal-list-container").scrollTop')==0 and page.evaluate('selectedThreads')==[] and snapshot()['listCoverage']['atStart']
     passed('inbox traversal scrolls only the verified list with one-use tokens, overlaps batches and resets to newest without selecting or closing chats')
 
     load(OBSERVED_ALIBABA,'https://message.alibaba.com/message/default.htm')
@@ -780,6 +782,114 @@ with sync_playwright() as p:
     page.evaluate("document.querySelector('.buyer-conversation-list').style.transform='translateY(2000px)'")
     clipped=snapshot()['listCoverage'];assert clipped['status']=='limited' and clipped['windowLimited'] and not clipped['hasMore'] and not clipped['complete']
     passed('a nonvirtualized native inbox beyond 200 rows exposes the current viewport window after scrolling while retaining the active conversation and per-snapshot bound')
+
+    load_active1688();page.evaluate('''()=>{const active=document.querySelector('.conversation-item.active');active.parentElement.append(active)}''')
+    current=snapshot();assert [row['listOrder'] for row in current['conversations']]==[0,1]
+    assert not current['conversations'][0]['active'] and current['conversations'][1]['active'] and current['conversations'][1]['messages']
+    assert current['conversations'][0]['id'].endswith('900000003.1#11152@cntaobao')
+    passed('1688 snapshot follows native sidebar top-to-bottom order even when the already-open transcript belongs to the last row')
+
+    def native_inbox(more=True, loading=False, start=38):
+        load(OBSERVED_1688)
+        page.evaluate('''([more,loading,start])=>{
+          const panel=document.querySelector('.conversation-list-panel'),template=panel.firstElementChild.cloneNode(true);
+          const scroller=document.createElement('div'),spacer=document.createElement('div');
+          scroller.className='conversation-list-scroll';scroller.style.cssText='height:120px;overflow-y:auto';spacer.style.cssText='height:2426px;position:relative';scroller.append(spacer);panel.replaceChildren(scroller);
+          const ids=Array.from({length:40},(_,index)=>`900000001.1-${920000000+index}.1#11152@cntaobao`);
+          const rendered=[];
+          if(start===0){const header=document.createElement('div');header.style.cssText='position:absolute;top:0px;height:26px;left:0;right:0';spacer.append(header);rendered.push({element:header,index:0,top:0,height:26})}
+          for(let index=start;index<start+2;index++){
+            const wrapper=document.createElement('div'),row=template.cloneNode(true);row.id=ids[index];row.style.cssText='box-sizing:border-box;height:60px;overflow:hidden';wrapper.style.cssText=`position:absolute;height:60px;top:${26+index*60}px;left:0;right:0`;wrapper.append(row);spacer.append(wrapper);rendered.push({element:wrapper,index:index+1,top:26+index*60,height:60});
+          }
+          scroller.scrollTop=start===0?0:26+start*60;
+          const state={dataStore:{conversationIdList:ids,conversationFetchLoading:loading},filterConversationList:ids,firstScreenRequestEnds:true,searchListVisible:false,hasMore:more};
+          const root={memoizedProps:{},memoizedState:null,return:null};root.stateNode={current:root};
+          const owner={memoizedProps:{},memoizedState:state,return:root};
+          const list={memoizedProps:{conversationIdList:ids,firstScreenRequestEnds:true},memoizedState:null,return:owner};
+          const widget={memoizedProps:{itemCount:41},memoizedState:{scrollOffset:scroller.scrollTop},return:list};
+          scroller.__reactFiber$synthetic={memoizedProps:{},memoizedState:null,return:widget};
+          for(const item of rendered){const style={position:'absolute',top:item.top,height:item.height};item.element.__reactFiber$synthetic={memoizedProps:{style},memoizedState:null,stateNode:item.element,return:{memoizedProps:{index:item.index,style},memoizedState:null,return:widget}};}
+          window.nativeInboxData={state,widget,scroller};window.nativeListScrolls=0;window.nativeListOffsets=[];scroller.addEventListener('scroll',()=>{nativeListScrolls++;nativeListOffsets.push(scroller.scrollTop)});
+          const originalNow=Date.now;window.readerClockAdvance=0;Date.now=()=>originalNow()+readerClockAdvance;
+        }''',[more,loading,start])
+        return inbox_request()
+    def inbox_request():
+        source=snapshot()
+        return {'expectedDocumentToken':source['documentToken'],'evidenceToken':source.get('inboxEvidenceToken'),'evidence':page.evaluate(INBOX_MODEL_EVIDENCE)}
+    def apply_inbox(request): return page.evaluate('(r)=>OpenLinksDialogsReader.applyInboxEvidence(r)',request)
+
+    request=native_inbox();effects=page.evaluate('({...readerSideEffects})');request_count=len(requests)
+    assert snapshot()['listCoverage']['nativePending'] and request['evidence']['status']=='ready'
+    assert apply_inbox(request)['ok']
+    source=snapshot();coverage=source['listCoverage']
+    assert [row['listOrder'] for row in source['conversations']]==[39,40]
+    assert coverage['loadedRows']==40 and coverage['nativeHasMore'] and coverage['hasMore'] and not coverage['complete'] and not coverage['nativePending']
+    assert coverage['scrollTop']+coverage['clientHeight']==coverage['scrollHeight']
+    assert not apply_inbox(request)['ok'] and page.evaluate('readerSideEffects')==effects and len(requests)==request_count
+    result=page.evaluate('(r)=>OpenLinksDialogsReader.advanceList(r)',{'documentToken':source['documentToken'],'listToken':coverage['token']})
+    assert result['ok'] and result['stalledAttempts']==1 and not result['advanced']
+    assert page.evaluate('nativeListScrolls')>0 and page.evaluate('selectedThreads')==[]
+    assert page.evaluate('nativeListOffsets.includes(nativeInboxData.scroller.scrollTop-1)')
+    assert snapshot()['listCoverage']['progressToken']==coverage['progressToken'] and snapshot()['listCoverage']['stalledAttempts']==1
+    passed('1688 native global ranks and server hasMore survive a virtualized geometric end; guarded pagination notifies only the sidebar scroll handler')
+
+    request=native_inbox(start=0)
+    assert request['evidence']['status']=='ready' and request['evidence']['startVerified']
+    page.evaluate('''()=>{nativeInboxData.state.dataStore.conversationIdList.reverse();const spacer=nativeInboxData.scroller.firstElementChild;spacer.append(spacer.children[1])}''')
+    request=inbox_request();assert request['evidence']['status']=='ready' and request['evidence']['startVerified']
+    assert apply_inbox(request)['ok']
+    source=snapshot();assert source['listCoverage']['atStart']
+    assert [row['listOrder'] for row in source['conversations']]==[1,2]
+    assert source['conversations'][0]['id'].endswith('920000000.1#11152@cntaobao')
+    passed('native renderer positions and observed header establish real top-to-bottom order even when cache IDs and DOM insertion order differ')
+
+    for start,field in [(0,'startVerified'),(38,'endVerified')]:
+        request=native_inbox(start=start);request['evidence'][field]=False
+        assert not apply_inbox(request)['ok']
+        coverage=snapshot()['listCoverage'];assert coverage['nativePending'] and coverage['hasMore'] and not coverage['complete'] and not coverage['atStart']
+    request=native_inbox(start=0);request['evidence']['rowRanks'][0]['index']=2;request['evidence']['rowRanks'][1]['index']=1
+    assert not apply_inbox(request)['ok']
+    passed('unproven native header/footer boundaries and renderer ranks contradicting visible geometry cannot declare a completed sweep or reordered contacts')
+
+    request=native_inbox();assert apply_inbox(request)['ok']
+    page.evaluate('''()=>{window.nativeRetryMarkers=0;nativeInboxData.scroller.addEventListener('scroll',event=>{if(!event.isTrusted)document.querySelector('.ww_conversation_list').dataset.paginationTick=String(++nativeRetryMarkers)})}''')
+    progress=snapshot()['listCoverage']['progressToken']
+    for attempt in range(1,9):
+        source=snapshot();result=page.evaluate('(r)=>OpenLinksDialogsReader.advanceList(r)',{'documentToken':source['documentToken'],'listToken':source['listCoverage']['token']})
+        assert result['ok'] and not result['advanced'] and result['stalledAttempts']==attempt
+        assert result['progressToken']==progress
+        assert apply_inbox(inbox_request())['ok']
+        assert snapshot()['listCoverage']['progressToken']==progress
+    coverage=snapshot()['listCoverage'];assert coverage['status']=='limited' and not coverage['hasMore'] and not coverage['complete']
+    passed('native spinner or class mutations during a stationary retry cannot turn cache revalidation into false list progress or bypass the eight-stall limit')
+
+    request=native_inbox(True,True);assert apply_inbox(request)['ok']
+    source=snapshot();coverage=source['listCoverage'];assert coverage['loading'] and coverage['hasMore'] and not coverage['complete']
+    result=page.evaluate('(r)=>OpenLinksDialogsReader.advanceList(r)',{'documentToken':source['documentToken'],'listToken':coverage['token']})
+    assert not result['ok'] and result['status']=='loading' and snapshot()['listCoverage']['stalledAttempts']==0
+    page.evaluate('nativeInboxData.state.hasMore=false;nativeInboxData.state.dataStore.conversationFetchLoading=false;readerClockAdvance+=800')
+    assert apply_inbox(inbox_request())['ok']
+    coverage=snapshot()['listCoverage'];assert coverage['status']=='end_visible' and coverage['complete'] and not coverage['hasMore'] and not coverage['loading']
+    passed('native loading waits without burning stall budget; end is confirmed only when fresh native hasMore is false and the scroll viewport is at bottom')
+
+    for field,value in [('expectedDocumentToken','stale'),('url','https://another.1688.com/'),('scrollOffset',1),('loadedCount',1)]:
+        request=native_inbox()
+        if field=='expectedDocumentToken':request[field]=value
+        else:request['evidence'][field]=value
+        assert not apply_inbox(request)['ok'] and snapshot()['listCoverage']['nativePending']
+    request=native_inbox();page.evaluate('document.querySelector(".conversation-item .name").textContent="Changed row"')
+    assert not apply_inbox(request)['ok'] and not snapshot()['listCoverage']['complete']
+    passed('native inbox evidence is one-use and rejects foreign documents, URLs, geometry, rank bounds and changed sidebar DOM')
+
+    request=native_inbox();page.evaluate('nativeInboxData.widget.memoizedState.scrollOffset=0')
+    for attempt in range(8):
+        request=inbox_request();assert request['evidence']['status']=='unsupported'
+        assert not apply_inbox(request)['ok'];page.evaluate('readerClockAdvance+=800')
+    coverage=snapshot()['listCoverage'];assert coverage['status']=='limited' and coverage['nativePending'] and not coverage['hasMore'] and not coverage['complete']
+    assert page.evaluate('selectedThreads')==[]
+    page.evaluate('readerClockAdvance+=300001;nativeInboxData.widget.memoizedState.scrollOffset=nativeInboxData.scroller.scrollTop')
+    assert apply_inbox(inbox_request())['ok'] and not snapshot()['listCoverage']['nativePending']
+    passed('unsettled virtual rows cannot pretend to be the new viewport; eight unavailable native checks report incomplete coverage without selecting chats')
 
     for text,blocked in [('Added your WeChat wx_buyer-12.',True),('Added ＷＸ＿ＢＵＹＥＲ－１２.',True),('Added wx_\u200bbuyer-12.',True),('Added wx_buyer-123.',False),('Added other_wx_buyer-12.',False)]:
         load();page.evaluate('(text)=>document.querySelectorAll("[data-message-text]")[1].textContent=text',text)

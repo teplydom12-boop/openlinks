@@ -13,7 +13,7 @@ const sortedJSON=value=>Array.isArray(value)?value.map(sortedJSON):value&&typeof
 function snapshot(platform='1688',extra={}) {
   return {platform,status:'ready',url:urls[platform],documentToken:'doc-1',frames:[],conversations:[{id:'supplier-1',title:'Supplier',identityReliable:true,active:true,unread:true,orderReliable:true,tailKnown:true,messages:[{id:'outreach-1',direction:'outbound',text:'Hello. We are interested in your product; please send specifications.'},{id:'m1',direction:'inbound',text:'What quantity do you need?'}]}],...extra};
 }
-function harness({attachmentResolver,folderSender,testCleaner,testRecovery,pauseOutreachForTest,reserveDialogSendQuota,getWorkCoordination,withDialogTurn,startOutreachForJoint,pauseOutreachForJoint,disableJointWork,micInitializationWait=async()=>{},reorderStorage=false}={}) {
+function harness({attachmentResolver,folderSender,testCleaner,testRecovery,pauseOutreachForTest,reserveDialogSendQuota,getWorkCoordination,withDialogTurn,startOutreachForJoint,pauseOutreachForJoint,disableJointWork,micInitializationWait=async()=>{},workflowBatchSize=1,workflowAutoKick=false,workflowStepWait,reorderStorage=false}={}) {
   const storage={},session={},calls=[],alarms=[],permissionRequests=[],tabUpdates=[],tabCreates=[],windowUpdates=[],windows=new Map([[20,{id:20,type:'normal'}],[30,{id:30,type:'normal'}]]),tabs=new Map([[1,{id:1,url:urls['1688'],status:'complete'}],[2,{id:2,url:urls.alibaba}],[3,{id:3,url:urls.mic}]]);
   const replies=new Map([[1,snapshot()],[2,snapshot('alibaba')],[3,snapshot('mic')]]);
   const frameLists=new Map(),images=new Map();let nextTabId=4,reads=0,fetches=0,allowed=true,time=1000000,openAction=async message=>({ok:true,openedId:message.conversationId}),revealAction=async message=>({ok:true,revealedId:message.conversationId}),fetchAction=async()=>new Response(JSON.stringify({choices:[{message:{content:'We need 100 units. Could you share your WeChat?'}}]}));
@@ -28,7 +28,7 @@ function harness({attachmentResolver,folderSender,testCleaner,testRecovery,pause
     alarms:{create:async(name,options)=>alarms.push({name,...options}),clear:async()=>true,onAlarm:listeners()},
     permissions:{contains:async request=>{permissionRequests.push(structuredClone(request));return typeof allowed==='function'?allowed(request):allowed;}},
   };
-  const monitor=createDialogMonitor({api,now:()=>time,attachmentResolver,folderSender,testCleaner,testRecovery,pauseOutreachForTest,reserveDialogSendQuota,getWorkCoordination,withDialogTurn,startOutreachForJoint,pauseOutreachForJoint,disableJointWork,micInitializationWait,imageLoader:async key=>{if(!images.has(key))throw new Error('Файл изображения недоступен.');return images.get(key);},fetchImpl:async(...args)=>{fetches++;return fetchAction(...args);}});
+  const monitor=createDialogMonitor({api,now:()=>time,attachmentResolver,folderSender,testCleaner,testRecovery,pauseOutreachForTest,reserveDialogSendQuota,getWorkCoordination,withDialogTurn,startOutreachForJoint,pauseOutreachForJoint,disableJointWork,micInitializationWait,workflowBatchSize,workflowAutoKick,workflowStepWait:workflowStepWait || (async ms=>{time+=ms;}),imageLoader:async key=>{if(!images.has(key))throw new Error('Файл изображения недоступен.');return images.get(key);},fetchImpl:async(...args)=>{fetches++;return fetchAction(...args);}});
   return {api,monitor,storage,session,calls,alarms,permissionRequests,tabUpdates,tabCreates,windowUpdates,windows,tabs,replies,frameLists,images,advanceTime:ms=>{time+=ms;},get time(){return time;},get reads(){return reads;},get fetches(){return fetches;},set allowed(value){allowed=value;},set fetchAction(value){fetchAction=value;},set openAction(value){openAction=value;},set revealAction(value){revealAction=value;},command:(type,extra={},sender=ui)=>monitor.handle({type:'DIALOGS_'+type,...extra},sender)};
 }
 async function ready(h) {
@@ -1792,7 +1792,7 @@ test('workflow24h marks any participant mention of buyer WeChat completed and cr
 test('workflow24h missing first buyer message loads history with a bounded retry and then moves on',async()=>{
   const h=harness();await workflowReady(h);const row=h.replies.get(1).conversations[0];delete row.firstBuyerMessage;row.firstBuyerMessageReliable=false;h.storage[DIALOGS_KEY].conversations[key].firstBuyerMessage=null;h.storage[DIALOGS_KEY].conversations[key].firstBuyerMessageReliable=false;
   h.replies.get(1).conversations.push(workflowInactive(h,'other'));await h.command('START');
-  for(let i=0;i<9;i++)await poll(h);
+  for(let i=0;i<9;i++){await poll(h);h.advanceTime(1100);}
   assert.equal(h.calls.filter(call=>call.type==='DIALOGS_LOAD_HISTORY_START').length,8);
   const response=await h.command('GET');assert.equal(response.state.workflow.visits[key].status,'history_unavailable');assert.ok(response.state.traversal['1688'].backoff[key]>h.time);
   await poll(h);assert.equal(opening(h).at(-1).conversationId,'other');assert.equal(h.fetches,0);
@@ -1839,7 +1839,7 @@ test('workflow24h a pause while re-reading a completed result retains it for res
 });
 test('workflow24h continues a started history operation when the top slice temporarily has no last-message date',async()=>{
   const h=harness();await workflowReady(h);const row=h.replies.get(1).conversations[0];delete row.firstBuyerMessage;row.firstBuyerMessageReliable=false;h.storage[DIALOGS_KEY].conversations[key].firstBuyerMessage=null;h.storage[DIALOGS_KEY].conversations[key].firstBuyerMessageReliable=false;
-  await h.command('START');await poll(h);row.latestMessageAt=null;row.latestMessageAtReliable=false;row.tailKnown=false;await poll(h);
+  await h.command('START');await poll(h);row.latestMessageAt=null;row.latestMessageAtReliable=false;row.tailKnown=false;h.advanceTime(1100);await poll(h);
   assert.equal(h.calls.filter(call=>call.type==='DIALOGS_LOAD_HISTORY_START').length,2);assert.equal((await h.command('GET')).state.workflow.history[key].phase,'start');
 });
 test('workflow24h activation follows only the operated lane and can be disabled without cancelling Claude',async()=>{
@@ -1855,7 +1855,7 @@ test('workflow24h manual scan while stopped never activates a marketplace tab',a
 test('workflow24h transient history loading stays pending instead of becoming an error',async()=>{
   const h=harness();await workflowReady(h);const row=h.replies.get(1).conversations[0];delete row.firstBuyerMessage;row.firstBuyerMessageReliable=false;h.storage[DIALOGS_KEY].conversations[key].firstBuyerMessage=null;h.storage[DIALOGS_KEY].conversations[key].firstBuyerMessageReliable=false;
   const native=h.api.tabs.sendMessage;h.api.tabs.sendMessage=(id,message,options)=>message.type==='DIALOGS_LOAD_HISTORY_START'?Promise.resolve({ok:false,status:'loading'}):native(id,message,options);
-  await h.command('START');await poll(h);const state=(await h.command('GET')).state;assert.equal(state.workflow.history[key].attempts,1);assert.equal(state.traversal['1688'].backoff[key],undefined);
+  await h.command('START');await poll(h);const state=(await h.command('GET')).state;assert.equal(state.workflow.history[key].attempts,0);assert.equal(state.traversal['1688'].backoff[key],undefined);
 });
 test('workflow24h selects rendered chats beyond the 100-transcript cache across marketplaces',async()=>{
   const h=harness();await workflowReady(h);await h.command('BIND_TAB',{platform:'alibaba',tabId:2});
@@ -2010,7 +2010,7 @@ test('sticky sweep preserves history, pause and resume on its current marketplac
   const h=harness();await workflowReady(h);await bindWorkflowPlatforms(h);h.storage[DIALOGS_KEY].workflow.cursor=1;
   const row=h.replies.get(2).conversations[0];row.firstBuyerMessageReliable=false;delete row.firstBuyerMessage;
   await h.command('START');await poll(h);assert.equal(h.storage[DIALOGS_KEY].workflow.cursor,1);assert.equal(h.calls.at(-1).id,2);
-  const before=h.storage[DIALOGS_KEY].workflow.sweepId;await h.command('STOP');await h.command('START');await poll(h);
+  const before=h.storage[DIALOGS_KEY].workflow.sweepId;await h.command('STOP');await h.command('START');h.advanceTime(1100);await poll(h);
   assert.equal(h.storage[DIALOGS_KEY].workflow.cursor,1);assert.equal(h.storage[DIALOGS_KEY].workflow.sweepId,before);assert.equal(h.calls.filter(call=>call.type==='DIALOGS_LOAD_HISTORY_START').length,2);
 });
 test('sticky sweep paginates the current platform through more than64 advancing pages before switching',async()=>{
@@ -2020,7 +2020,7 @@ test('sticky sweep paginates the current platform through more than64 advancing 
     if(message.type==='DIALOGS_ADVANCE_LIST'){h.calls.push({id,...message});page++;h.replies.get(1).listCoverage={token:'page-'+page,progressToken:'page-'+page,hasMore:page<66};return {ok:true,advanced:true};}
     return original(id,message,options);
   };
-  await h.command('START');for(let i=0;i<66;i++){await poll(h);assert.equal(h.storage[DIALOGS_KEY].workflow.cursor,0);assert.equal(opening(h).length,0);}
+  await h.command('START');for(let i=0;i<66;i++){await poll(h);h.advanceTime(2000);assert.equal(h.storage[DIALOGS_KEY].workflow.cursor,0);assert.equal(opening(h).length,0);}
   await poll(h);assert.equal(page,66);assert.deepEqual(opening(h).map(call=>call.conversationId),['ali-next']);
 });
 test('sticky sweep bounds a stalled list and cold loading then proceeds to the next available platform',async()=>{
@@ -2029,7 +2029,7 @@ test('sticky sweep bounds a stalled list and cold loading then proceeds to the n
     if(variant==='list'){h.replies.get(1).listCoverage={token:'stalled',progressToken:'stalled',hasMore:true};const original=h.api.tabs.sendMessage;h.api.tabs.sendMessage=(id,message,options)=>message.type==='DIALOGS_ADVANCE_LIST'?Promise.resolve({ok:true,advanced:false}):original(id,message,options);}
     else h.tabs.get(1).status='loading';
     await h.command('START');await poll(h);assert.equal(opening(h).length,0);
-    if(variant==='loading'){h.advanceTime(120001);await poll(h);}else for(let i=0;i<10&&!opening(h).length;i++)await poll(h);
+    if(variant==='loading'){h.advanceTime(120001);await poll(h);}else for(let i=0;i<10&&!opening(h).length;i++){h.advanceTime(2000);await poll(h);}
     assert.deepEqual(opening(h).map(call=>call.conversationId),['available']);
   }
 });
@@ -2099,4 +2099,119 @@ test('limited native coverage is recorded as incomplete rather than an exhausted
     assert.equal(page.failed,true);assert.equal(page.atEnd,false);assert.deepEqual(opening(h).map(call=>call.conversationId),['next-marketplace']);assert.equal(result.state.workflow.cursor,1);
     const event=result.workflowActivityHistory.find(event=>event.type==='workflow_list_limited'&&event.platform==='1688');assert.ok(event);assert.match(event.detail,/Не удалось завершить чтение списка/);assert.equal(h.calls.some(call=>call.type==='DIALOGS_ADVANCE_LIST'&&call.id===1),false);
   }
+});
+
+test('fast workflow drains ready chats in native top-to-bottom order before the next platform',async()=>{
+  const h=harness({workflowBatchSize:12});await workflowReady(h);await bindWorkflowPlatforms(h);completeSelectedRead(h);
+  for(const [index,name] of ['1688','alibaba','mic'].entries())h.replies.get(index+1).conversations=[workflowInactive(h,name+'-second',{listOrder:1}),workflowInactive(h,name+'-first',{listOrder:0})];
+  const started=h.time;await h.command('START');await poll(h);
+  assert.deepEqual(opening(h).map(call=>call.conversationId),['1688-first','1688-second','alibaba-first','alibaba-second','mic-first','mic-second']);assert.ok(h.time-started<5000);assert.equal(h.fetches,0);
+});
+test('native first row wins over a lower active chat and old visit timestamps',async()=>{
+  const h=harness({workflowBatchSize:12}),host=await workflowReady(h,{folder:true});const lower=h.replies.get(1).conversations[0];Object.assign(lower,{listOrder:2,canSelect:true,selectionToken:'lower'});const top=workflowInactive(h,'top',{listOrder:0,preview:'Changed top message'}),middle=workflowInactive(h,'middle',{listOrder:1});
+  const template=structuredClone(lower);h.replies.get(1).conversations=[lower,middle,top];h.storage[DIALOGS_KEY].workflow.visits[conversationKey('1688','top')]={at:h.time,sweepId:1,preview:'Old message',status:'waiting_supplier'};
+  h.openAction=async(message)=>{for(const row of h.replies.get(1).conversations)row.active=false;const row=h.replies.get(1).conversations.find(row=>row.id===message.conversationId);Object.assign(row,template,{id:row.id,title:row.title,listOrder:row.listOrder,preview:row.preview,active:true,needsRead:false});return {ok:true};};
+  await h.command('START');await poll(h);assert.equal(opening(h)[0].conversationId,'top');assert.equal(host.first.request.key,conversationKey('1688','top'));assert.equal(host.jobs.size,1);
+});
+test('a new native sweep returns to confirmed list start before reading a lower active chat',async()=>{
+  const h=harness({workflowBatchSize:12});await workflowReady(h);completeSelectedRead(h);const lower=h.replies.get(1).conversations[0];Object.assign(lower,{listOrder:1});h.replies.get(1).listCoverage={token:'bottom',atStart:false,hasMore:false,progressToken:'bottom'};
+  const native=h.api.tabs.sendMessage;h.api.tabs.sendMessage=async(id,message,options)=>{if(message.type==='DIALOGS_ADVANCE_LIST'&&message.direction==='start'){h.calls.push({id,...message});h.replies.get(1).listCoverage={token:'top',atStart:true,hasMore:false,progressToken:'top'};h.replies.get(1).conversations.unshift(workflowInactive(h,'top',{listOrder:0}));return {ok:true};}return native(id,message,options);};
+  await h.command('START');await poll(h);const actions=h.calls.filter(call=>['DIALOGS_ADVANCE_LIST','DIALOGS_OPEN_CONVERSATION'].includes(call.type));assert.equal(actions[0].direction,'start');assert.equal(actions[1].conversationId,'top');
+});
+test('an unconfirmed start never grants permission to process bottom rows',async()=>{
+  const h=harness({workflowBatchSize:12}),host=await workflowReady(h,{folder:true});h.replies.get(1).listCoverage={token:'bottom',atStart:false,hasMore:false,progressToken:'bottom'};let attempts=0;
+  const native=h.api.tabs.sendMessage;h.api.tabs.sendMessage=(id,message,options)=>message.type==='DIALOGS_ADVANCE_LIST'?(attempts++,Promise.resolve({ok:true})):native(id,message,options);
+  await h.command('START');await poll(h);assert.equal(attempts,3);assert.equal(host.jobs.size,0);assert.equal(opening(h).length,0);assert.equal(h.storage[DIALOGS_KEY].workflow.list['1688'].failed,true);
+});
+test('fast selection waits for a cached-first transcript to become stable instead of backing it off',async()=>{
+  let h,openedAt;h=harness({workflowBatchSize:12,workflowStepWait:async ms=>{h.advanceTime(ms);if(openedAt&&h.time-openedAt>=1100){const row=h.replies.get(1).conversations[0];row.historyStable=true;row.tailKnown=true;}}});const host=await workflowReady(h,{folder:true});const row=h.replies.get(1).conversations[0];Object.assign(row,{active:false,canSelect:true,selectionToken:'stable-test'});
+  h.openAction=async()=>{openedAt=h.time;row.active=true;row.historyStable=false;row.tailKnown=false;return {ok:true};};
+  await h.command('START');await poll(h);assert.equal(opening(h).length,1);assert.equal(host.jobs.size,1);assert.equal(h.storage[DIALOGS_KEY].traversal['1688'].backoff[key],undefined);assert.ok(h.time-openedAt>=1100);
+});
+test('fast history loading delays do not consume real history attempts or skip the recipient',async()=>{
+  const h=harness({workflowBatchSize:12}),host=await workflowReady(h,{folder:true});const row=h.replies.get(1).conversations[0],first=structuredClone(row.firstBuyerMessage);delete row.firstBuyerMessage;row.firstBuyerMessageReliable=false;h.storage[DIALOGS_KEY].conversations[key].firstBuyerMessage=null;h.storage[DIALOGS_KEY].conversations[key].firstBuyerMessageReliable=false;
+  const start=h.time,native=h.api.tabs.sendMessage;let loads=0;h.api.tabs.sendMessage=async(id,message,options)=>{if(message.type==='DIALOGS_LOAD_HISTORY_START'){loads++;if(h.time-start<4400)return {ok:false,status:'loading',retryAfterMs:1100};row.firstBuyerMessage=first;row.firstBuyerMessageReliable=true;return {ok:true};}return native(id,message,options);};
+  await h.command('START');await poll(h);assert.ok(loads>=5);assert.equal(host.jobs.size,1);assert.equal(h.storage[DIALOGS_KEY].traversal['1688'].backoff[key],undefined);assert.equal(opening(h).length,0);
+});
+test('fast drain respects batch size, joins simultaneous alarms and stops immediately during a delay',async()=>{
+  const entered=deferred(),release=deferred();let h,waits=0;h=harness({workflowBatchSize:3,workflowStepWait:async ms=>{h.advanceTime(ms);if(++waits===1){entered.resolve();await release.promise;}}});await workflowReady(h);completeSelectedRead(h);h.replies.get(1).conversations=Array.from({length:8},(_,i)=>workflowInactive(h,'row-'+i,{listOrder:i}));
+  await h.command('START');const first=poll(h);await entered.promise;const second=poll(h);const paused=await h.command('STOP');assert.equal(paused.state.running,false);release.resolve();await Promise.all([first,second]);assert.equal(opening(h).length,1);
+  await h.command('START');await poll(h);assert.equal(opening(h).length,4,'one drain performs no more than three new row actions');
+});
+test('fast manual review and test preview hold the exact recipient without another traversal',async()=>{
+  for(const testMode of [false,true]){let sends=0;const h=harness({workflowBatchSize:12,folderSender:async args=>{assert.equal(args.dryRun,true);const token={operation:args.previewOperation,platform:'1688',id:'supplier-1',documentToken:args.source.documentToken,sourceUrl:args.source.sourceUrl,text:args.text};await args.reservePreview({attemptId:args.previewOperation,cleanupToken:token});sends++;return {status:'previewed'};}}),host=await workflowReady(h,{folder:true,testMode});h.replies.get(1).conversations.push(workflowInactive(h,'next'));
+    if(testMode)await h.command('TEST_NEXT',testTokens(await h.command('GET')));else await h.command('START');await poll(h);host.done();await poll(h);assert.equal(sends,1);assert.equal(opening(h).length,0);const current=await h.command('GET');assert.equal(testMode?current.folder.test.phase:current.folder.review.phase,testMode?'completed':'prepared');await h.command('STOP');
+  }
+});
+
+test('a permanently unstable active history times out once and moves to the next row during backoff',async()=>{
+  const h=harness({workflowBatchSize:12});await workflowReady(h);const row=h.replies.get(1).conversations[0];row.historyStable=false;row.listOrder=0;h.replies.get(1).conversations.push(workflowInactive(h,'next-stable',{listOrder:1}));await h.command('START');await poll(h);
+  assert.equal(opening(h).length,0);h.advanceTime(120001);await poll(h);assert.equal(opening(h).at(-1).conversationId,'next-stable');assert.equal(h.storage[DIALOGS_KEY].traversal['1688'].pending.id,'next-stable');assert.ok(h.storage[DIALOGS_KEY].traversal['1688'].backoff[key]>h.time);
+});
+test('the corrected-order migration restarts1688 once without losing results, drafts or paid jobs',async()=>{
+  const h=harness(),host=await workflowReady(h,{folder:true});await h.command('START');await poll(h);const jobId=host.first.id;await h.command('STOP');const saved=h.storage[DIALOGS_KEY];saved.workflow.orderVersion=1;saved.traversal['1688'].backoff[key]=h.time+300000;saved.workflow.cursor=1;saved.workflow.sweepId=7;saved.workflow.list.alibaba={sweepId:7,positioned:true,atEnd:false};saved.workflow.visits[key]={at:h.time,status:'test_completed',lastResult:{status:'test_completed',detail:'Simulated',at:h.time}};
+  const migrated=await h.command('GET');assert.equal(migrated.state.workflow.orderVersion,2);assert.equal(migrated.state.workflow.cursor,0);assert.equal(migrated.state.workflow.sweepId,8);assert.deepEqual(migrated.state.workflow.list,{});assert.deepEqual(migrated.state.traversal['1688'].backoff,{});assert.equal(migrated.state.workflow.visits[key].lastResult.status,'test_completed');assert.equal(migrated.folder.jobs[0].id,jobId);assert.equal(migrated.folder.jobs[0].status,'queued');
+  h.storage[DIALOGS_KEY].workflow.cursor=2;h.storage[DIALOGS_KEY].traversal['1688'].backoff[key]=h.time+300000;await h.command('START');await h.command('STOP');assert.equal((await h.command('GET')).state.workflow.cursor,2);assert.equal((await h.command('GET')).state.traversal['1688'].backoff[key],h.time+300000);
+});
+
+test('START kicks immediately and pause-resume hands off an old delayed drain without waiting for an alarm',async()=>{
+  const entered=deferred(),release=deferred(),secondOpened=deferred();let h,waiting=false;h=harness({workflowBatchSize:12,workflowAutoKick:true,workflowStepWait:async ms=>{h.advanceTime(ms);if(!waiting){waiting=true;entered.resolve();await release.promise;}}});await workflowReady(h);completeSelectedRead(h);h.replies.get(1).conversations=[workflowInactive(h,'first',{listOrder:0}),workflowInactive(h,'second',{listOrder:1})];const original=h.api.tabs.sendMessage;
+  h.api.tabs.sendMessage=async(id,message,options)=>{const result=await original(id,message,options);if(message.type==='DIALOGS_OPEN_CONVERSATION'&&message.conversationId==='second')secondOpened.resolve();return result;};
+  await h.command('START');await entered.promise;assert.equal(opening(h).length,1);await h.command('STOP');await h.command('START');release.resolve();let timer;
+  try{await Promise.race([secondOpened.promise,new Promise((_,reject)=>{timer=setTimeout(()=>reject(new Error('Immediate resume was lost')),2000);})]);}finally{clearTimeout(timer);await h.command('STOP');}
+  assert.deepEqual(opening(h).map(call=>call.conversationId),['first','second']);assert.ok(h.alarms.some(alarm=>alarm.name==='openlinks-dialogs'&&alarm.periodInMinutes===0.5),'a durable alarm remains as a worker-suspension fallback');
+});
+test('a same-step ready Claude reply continues to the next chat after one guarded automatic attempt',async()=>{
+  let attempts=0;const h=harness({workflowBatchSize:12,reserveDialogSendQuota:async()=>({ok:true}),folderSender:async args=>{assert.notEqual(args.dryRun,true);assert.equal((await args.reserve({attemptId:crypto.randomUUID(),platform:'1688',key:args.request.key})).ok,true);attempts++;return {status:'attempted'};}}),host=await workflowReady(h,{folder:true});await h.command('FOLDER_SETTINGS',{autoSend:true});h.replies.get(1).conversations.push(workflowInactive(h,'next'));const native=h.api.runtime.sendNativeMessage;
+  h.api.runtime.sendNativeMessage=async(name,message)=>{const result=await native(name,message);if(message.action==='submit')host.done();return result;};
+  await h.command('START');await poll(h);assert.equal(attempts,1);assert.equal(host.jobs.size,1);assert.equal(opening(h).at(-1).conversationId,'next');assert.equal(h.storage[DIALOGS_KEY].workflow.visits[key].lastResult.status,'attempted');
+});
+test('short scheduled continuations drain more than one bounded batch without another Chrome alarm',async()=>{
+  const completed=deferred();const h=harness({workflowBatchSize:3,workflowAutoKick:true});await workflowReady(h);completeSelectedRead(h);h.replies.get(1).conversations=Array.from({length:10},(_,index)=>workflowInactive(h,'ordered-'+index,{listOrder:index}));const native=h.api.tabs.sendMessage;
+  h.api.tabs.sendMessage=async(id,message,options)=>{const result=await native(id,message,options);if(message.type==='DIALOGS_OPEN_CONVERSATION'&&message.conversationId==='ordered-9')completed.resolve();return result;};
+  await h.command('START');let timer;try{await Promise.race([completed.promise,new Promise((_,reject)=>{timer=setTimeout(()=>reject(new Error('Bounded drain continuation was lost')),4000);})]);}finally{clearTimeout(timer);await h.command('STOP');}
+  assert.deepEqual(opening(h).map(call=>call.conversationId),Array.from({length:10},(_,index)=>'ordered-'+index));
+});
+
+test('1688 native inbox evidence refreshes pagination only for its exact requested frame and document',async()=>{
+  const h=harness();await workflowReady(h);const snap=h.replies.get(1);snap.conversations[0].messages.push({id:'buyer-last',direction:'outbound',text:'Waiting.'});snap.inboxEvidenceToken='inbox-once';snap.listCoverage={token:'rows-before',atStart:true,hasMore:false};const native=h.api.tabs.sendMessage;let applied=0;
+  h.api.scripting={executeScript:async request=>{assert.deepEqual(request.files,['inbox-model-evidence.js']);assert.deepEqual(request.target,{tabId:1,frameIds:[0]});assert.equal(request.world,'MAIN');return [{frameId:0,result:{platform:'1688',url:urls['1688'],status:'ready',schema:'1688-inbox-pagination-v1',hasMore:true,loadedCount:40}}];}};
+  h.api.tabs.sendMessage=async(id,message,options)=>{if(message.type==='DIALOGS_APPLY_INBOX_EVIDENCE'){applied++;assert.equal(message.expectedDocumentToken,'doc-1');assert.equal(message.evidenceToken,'inbox-once');assert.equal(options.frameId,0);delete snap.inboxEvidenceToken;snap.listCoverage={token:'rows-native',atStart:true,hasMore:true,loadedCount:40,progressToken:'native-list'};return {ok:true};}if(message.type==='DIALOGS_ADVANCE_LIST'){h.calls.push({id,...message});return {ok:true};}return native(id,message,options);};
+  await h.command('START');await poll(h);assert.equal(applied,1);assert.equal(h.calls.find(call=>call.type==='DIALOGS_ADVANCE_LIST').listToken,'rows-native');assert.equal(h.storage[DIALOGS_KEY].workflow.list['1688'].atEnd,false);assert.equal(h.storage[DIALOGS_KEY].workflow.cursor,0);
+});
+test('native inbox evidence with a foreign URL or changed refreshed document never grants list completion',async()=>{
+  for(const mismatch of ['url','document']){const h=harness();await workflowReady(h);const snap=h.replies.get(1);snap.inboxEvidenceToken='inbox-once';const native=h.api.tabs.sendMessage;let applied=0;
+    h.api.scripting={executeScript:async()=>[{frameId:0,result:{platform:'1688',url:mismatch==='url'?'https://example.com/':urls['1688'],status:'ready'}}]};
+    h.api.tabs.sendMessage=async(id,message,options)=>{if(message.type==='DIALOGS_APPLY_INBOX_EVIDENCE'){applied++;snap.documentToken='changed-document';return {ok:true};}return native(id,message,options);};
+    const scanned=await h.command('SCAN',{platform:'1688'});assert.equal(applied,mismatch==='url'?0:1);if(mismatch==='document')assert.equal(scanned.state.bindings['1688'].status,'loading');assert.equal(h.calls.some(call=>call.type==='DIALOGS_ADVANCE_LIST'),false);
+  }
+});
+
+test('pending native inbox metadata blocks lower-row work until order is confirmed',async()=>{
+  let h,start;h=harness({workflowBatchSize:12,workflowStepWait:async ms=>{h.advanceTime(ms);if(h.time-start>=2000)h.replies.get(1).listCoverage={token:'native-ready',atStart:true,hasMore:false,nativePending:false};}});const host=await workflowReady(h,{folder:true});h.replies.get(1).listCoverage={token:'pending',nativePending:true,status:'metadata_pending',hasMore:true,retryAfterMs:1000};start=h.time;
+  await h.command('START');await poll(h);assert.equal(host.jobs.size,1);assert.ok(host.first.createdAt-start>=2000);assert.equal(opening(h).length,0);
+});
+test('limited or permanently loading native metadata cannot trap a platform or infer inbox completion',async()=>{
+  for(const variant of ['limited','loading']){const h=harness();await workflowReady(h);await h.command('BIND_TAB',{platform:'alibaba',tabId:2});h.replies.get(2).conversations=[workflowInactive(h,'available')];h.replies.get(1).listCoverage={token:'native-unavailable',nativePending:variant==='limited',loading:variant==='loading',status:variant==='limited'?'limited':'ready',atStart:true,hasMore:true};
+    await h.command('START');await poll(h);if(variant==='loading'){assert.equal(opening(h).length,0);h.advanceTime(120001);await poll(h);}
+    assert.equal(opening(h).at(-1).conversationId,'available');const page=h.storage[DIALOGS_KEY].workflow.list['1688'];assert.equal(page.failed,true);assert.equal(page.atEnd,false);
+  }
+});
+
+test('waiting for native metadata activates only its current working tab and never opens rows early',async()=>{
+  for(const visible of [true,false]){const h=harness(),host=await workflowReady(h,{folder:true});await h.command('SETTINGS',{settings:{showWorkingTab:visible}});h.replies.get(1).listCoverage={token:'pending',nativePending:true,status:'metadata_pending',hasMore:true};h.replies.get(1).conversations.push(workflowInactive(h,'lower'));
+    await h.command('START');await poll(h);await poll(h);assert.deepEqual(h.tabUpdates.filter(update=>update.active).map(update=>update.id),visible?[1]:[]);assert.equal(h.windowUpdates.length,0);assert.equal(opening(h).length,0);assert.equal(host.jobs.size,0);
+  }
+});
+test('an existing paid result stays pending while native inbox position is unconfirmed',async()=>{
+  const {h,previews}=manualReviewHarness(),host=await workflowReady(h,{folder:true});await h.command('START');await poll(h);host.done('Keep until list is confirmed.');h.replies.get(1).listCoverage={token:'pending',nativePending:true,status:'metadata_pending',hasMore:true};
+  await poll(h);assert.equal(previews.length,0);assert.equal(h.storage.openlinksClaudeFolder.jobs[0].status,'queued');assert.equal(host.jobs.size,1);
+  h.replies.get(1).listCoverage={token:'ready',nativePending:false,atStart:true,hasMore:false};await poll(h);assert.equal(previews.length,1);assert.equal(host.jobs.size,1);
+});
+
+test('exact-source unsupported inbox evidence consumes the reader failure budget and refreshes its limited state',async()=>{
+  const h=harness();await workflowReady(h);const snap=h.replies.get(1);snap.inboxEvidenceToken='unsupported-once';snap.listCoverage={token:'native-pending',nativePending:true,status:'metadata_pending',hasMore:true};let failed=0;const native=h.api.tabs.sendMessage;
+  h.api.scripting={executeScript:async()=>[{frameId:0,result:{platform:'1688',url:urls['1688'],status:'unsupported',schema:'1688-inbox-pagination-v1'}}]};
+  h.api.tabs.sendMessage=async(id,message,options)=>{if(message.type==='DIALOGS_APPLY_INBOX_EVIDENCE'){failed++;assert.equal(message.expectedDocumentToken,'doc-1');assert.equal(message.evidenceToken,'unsupported-once');assert.equal(message.evidence.status,'unsupported');delete snap.inboxEvidenceToken;snap.listCoverage={token:'native-limited',nativePending:true,status:'limited',hasMore:false};return {ok:false,reason:'unsupported'};}return native(id,message,options);};
+  await h.command('START');await poll(h);assert.equal(failed,1);assert.equal(h.storage[DIALOGS_KEY].workflow.list['1688'].failed,true);assert.equal(h.storage[DIALOGS_KEY].workflow.list['1688'].atEnd,false);assert.ok(h.storage[DIALOGS_KEY].events.some(event=>event.type==='workflow_list_limited'));
 });
