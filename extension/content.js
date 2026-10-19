@@ -196,6 +196,11 @@
       found.editor.dispatchEvent(new InputEvent('input',{bubbles:true,composed:true,inputType:'deleteContentBackward',data:null}));
       found.editor.dispatchEvent(new Event('change',{bubbles:true,composed:true}));
       if(exactEditorText(found.editor)!=='')return deny('Сайт не подтвердил очистку тестового черновика. Проверьте поле вручную.');
+      // Filling an owned preview focuses this editor. Release that focus after
+      // its explicit, verified cleanup so a newly approved operation does not
+      // mistake our previous focus for a user currently typing in the chat.
+      const focused=document.activeElement;
+      if(focused===found.editor||found.editor.contains(focused))focused.blur();
       preview.cleared=true;preparedEditors.delete(found.editor);return {cleared:true};
     }finally{preview.cleaning=false;}
   }

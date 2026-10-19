@@ -16,9 +16,35 @@
     <div class="sidebar-bottom"><span class="live-dot"></span> Ответы с Claude<p>Товар, правила и история переписки — в одном рабочем пространстве.</p></div>
   </aside>
   <main>
-    <header><div><div class="eyebrow">OPENLINKS + CLAUDE</div><h1>Диалоги с поставщиками</h1><p class="dialogs-subtitle">Настройте задачу один раз. Claude подготовит ответы по вашим правилам.</p></div><div id="dialogs-run-state" class="state" role="status">Загрузка…</div></header>
+    <header><div><div class="eyebrow">OPENLINKS + CLAUDE</div><h1>Диалоги с поставщиками</h1><p class="dialogs-subtitle">Сохраните товары. Claude определит товар по первому вашему сообщению и продолжит диалог после ответа продавца.</p></div><div id="dialogs-run-state" class="state" role="status">Загрузка…</div></header>
     <div id="dialogs-feedback" role="status" hidden></div>
-    <nav class="dialogs-steps" aria-label="Этапы настройки"><a href="#dialogs-folder"><span>1</span> Claude</a><a href="#dialogs-product"><span>2</span> Товар и правила</a><a href="#dialogs-monitor"><span>3</span> Мониторинг</a><a href="#dialogs-conversations"><span>4</span> Переписки</a></nav>
+    <nav class="dialogs-steps" aria-label="Этапы настройки"><a href="#dialogs-folder"><span>1</span> Claude</a><a href="#dialogs-product"><span>2</span> Память товаров</a><a href="#dialogs-monitor"><span>3</span> Мониторинг</a><a href="#dialogs-conversations"><span>4</span> Переписки</a></nav>
+
+    <section id="dialogs-activity" class="panel dialogs-activity" aria-labelledby="dialogs-activity-heading">
+      <div class="panel-heading"><div><div class="eyebrow">БЛОК 2 · ТЕКУЩАЯ РАБОТА</div><h2 id="dialogs-activity-heading">Обход чатов за последние сутки</h2></div><span id="dialogs-activity-status" class="dialogs-status" role="status">Загрузка…</span></div>
+      <p class="hint">24 часа считаются от последнего сообщения. Прочитанные чаты тоже проверяются. Ваш точный WeChat ID в любом сообщении завершает диалог. После ответа приложение переходит дальше и возвращается к незавершённым чатам.</p>
+      <div class="dialogs-activity-current" role="status" aria-live="polite"><strong id="dialogs-activity-action">Ожидание состояния</strong><p id="dialogs-activity-target" class="hint"></p><p id="dialogs-activity-detail"></p><p id="dialogs-activity-time" class="hint"></p></div>
+      <div class="actions"><button id="dialogs-activity-resume" class="button primary" type="button" disabled>Продолжить блок 2</button><button id="dialogs-activity-pause" class="button secondary" type="button" disabled>Пауза блока 2</button><a class="link-button" href="#dialogs-monitor">Настройки мониторинга ↓</a></div>
+      <label class="check"><input id="dialogs-show-working-tab" type="checkbox" disabled> Показывать рабочую вкладку</label><p class="hint">Выбирает вкладку текущего чата в окне рабочего браузера. Не выводит окно браузера поверх других программ. Снимите галочку для фоновой работы.</p>
+      <p id="dialogs-activity-pause-note" class="hint">Пауза сохраняет товары, прочитанные чаты и подготовленные ответы.</p>
+      <details class="dialogs-inline-details" open><summary>Последние действия блока 2</summary><ol id="dialogs-activity-events" class="dialogs-events"></ol><p id="dialogs-activity-empty" class="hint">Действий пока нет.</p></details>
+      <section id="dialogs-review-panel" class="dialogs-review-panel" aria-labelledby="dialogs-review-heading" hidden>
+        <div class="panel-heading"><h3 id="dialogs-review-heading">Проверьте ответ перед отправкой</h3><span id="dialogs-review-status" class="dialogs-status" role="status"></span></div>
+        <p id="dialogs-review-recipient"></p><p id="dialogs-review-product" class="hint"></p><p id="dialogs-review-time" class="hint"></p>
+        <label for="dialogs-review-text">Текст ответа поставщику</label><textarea id="dialogs-review-text" rows="7" maxlength="6000" placeholder="Здесь появится подготовленный ответ."></textarea>
+        <p id="dialogs-review-detail" class="hint" role="status"></p><p id="dialogs-review-conflict" class="hint" role="alert" hidden></p>
+        <div class="actions"><button id="dialogs-review-send" class="button primary" type="button" disabled>Отправить</button><button id="dialogs-review-skip" class="button secondary" type="button" disabled>Пропустить и перейти дальше</button><button id="dialogs-review-reset" class="link-button" type="button" hidden>Загрузить текущий вариант</button></div>
+        <p id="dialogs-review-note" class="hint">Ответ уже введён в поле чата. Расширение ждёт вашего решения. После отправки или пропуска оно перейдёт к следующему чату.</p>
+      </section>
+        <div id="dialogs-test-panel" class="dialogs-test-panel" hidden>
+          <div class="panel-heading"><h3 id="dialogs-test-status" role="status">Готов к проверке</h3><span class="dialogs-status test">Без отправки</span></div>
+          <p id="dialogs-test-detail" class="hint"></p>
+          <div class="dialogs-test-platform-controls"><div><label for="dialogs-test-platform">Площадка для теста</label><select id="dialogs-test-platform" disabled><option value="all">Все площадки</option><option value="1688">1688</option><option value="alibaba">Alibaba</option><option value="mic">Made-in-China</option></select></div><button id="dialogs-test-platform-start" class="button secondary" type="button" disabled>Проверить эту площадку</button></div><p id="dialogs-test-platform-note" class="hint" role="status"></p>
+          <div id="dialogs-test-result" role="region" aria-label="Точный текст тестового ответа" class="dialogs-test-result" hidden><p id="dialogs-test-recipient"></p><p id="dialogs-test-time" class="hint"></p><h4>Точный текст ответа поставщику</h4><pre id="dialogs-test-text" tabindex="0"></pre><p id="dialogs-test-result-note" class="hint">Текст введён в чат для проверки. Записи об отправке в истории переписки нет.</p></div>
+          <div class="actions"><button id="dialogs-test-next" class="button primary" type="button" disabled>Проверить первый цикл</button><button id="dialogs-test-skip" class="button secondary" type="button" disabled hidden>Пропустить и перейти дальше</button><span id="dialogs-test-count" class="hint"></span></div>
+          <p class="hint">В тесте ответ вводится в поле чата, но не отправляется. Завершение теста учитывает этот ответ только внутри проверки и переводит приложение к следующему чату. При пропуске отправки также нет.</p>
+        </div>
+    </section>
 
     <section id="dialogs-folder" class="panel dialogs-folder" aria-labelledby="dialogs-folder-heading">
       <div class="panel-heading"><div><div class="eyebrow">ШАГ 1</div><h2 id="dialogs-folder-heading">Подключение Claude</h2></div><span id="dialogs-folder-status" class="dialogs-status" role="status">Выключено</span></div>
@@ -32,8 +58,8 @@
     </section>
 
     <section id="dialogs-product" class="panel dialogs-product" aria-labelledby="dialogs-product-heading">
-      <div class="panel-heading"><div><div class="eyebrow">ШАГ 2</div><h2 id="dialogs-product-heading">Товар и правила общения</h2></div><span id="dialogs-product-status" class="dialogs-status" role="status">Не согласовано</span></div>
-      <p class="dialogs-product-scope">Эта задача применяется ко всем поставщикам в чатах мониторинга. Опишите товар, проверьте выводы Claude и согласуйте сведения для ответов.</p>
+      <div class="panel-heading"><div><div class="eyebrow">ШАГ 2</div><h2 id="dialogs-product-heading">Память товаров и правила общения</h2></div><span id="dialogs-product-status" class="dialogs-status" role="status">Не согласовано</span></div>
+      <p class="dialogs-product-scope">Для каждого товара заполните описание и правила, согласуйте сведения и сохраните отдельную карточку в память. В чате будет выбран товар по первому вашему сообщению. Если товар или начало переписки не распознаны, приложение покажет причину и перейдёт к следующему чату.</p>
       <form id="dialogs-product-form">
         <div class="dialogs-form-grid"><div><label for="dialogs-product-card">Описание товара</label><textarea id="dialogs-product-card" rows="5" maxlength="30000" placeholder="Вставьте описание, комплектацию или текст карточки товара."></textarea></div><div><label for="dialogs-product-characteristics">Ваши требования</label><textarea id="dialogs-product-characteristics" rows="5" maxlength="12000" placeholder="Модель, материал, размеры, количество, качество и упаковка."></textarea></div></div>
         <label for="dialogs-product-url">Ссылка на товар (необязательно)</label><input id="dialogs-product-url" type="url" maxlength="4096" placeholder="https://…">
@@ -46,6 +72,18 @@
         <p id="dialogs-product-conflict" class="hint" hidden></p><p id="dialogs-product-approval-note" class="hint" aria-live="polite"></p>
         <div class="actions"><button id="dialogs-product-save" class="button secondary" type="submit" disabled>Сохранить изменения</button><button id="dialogs-product-approve" class="button primary" type="button" disabled>Согласовать информацию</button><button id="dialogs-product-reset" class="link-button" type="button" disabled>Сбросить несохранённые изменения</button></div>
       </form>
+      <section class="dialogs-memories" aria-labelledby="dialogs-memories-heading">
+        <div class="panel-heading"><h3 id="dialogs-memories-heading">Сохранённые товары</h3><span id="dialogs-memory-count" class="tiny-tag">0 / 20</span></div>
+        <p class="hint">Назовите товар и укажите слова из первого сообщения поставщику: например, «дровокол», «log splitter», «劈木机». Каждый вариант — с новой строки или через запятую. Однозначное совпадение выбирает сохранённые характеристики и правила этого товара.</p>
+        <form id="dialogs-memory-form">
+          <div class="dialogs-form-grid"><div><label for="dialogs-memory-name">Название товара</label><input id="dialogs-memory-name" type="text" maxlength="120" placeholder="Дровоколы"></div><div><label for="dialogs-memory-aliases">Как товар назван в сообщении</label><textarea id="dialogs-memory-aliases" rows="3" maxlength="3000" placeholder="дровокол
+log splitter
+劈木机"></textarea></div></div>
+          <p id="dialogs-memory-note" class="hint" role="status"></p>
+          <div class="actions"><button id="dialogs-memory-save" class="button primary" type="submit" disabled>Сохранить товар в память</button><button id="dialogs-memory-new" class="link-button" type="button">Новая карточка памяти</button></div>
+        </form>
+        <div id="dialogs-memory-list" class="dialogs-memory-list" aria-label="Память товаров"></div><p id="dialogs-memory-empty" class="hint">Память пока пуста. Согласуйте описание выше и сохраните первый товар.</p>
+      </section>
       <details class="dialogs-inline-details dialogs-settings"><summary>Контекст переговоров и WeChat</summary>
         <form id="dialogs-settings-form"><label for="dialogs-brief">Дополнительное задание (необязательно)</label><textarea id="dialogs-brief" rows="3" maxlength="12000" placeholder="Дополнительные пожелания по закупке и переговорам."></textarea><div class="dialogs-form-grid"><div><label for="dialogs-wechat">Ваш WeChat (необязательно)</label><input id="dialogs-wechat" type="text" maxlength="256" placeholder="WeChat ID"></div><div><label for="dialogs-language">Язык ответов (необязательно)</label><input id="dialogs-language" type="text" maxlength="100" placeholder="По умолчанию — язык продавца"></div></div><p class="hint">После изменения контекста согласуйте сведения о товаре заново.</p><button id="dialogs-save-settings" class="button secondary" type="submit" disabled>Сохранить контекст</button></form>
       </details>
@@ -57,13 +95,7 @@
       <p id="dialogs-open-status" class="hint" role="status" aria-live="polite">Загрузка состояния чатов…</p>
       <div id="dialogs-bindings" class="dialogs-platforms"></div>
       <div class="dialogs-mode" id="dialogs-mode"><div class="panel-heading"><div><h3 id="dialogs-mode-label">С вашим одобрением</h3><p id="dialogs-folder-send-note" class="hint" role="status">Claude готовит черновики. Вы проверяете текст и нажимаете «Отправить».</p></div><div class="dialogs-mode-options"><label class="check dialogs-mode-check"><input id="dialogs-folder-send" type="checkbox" disabled> Отправлять ответы автоматически</label><label class="check dialogs-mode-check"><input id="dialogs-test-mode" type="checkbox" disabled> Тестовый режим — без отправки</label></div></div><p id="dialogs-monitor-note" class="hint" role="status"></p>
-        <div id="dialogs-test-panel" class="dialogs-test-panel" hidden>
-          <div class="panel-heading"><h3 id="dialogs-test-status" role="status">Готов к проверке</h3><span class="dialogs-status test">Без отправки</span></div>
-          <p id="dialogs-test-detail" class="hint"></p>
-          <div id="dialogs-test-result" class="dialogs-test-result" hidden><p id="dialogs-test-recipient"></p><p id="dialogs-test-time" class="hint"></p><pre id="dialogs-test-text"></pre><p id="dialogs-test-result-note" class="hint">Текст введён в чат для проверки. Записи об отправке в истории переписки нет.</p></div>
-          <div class="actions"><button id="dialogs-test-next" class="button primary" type="button" disabled>Проверить первый цикл</button><span id="dialogs-test-count" class="hint"></span></div>
-          <p class="hint">После одного ответа проверка останавливается на всех площадках. «Следующий цикл» учитывает предыдущий ответ только в тестовом режиме и переходит к следующему подходящему чату, в том числе уже прочитанному, если включено чтение прочитанных ответов.</p>
-        </div>
+
       </div>
       <section id="joint-mode" class="joint-mode" aria-labelledby="joint-mode-heading">
         <div class="panel-heading"><div><h3 id="joint-mode-heading">Очередь и диалоги вместе</h3><p class="hint">Сначала первичные обращения. Во время ожидания квот — переписка с поставщиками.</p></div><span id="joint-mode-status" class="dialogs-status" role="status">Загрузка…</span></div>
@@ -73,22 +105,23 @@
         <p id="joint-mode-feedback" class="hint" role="status" hidden></p>
       </section>
       <div class="actions"><button id="dialogs-start" class="button primary" type="button" disabled>Начать мониторинг</button><button id="dialogs-stop" class="button secondary" type="button" disabled>Остановить мониторинг</button><button id="dialogs-scan" class="button secondary" type="button" disabled>Проверить сейчас</button></div>
-      <label class="check"><input id="dialogs-scan-read" type="checkbox" disabled> Проверять также прочитанные ответы поставщиков</label>
+      <label id="dialogs-scan-read-control" class="check"><input id="dialogs-scan-read" type="checkbox" disabled> Проверять также прочитанные ответы поставщиков</label>
       <p id="dialogs-scan-read-note" class="hint" role="status">Ответ готовится только после вашего первичного сообщения и последующего ответа поставщика в доступной истории. Если WeChat сохранён в шаге 2, его предыдущая передача учитывается.</p>
-      <details class="dialogs-inline-details"><summary>Как читаются сообщения</summary><label class="check"><input id="dialogs-read-unread" type="checkbox" checked> Открывать диалоги с новыми сообщениями для чтения</label><p class="hint">Открытие переписки может снять отметку «непрочитано». Проверка прочитанных чатов не зависит от этой настройки. Если история или автор сообщения не распознаны, ответ приостанавливается до проверки.</p></details>
+      <details id="dialogs-read-options" class="dialogs-inline-details"><summary>Как читаются сообщения</summary><label class="check"><input id="dialogs-read-unread" type="checkbox" checked> Открывать диалоги с новыми сообщениями для чтения</label><p class="hint">Открытие переписки может снять отметку «непрочитано». Проверка прочитанных чатов не зависит от этой настройки. Если история или автор сообщения не распознаны, ответ приостанавливается до проверки.</p></details>
     </section>
 
     <section id="dialogs-conversations" class="panel" aria-labelledby="dialogs-conversations-heading">
       <div class="panel-heading"><div><div class="eyebrow">ШАГ 4</div><h2 id="dialogs-conversations-heading">Переписки и ответы</h2></div><span id="dialogs-count" class="tiny-tag">0</span></div>
-      <div class="dialogs-filters"><div><label for="dialogs-filter">Показать</label><select id="dialogs-filter"><option value="all">Все переписки</option><option value="unanswered">Требуют ответа</option><option value="unread">Непрочитанные на площадке</option><option value="takeover">Под моим управлением</option><option value="paused">На паузе</option></select></div><div><label for="dialogs-search">Найти поставщика или сообщение</label><input id="dialogs-search" type="search" placeholder="Имя, площадка или текст"></div></div>
+      <div class="dialogs-filters"><div><label for="dialogs-filter">Показать</label><select id="dialogs-filter"><option value="all">Все переписки</option><option value="unanswered">Требуют ответа</option><option value="completed">Завершены · WeChat найден</option><option value="waiting">Ожидают ответа поставщика</option><option value="blocked">Нужна проверка</option><option value="unread">Непрочитанные на площадке</option><option value="takeover">Под моим управлением</option><option value="paused">На паузе</option></select></div><div><label for="dialogs-search">Найти поставщика или сообщение</label><input id="dialogs-search" type="search" placeholder="Имя, площадка или текст"></div></div>
       <div class="dialogs-workspace">
         <div><div id="dialogs-list" class="dialogs-list" aria-label="Список переписок"></div><p id="dialogs-empty" class="hint">Загрузка переписок…</p></div>
         <section id="dialogs-detail" class="dialogs-detail" hidden aria-label="Выбранная переписка">
           <div class="panel-heading"><div><h3 id="dialogs-supplier"></h3><p id="dialogs-conversation-status" class="hint"></p></div><a id="dialogs-source" target="_blank" rel="noopener noreferrer" hidden>Открыть чат ↗</a></div>
           <div class="actions"><button id="dialogs-takeover" class="button secondary" type="button">Взять разговор на себя</button><button id="dialogs-mute" class="button secondary" type="button">Пауза переписки</button></div>
-          <p id="dialogs-history-note" class="hint"></p><p id="dialogs-reader-detail" class="hint" role="status" hidden></p><p id="dialogs-coverage" class="hint" hidden></p><p id="dialogs-wechat-assessment" class="hint" role="status" hidden></p>
+          <p id="dialogs-workflow-assessment" class="dialogs-workflow-assessment" role="status" hidden></p><p id="dialogs-history-note" class="hint"></p><p id="dialogs-reader-detail" class="hint" role="status" hidden></p><p id="dialogs-coverage" class="hint" hidden></p><p id="dialogs-wechat-assessment" class="hint" role="status" hidden></p>
           <div id="dialogs-history" class="dialogs-history" aria-label="История переписки"></div>
           <p id="dialogs-conversation-test-note" class="dialogs-conversation-test-note" role="status" hidden></p>
+          <details id="dialogs-previous-draft" class="dialogs-previous-draft" hidden><summary>Прежний черновик — нужно заново проверить товар</summary><p id="dialogs-previous-draft-note" class="hint"></p><pre id="dialogs-previous-draft-text" tabindex="0"></pre><p class="hint">Сохранён для просмотра. Для отправки нужен новый ответ с актуальным товаром и перепиской.</p></details>
           <div class="dialogs-draft">
             <div class="panel-heading"><h3>Ответ поставщику</h3><button id="dialogs-folder-draft" class="button secondary" type="button" disabled>Подготовить ответ</button></div>
             <p id="dialogs-generate-hint" class="hint"></p><p id="dialogs-draft-reason" class="hint" hidden></p><p id="dialogs-auto-status" class="hint" role="status" hidden></p>

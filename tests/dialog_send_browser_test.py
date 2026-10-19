@@ -253,6 +253,32 @@ with sync_playwright() as p:
         assert send()['clicked'] is False
     passed('test previews fill real synthetic composers, permanently forbid SEND and clean only owned text on both platforms')
 
+    for platform in ['alibaba','mic']:
+        load(platform)
+        assert preview()['ok']
+        assert send()['clicked'] is False
+        assert clear_preview()['cleared'] and page.locator('textarea').input_value()==''
+        # Explicit approval starts a distinct guarded operation. The original
+        # preview permission remains unable to click Send after cleanup.
+        assert send()['clicked'] is False
+        page.evaluate("guard.operation='approved-new-operation'")
+        approved=page.evaluate("command('PREPARE',{jobId:guard.operation,dialogGuard:guard})");assert approved['ok'],approved
+        approved_send="command('SEND',{jobId:guard.operation,dialogGuard:guard,expectedUrl:location.href,attemptId:guard.operation})"
+        assert page.evaluate(approved_send)['clicked'] is True
+        assert page.evaluate('syntheticClicks')==1
+        assert page.evaluate(approved_send)['clicked'] is False
+    passed('manual approval clears only the owned preview and requires a new guarded operation for exactly one send')
+
+    load();assert preview()['ok']
+    page.locator('textarea').fill('A manual change in the marketplace')
+    assert clear_preview()['cleared'] is False
+    page.evaluate("guard.operation='approved-new-operation'")
+    assert page.evaluate("command('PREPARE',{jobId:guard.operation,dialogGuard:guard})")['ok'] is False
+    assert page.evaluate("command('SEND',{jobId:guard.operation,dialogGuard:guard,expectedUrl:location.href,attemptId:guard.operation})")['clicked'] is False
+    assert page.locator('textarea').input_value()=='A manual change in the marketplace'
+    assert page.evaluate('syntheticClicks')==0
+    passed('approval cannot replace or send a marketplace draft edited manually after preparation')
+
     for platform in ['alibaba','mic','1688']:
         for waiting in [True,False]:
             load(platform)

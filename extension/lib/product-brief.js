@@ -50,7 +50,10 @@ export function normalizeProduct(value,settings={}){
 function filesFingerprint(product){return hash(JSON.stringify(product.files.filter(file=>!file.excluded)));}
 function pendingImages(product){const keys=product.files.filter(file=>!file.excluded).flatMap(file=>file.images.map(image=>image.imageKey));return keys.length&&(!product.extraction||product.extraction.filesFingerprint!==filesFingerprint(product)||keys.some(key=>!product.extraction.processedImageKeys?.includes(key)));}
 function blockedFiles(product){return product.files.filter(file=>!file.excluded&&file.status!=='ready');}
-function clearDrafts(state){for(const item of Object.values(state.conversations||{}))item.draft=null;}
+function clearDrafts(state){for(const item of Object.values(state.conversations||{})){
+  if(state.settings?.workflow24h&&typeof item.draft?.text==='string'&&item.draft.text.trim())item.previousDraft={...item.draft,status:'stale',archivedAt:Date.now(),detail:'Задание изменено. Прежний черновик сохранён для просмотра; подготовьте ответ по актуальному контексту.'};
+  item.draft=null;
+}}
 function bump(state,product){product.revision++;product.approval=null;product.fingerprint=productStateFingerprint(product,state.settings);state.product=product;clearDrafts(state);return product;}
 export function saveProductState(state,patch){
   const input=obj(patch),previous=normalizeProduct(state.product,state.settings),next={...previous};

@@ -60,7 +60,7 @@ export function buildManualProductPrompt(state,request,{now=Date.now()}={}){
 }
 
 export function buildManualDialogPrompt(state,request,{now=Date.now()}={}){
-  const prompt=buildDraftPrompt(state,request),context=JSON.parse(prompt.user);
+  const prompt=buildDraftPrompt(state,request,now),context=JSON.parse(prompt.user);
   const requiredImages=context.messages.flatMap(message=>(message.attachments||[]).flatMap(attachment=>(attachment.resolution?.images||[]).map(image=>requiredImage(image,{messageKey:message.messageKey,name:attachment.name}))));
   const warnings=manualWarnings(context,requiredImages,'dialog');
   return {filename:filename('dialog',context.platform,now),text:render(prompt,context,warnings,requiredImages,'dialog'),warnings,requiredImages,request:requestCopy(request,DIALOG_REQUEST_FIELDS)};

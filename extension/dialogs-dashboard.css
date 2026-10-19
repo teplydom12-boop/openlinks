@@ -1,3 +1,5 @@
+/* Layout display rules must not override semantic visibility. */
+[hidden] { display: none !important; }
 /* Supplier conversations: one Claude connection and a four-step workflow. */
 .sidebar a.nav { text-decoration: none; }
 .dialogs-subtitle { color: var(--muted); font-size: 12px; margin: 9px 0 0; }
@@ -159,3 +161,38 @@ button:focus-visible, a:focus-visible, summary:focus-visible, select:focus-visib
   .dialogs-mode-options { width: 100%; margin-top: 8px; }
   .dialogs-test-panel > .panel-heading { flex-direction: row; flex-wrap: wrap; }
 }
+
+.dialogs-activity { border-color: #c1d5e4; background: #fbfdff; }
+.dialogs-activity > .panel-heading { gap: 16px; align-items: center; }
+.dialogs-activity-current { padding: 16px 18px; border: 1px solid #dce7ee; border-radius: 9px; background: #fff; margin: 18px 0; }
+.dialogs-activity-current > strong { font-size: 15px; color: #2b5067; }
+.dialogs-activity-current p { margin: 8px 0 0; overflow-wrap: anywhere; }
+.dialogs-activity .dialogs-events { max-height: 180px; }
+.dialogs-activity .dialogs-test-panel { background: #eef4fe; border: 1px solid #cbdaf0; border-radius: 10px; padding: 18px; }
+.dialogs-test-result h4 { margin-bottom: 0; color: #2c4e72; }
+.dialogs-test-result pre { max-height: 360px; font-size: 14px; }
+.dialogs-memories { margin-top: 22px; padding: 18px; border: 1px solid #cbded5; background: #f6fbf8; border-radius: 9px; }
+.dialogs-memories .panel-heading { margin-bottom: 8px; }
+.dialogs-memories input[type=text] { width: 100%; box-sizing: border-box; border: 1px solid #dce4e9; border-radius: 7px; padding: 12px; color: #233e4c; }
+.dialogs-memory-list { display: grid; gap: 12px; margin-top: 20px; }
+.dialogs-memory { padding: 14px; border: 1px solid #dbe7e0; border-radius: 8px; background: #fff; min-width: 0; }
+.dialogs-memory.selected { border-color: #63a38c; background: #f0faf5; }
+.dialogs-memory h4 { margin: 0; font-size: 14px; color: #294c3d; overflow-wrap: anywhere; }
+.dialogs-memory p { overflow-wrap: anywhere; margin: 6px 0; }
+.dialogs-memory .actions { margin-top: 10px; }
+.dialogs-workflow-assessment { background: #eef5fb; border: 1px solid #d1e0ee; border-radius: 8px; padding: 12px; line-height: 1.65; overflow-wrap: anywhere; }
+@media (max-width: 720px) { .dialogs-activity > .panel-heading { align-items: flex-start; flex-direction: column; } .dialogs-memories { padding: 12px; } }
+.dialogs-previous-draft { padding: 13px; margin: 14px 0; border: 1px solid #e0d4ba; border-radius: 8px; background: #fffbf2; }
+.dialogs-previous-draft pre { white-space: pre-wrap; overflow-wrap: anywhere; max-height: 260px; overflow: auto; font: inherit; font-size: 12px; }
+.dialogs-review-panel { margin: 18px 0; padding: 20px; border: 2px solid #a8cdbb; background: #f5fcf8; border-radius: 10px; }
+.dialogs-review-panel.test-mode { background: #f2f6ff; border-color: #b7cce8; }
+.dialogs-review-panel > .panel-heading { gap: 12px; flex-wrap: wrap; }
+.dialogs-review-panel h3 { margin: 0; }
+.dialogs-review-panel #dialogs-review-recipient { font-weight: 600; color: #294c3d; overflow-wrap: anywhere; }
+.dialogs-review-panel .actions { margin-top: 14px; flex-wrap: wrap; }
+.dialogs-review-panel textarea { font-size: 14px; line-height: 1.7; }
+#dialogs-review-conflict { color: #9c4b3f; }
+.dialogs-test-platform-controls { display: grid; grid-template-columns: minmax(180px, 1fr) auto; align-items: end; gap: 12px; margin: 16px 0 8px; }
+.dialogs-test-platform-controls label { margin-top: 0; }
+.dialogs-test-platform-controls select { width: 100%; background: #fff; min-height: 42px; }
+@media (max-width: 720px) { .dialogs-test-platform-controls { grid-template-columns: 1fr; } }

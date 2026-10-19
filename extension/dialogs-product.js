@@ -11,7 +11,7 @@ const emptyProduct=()=>({revision:0,files:[],sourceUrl:'',cardText:'',characteri
 
 export function setupProductUI({command,adopt,feedback,getFolderState=()=>({enabled:false}),onDirty=()=>{},onApproved=async()=>{}}){
   let state=null,fingerprint='',baseFingerprint='',baseRevision=0,files=[],dirty=false,settingsDirty=false;
-  let operation='',pendingFiles=[],retryId=null,disablePromise=null;
+  let operation='',pendingFiles=[],retryId=null,disablePromise=null,memoryId='';
   const originals=new Map(),removed=new Set(),expanded=new Set();
   const product=()=>state?.product||emptyProduct();
   const isApproved=()=>!dirty&&!settingsDirty&&!!product().approval&&product().approval.revision===product().revision&&product().approval.fingerprint===fingerprint;
@@ -25,7 +25,7 @@ export function setupProductUI({command,adopt,feedback,getFolderState=()=>({enab
   }
   function markDirty(){dirty=true;pauseAutomatic();render();onDirty();}
   function fileButton(label,handler){const button=element('button',label,'link-button');button.type='button';button.disabled=!!operation;button.addEventListener('click',()=>Promise.resolve().then(handler).catch(error=>feedback(error.message,true)));return button;}
-  async function forgetFile(id){try{await deleteProductFile(id);}catch{feedback('Не удалось удалить локальный исходный файл. Повторите удаление после обновления страницы.',true);}}
+  async function forgetFile(id){if((state?.productMemories?.entries||[]).some(memory=>memory.product?.files?.some(file=>file.id===id)))return;try{await deleteProductFile(id);}catch{feedback('Не удалось удалить локальный исходный файл. Повторите удаление после обновления страницы.',true);}}
   async function removeFile(id){
     files=files.filter(file=>file.id!==id);originals.delete(id);
     if((product().files||[]).some(file=>file.id===id))removed.add(id);else await forgetFile(id);
@@ -67,7 +67,7 @@ export function setupProductUI({command,adopt,feedback,getFolderState=()=>({enab
     const conflict=dirty&&(baseRevision!==(saved.revision||0)||baseFingerprint!==fingerprint);
     const status=$('#dialogs-product-status');status.textContent=dirty?'Есть несохранённые изменения':approved?'Согласовано · версия '+saved.revision:'Нужно согласование · версия '+(saved.revision||0);status.className='dialogs-status '+(approved?'good':'warn');
     $('#dialogs-product-conflict').hidden=!conflict;$('#dialogs-product-conflict').textContent=conflict?'Сохранённая версия изменилась в другом окне или после обновления настроек. Скопируйте нужные правки и загрузите сохранённую версию кнопкой сброса; устаревшие данные не будут перезаписаны.':'';
-    $('#dialogs-product-approval-note').textContent=settingsDirty?'Сохраните контекст переговоров перед согласованием.':dirty?'Изменения ещё не применены. Сохраните их, затем согласуйте новую версию. Обработка ответов приостановлена до нового согласования.':approved?'Согласовано '+displayTime(saved.approval.approvedAt)+'. Эта версия используется для ответов всем наблюдаемым поставщикам. Любое изменение материалов, правил, задания, WeChat или языка требует нового согласования.':invalidFiles?'Есть частично прочитанные, неподдерживаемые или ошибочные файлы. Повторите чтение, исключите их из задания или удалите перед согласованием.':approvalIssue||'Проверьте факты и вопросы. Согласование разрешает использовать сохранённую версию при подготовке черновиков.';
+    $('#dialogs-product-approval-note').textContent=settingsDirty?'Сохраните контекст переговоров перед согласованием.':dirty?'Изменения ещё не применены. Сохраните их, затем согласуйте новую версию. Обработка ответов приостановлена до нового согласования.':approved?'Согласовано '+displayTime(saved.approval.approvedAt)+'. Сохраните эту версию в память под названием товара. Для каждой переписки используются сведения выбранной карточки.':invalidFiles?'Есть частично прочитанные, неподдерживаемые или ошибочные файлы. Повторите чтение, исключите их из задания или удалите перед согласованием.':approvalIssue||'Проверьте факты и вопросы. Согласование разрешает использовать сохранённую версию при подготовке черновиков.';
     for(const el of $('#dialogs-product-form').querySelectorAll('input,textarea'))el.disabled=!!operation;
     $('#dialogs-product-save').disabled=!!operation||!dirty;
     $('#dialogs-product-folder').disabled=!!operation||!sourceReady()||settingsDirty||!getFolderState().enabled||getFolderState().dirty;
@@ -75,7 +75,7 @@ export function setupProductUI({command,adopt,feedback,getFolderState=()=>({enab
     $('#dialogs-product-approve').textContent=approved?'Версия '+saved.revision+' согласована':'Согласовать версию '+(saved.revision||0);
     $('#dialogs-product-reset').disabled=!!operation||!dirty;
     $('#dialogs-product-extraction-state').textContent=operation==='folder'?'Передаю материалы Claude…':operation==='files'?'Читаю выбранные файлы…':operation==='save'?'Сохраняю…':operation==='approve'?'Согласование…':saved.extraction?'Информация готова. Проверьте её перед согласованием.':!getFolderState().enabled?'Сначала подключите Claude в шаге 1.':'';
-    renderFiles();
+    renderFiles();renderMemories();
   }
   async function save(){
     if(!dirty)return;
@@ -100,6 +100,45 @@ export function setupProductUI({command,adopt,feedback,getFolderState=()=>({enab
     });
     pendingFiles=[];render();onDirty();
   }
+  function renderMemories(){
+    const entries=state?.productMemories?.entries||[],list=$('#dialogs-memory-list');
+    if(memoryId&&!entries.some(entry=>entry.id===memoryId))memoryId='';
+    $('#dialogs-memory-count').textContent=entries.length+' / 20';
+    $('#dialogs-memory-empty').hidden=entries.length>0;
+    $('#dialogs-memory-save').disabled=!!operation||!isApproved()||!$('#dialogs-memory-name').value.trim()||!$('#dialogs-memory-aliases').value.trim();
+    $('#dialogs-memory-save').textContent=memoryId?'Обновить выбранный товар в памяти':'Сохранить товар в память';
+    $('#dialogs-memory-new').disabled=!!operation;
+    for(const input of $('#dialogs-memory-form').querySelectorAll('input,textarea'))input.disabled=!!operation;
+    $('#dialogs-memory-note').textContent=memoryId?'Обновится только выбранная карточка. Уже подготовленные ответы с прежним контекстом потребуют повторной проверки.':!isApproved()?'Сначала сохраните и согласуйте сведения о товаре выше.':'Сохраняются согласованные характеристики, вопросы, правила и материалы. Для другого товара заполните редактор заново.';
+    list.replaceChildren();
+    for(const memory of entries){
+      const row=element('article',undefined,'dialogs-memory'+(memory.id===memoryId?' selected':''));row.dataset.memoryId=memory.id;
+      row.append(element('h4',memory.name),element('p',(memory.aliases||[]).join(' · '),'hint'),element('p','Сохранено: '+displayTime(memory.updatedAt||memory.createdAt),'hint'));
+      const actions=element('div',undefined,'actions');
+      const load=fileButton('Открыть для редактирования',()=>withOperation('memory-load',async()=>{
+        if(dirty||settingsDirty)throw new Error('Сначала сохраните или сбросьте изменения редактора и контекста.');
+        const result=await command('MEMORY_LOAD',{id:memory.id});adopt(result);memoryId=memory.id;
+        $('#dialogs-memory-name').value=memory.name;$('#dialogs-memory-aliases').value=(memory.aliases||[]).join('\n');
+        hydrate();feedback('Товар загружен в редактор. После правок согласуйте сведения и обновите карточку памяти.');
+      }));
+      const remove=fileButton('Удалить из памяти',()=>withOperation('memory-delete',async()=>{
+        adopt(await command('MEMORY_DELETE',{id:memory.id}));
+        if(memoryId===memory.id){memoryId='';$('#dialogs-memory-name').value='';$('#dialogs-memory-aliases').value='';}
+        feedback('Карточка удалена из памяти. Переписки без подходящего товара останутся на проверке.');
+      }));remove.classList.add('danger');
+      load.disabled=!!operation||dirty||settingsDirty;actions.append(load,remove);row.append(actions);list.append(row);
+    }
+  }
+  $('#dialogs-memory-form').addEventListener('input',renderMemories);
+  $('#dialogs-memory-form').addEventListener('submit',event=>{event.preventDefault();withOperation('memory-save',async()=>{
+    if(!isApproved())throw new Error('Сначала сохраните и согласуйте сведения о товаре.');
+    const name=$('#dialogs-memory-name').value.trim(),aliases=$('#dialogs-memory-aliases').value;
+    if(!name||!aliases.trim())throw new Error('Укажите название и варианты названия товара из первого сообщения.');
+    const result=await command('MEMORY_SAVE',{name,aliases,...(memoryId?{id:memoryId}:{})});
+    adopt(result);memoryId='';$('#dialogs-memory-name').value='';$('#dialogs-memory-aliases').value='';
+    feedback('Товар сохранён в память. Его сведения применяются к чатам с однозначным совпадением первого вашего сообщения.');
+  });});
+  $('#dialogs-memory-new').addEventListener('click',()=>{memoryId='';$('#dialogs-memory-name').value='';$('#dialogs-memory-aliases').value='';renderMemories();$('#dialogs-memory-name').focus();});
   $('#dialogs-product-form').addEventListener('input',event=>{if(event.target.matches('textarea,input[type=url]'))markDirty();});
   $('#dialogs-product-form').addEventListener('submit',event=>{event.preventDefault();withOperation('save',async()=>{await save();feedback('Сведения о товаре сохранены. Проверьте и согласуйте текущую версию.');});});
   $('#dialogs-product-files').addEventListener('change',event=>{const selected=[...event.target.files];event.target.value='';addFiles(selected);});
@@ -111,6 +150,7 @@ export function setupProductUI({command,adopt,feedback,getFolderState=()=>({enab
     render(nextState,nextAI,nextFingerprint){state=nextState;fingerprint=nextFingerprint||nextState?.product?.fingerprint||'';if(!dirty&&!operation)hydrate();render();},
     isDirty:()=>dirty||settingsDirty,
     isApproved,
+    hasMemories:()=>!dirty&&!settingsDirty&&(state?.productMemories?.entries||[]).length>0,
     setSettingsDirty(value){settingsDirty=value;if(value)pauseAutomatic();render();onDirty();},
   };
 }

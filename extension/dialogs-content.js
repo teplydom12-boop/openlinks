@@ -14,10 +14,18 @@
   const usedTokens = new Set();
   let selectionRows = new Map(), lastTrustedInput = 0, active1688Evidence = null, activeAlibabaEvidence = null, activeMicEvidence = null, pendingReveal = null;
   let modelRequest=null,modelAttempt='',modelAccepted={threadId:'',rows:new Map()};
+  let historyModelRequest=null,historyModelAttempt={fingerprint:'',at:0};
+  const historyBoundaryProofs=new Map();
+  const historyModelTimes=new Map();
   // Opaque tokens bind a reply to the exact current document and transcript.
   // They change on any message/attachment/evidence change, never persist across
   // navigation, and are checked synchronously immediately before editing/clicking.
   let replyEvidence=new Map();
+  const historyLoads=new Map();
+  const firstBuyerProofs=new Map();
+  const latestMessageTimes=new Map();
+  const HISTORY_LOAD_LIMIT=8;
+  let inboxTraversal={token:'',signature:'',steps:0,scroller:null};
   const LIMIT = {conversations: 200, messages: 500, text: 12000, nodes: 3000};
   const HISTORY = '[data-message-history],[data-chat-history],[data-message-list],[role="log"],.message-list,.messages-list,.chat-messages,.message-history,.chat-history,.buyer-messenger-container .message-box .im-message-flow .scroll-box,.conversation-area .window-center-messages-main > .msg-list';
   const ROOT = '[data-dialog-root],[data-chat-root],[data-conversation-root],.chat-panel,.chat-window,.conversation-panel,.message-panel,.ww_box,.buyer-messenger-container .message-box,.conversation-area .conversation-window,.conversation-area';
@@ -32,7 +40,7 @@
   const DIRECTION_CLASSES = {incoming:'inbound',received:'inbound','message-incoming':'inbound','message-received':'inbound','msg-incoming':'inbound',outgoing:'outbound',sent:'outbound','message-outgoing':'outbound','message-sent':'outbound','msg-outgoing':'outbound','system-message':'system','message-system':'system'};
   const clean = (value, max=LIMIT.text) => String(value ?? '').replace(/\u0000/g,'').replace(/\r\n?/g,'\n').trim().slice(0,max);
   const identifier = value => typeof value==='string' && value.length>0 && value.length<=256 && value===value.trim() && !/[\u0000-\u001f\u007f]/u.test(value) ? value : '';
-  function rowSignature(node){const text=node.outerHTML;if(text.length>100000)return '';let a=2166136261,b=2246822507;for(let i=0;i<text.length;i++){a=Math.imul(a^text.charCodeAt(i),16777619);b=Math.imul(b^text.charCodeAt(i),3266489909);}return `${(a>>>0).toString(16)}${(b>>>0).toString(16)}:${text.length}`;}
+  function rowSignature(node,max=100000){const text=node.outerHTML;if(text.length>max)return '';let a=2166136261,b=2246822507;for(let i=0;i<text.length;i++){a=Math.imul(a^text.charCodeAt(i),16777619);b=Math.imul(b^text.charCodeAt(i),3266489909);}return `${(a>>>0).toString(16)}${(b>>>0).toString(16)}:${text.length}`;}
   function platform(url=location.href) {
     try {const host=new URL(url).hostname;return host==='1688.com'||host.endsWith('.1688.com')?'1688':host==='alibaba.com'||host.endsWith('.alibaba.com')?'alibaba':host==='made-in-china.com'||host.endsWith('.made-in-china.com')?'mic':null;} catch {return null;}
   }
@@ -100,13 +108,73 @@
     const role=node.getAttribute('data-sender-role');if(['supplier','seller','vendor'].includes(role))found.add('inbound');else if(['self','buyer'].includes(role))found.add('outbound');else if(role==='system')found.add('system');
     return found.size===1?[...found][0]:'unknown';
   }
+  // Native inbox labels are relative to the browser's local calendar. Never
+  // replace a missing platform date with the time at which we observed it.
+  // Day-only labels are useful diagnostics, but cannot prove a rolling 24h age.
+  function nativeTimestamp(raw,{relative=false,now=Date.now()}={}) {
+    raw=clean(raw,100).replace(/\u00a0/g,' ').replace(/\s+/g,' ');
+    const finish=(at,precision='minute')=>Number.isFinite(at)&&at>0&&at<=now+300000?{at,reliable:!['day','yearless'].includes(precision),precision}:null;
+    if(/^\d{10}(?:\d{3})?$/.test(raw))return finish(Number(raw)*(raw.length===10?1000:1),'millisecond');
+    const local=(year,month,day,hour=0,minute=0,second=0,millisecond=0)=>{
+      const value=new Date(year,month-1,day,hour,minute,second,millisecond);
+      return value.getFullYear()===year&&value.getMonth()===month-1&&value.getDate()===day&&value.getHours()===hour&&value.getMinutes()===minute&&value.getSeconds()===second?value.getTime():NaN;
+    };
+    let match=/^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})(?::(\d{2})(?:\.(\d{1,3}))?)?(Z|[+-]\d{2}:?\d{2})$/i.exec(raw);
+    if(match){
+      const [,y,m,d,h,mi,s='0',ms='0',zone]=match,parts=[y,m,d,h,mi,s].map(Number),utc=new Date(Date.UTC(parts[0],parts[1]-1,parts[2],parts[3],parts[4],parts[5],Number(ms.padEnd(3,'0'))));
+      if(utc.getUTCFullYear()!==parts[0]||utc.getUTCMonth()!==parts[1]-1||utc.getUTCDate()!==parts[2]||utc.getUTCHours()!==parts[3]||utc.getUTCMinutes()!==parts[4]||utc.getUTCSeconds()!==parts[5])return null;
+      const offset=zone.toUpperCase()==='Z'?null:/^([+-])(\d{2}):?(\d{2})$/.exec(zone);
+      if(offset&&(Number(offset[2])>23||Number(offset[3])>59))return null;
+      return finish(utc.getTime()-(offset?(offset[1]==='+'?1:-1)*(Number(offset[2])*60+Number(offset[3]))*60000:0),'second');
+    }
+    match=/^(\d{4})[-/年](\d{1,2})[-/月](\d{1,2})日?(?:[ T](\d{1,2}):(\d{2})(?::(\d{2}))?)?$/.exec(raw);
+    if(match)return finish(local(Number(match[1]),Number(match[2]),Number(match[3]),Number(match[4]||0),Number(match[5]||0),Number(match[6]||0)),match[4]?'minute':'day');
+    if(!relative)return null;
+    const today=new Date(now);
+    match=/^(?:(今天|今日|today|昨天|昨日|yesterday)\s*)?(\d{1,2}):(\d{2})(?::(\d{2}))?$/i.exec(raw);
+    if(match){
+      const day=new Date(today.getFullYear(),today.getMonth(),today.getDate()-( /^(昨天|昨日|yesterday)$/i.test(match[1]||'')?1:0));
+      return finish(local(day.getFullYear(),day.getMonth()+1,day.getDate(),Number(match[2]),Number(match[3]),Number(match[4]||0)));
+    }
+    if(/^(今天|今日|today|昨天|昨日|yesterday)$/i.test(raw)){
+      const day=new Date(today.getFullYear(),today.getMonth(),today.getDate()-( /^(昨天|昨日|yesterday)$/i.test(raw)?1:0));
+      return finish(day.getTime(),'day');
+    }
+    match=/^(\d{1,2})[-/月](\d{1,2})日?(?:[ T](\d{1,2}):(\d{2})(?::(\d{2}))?)?$/.exec(raw);
+    if(match){
+      let year=today.getFullYear(),at=local(year,Number(match[1]),Number(match[2]),Number(match[3]||0),Number(match[4]||0),Number(match[5]||0));
+      if(at>now+300000)at=local(--year,Number(match[1]),Number(match[2]),Number(match[3]||0),Number(match[4]||0),Number(match[5]||0));
+      // A repeated calendar date from a previous year is indistinguishable
+      // from a recent chat here. Retain the label as a hint, never as age proof.
+      return finish(at,'yearless');
+    }
+    return null;
+  }
   function timestamp(node) {
     const raw=node.getAttribute('data-timestamp')||node.querySelector('time[datetime]')?.getAttribute('datetime');
-    if(!raw)return null;
-    if(/^\d{10}(?:\d{3})?$/.test(raw)){const value=Number(raw)*(raw.length===10?1000:1);return Number.isFinite(value)?value:null;}
-    // Locale-dependent labels such as "10:30" or "Yesterday" are not dates.
-    if(!/^\d{4}-\d{2}-\d{2}T.*(?:Z|[+-]\d{2}:?\d{2})$/i.test(raw))return null;
-    const value=Date.parse(raw);return Number.isFinite(value)?value:null;
+    if(raw)return nativeTimestamp(raw)?.at??null;
+    // Chat bubbles often show just HH:mm on old days; it must never be assumed
+    // to mean today. Only a complete native bubble date is accepted here.
+    const selector=platform()==='1688'?'.first-line > .time':platform()==='mic'?':scope > .chatTime':platform()==='alibaba'?'.item-base-info > span:not(.name)':null;
+    const labels=selector?select(node,selector):[];
+    if(labels.length!==1)return null;
+    const label=clean(labels[0].getAttribute('title')||labels[0].textContent,100);
+    const parsed=nativeTimestamp(label,{relative:/^\d{1,2}[-/月]\d{1,2}/.test(label)});
+    return parsed?.reliable?parsed.at:null;
+  }
+  function latestRowTime(row) {
+    const result=(value,source)=>value?{latestMessageAt:value.at,latestMessageAtReliable:value.reliable,latestMessageAtSource:source,latestMessageAtPrecision:value.precision}:null;
+    // Alibaba data-modify-time is a conversation modification time; live model
+    // evidence does not identify it as the newest message timestamp. It stays
+    // in the row-version token only and cannot authorize the 24-hour window.
+    const explicit=row.getAttribute('data-last-message-at');
+    // Invalid explicit metadata must not be silently downgraded to a plausible
+    // label (for example a future server timestamp next to an old HH:mm).
+    if(explicit)return result(nativeTimestamp(explicit),'data-last-message-at')||{latestMessageAt:null,latestMessageAtReliable:false,latestMessageAtSource:'invalid-native-time'};
+    const selector=row.matches(INBOX_1688)?'.content > .conversation > .time':row.matches(INBOX_ALIBABA)?'.contact-info > .contact-time':row.matches(INBOX_MIC)?'.record-chatInfo-right > .record-time':'time[datetime],[data-last-message-time]';
+    const labels=select(row,selector);if(labels.length!==1)return null;
+    const label=labels[0],raw=label.getAttribute('datetime')||label.getAttribute('data-timestamp')||label.getAttribute('title')||label.textContent;
+    return result(nativeTimestamp(raw,{relative:true}),'native-inbox-time');
   }
   function messageNodes(history,live1688=false) {
     const found=select(history,MESSAGE).filter(node=>!node.closest(ITEM)&&!node.closest(EXCLUDED));
@@ -305,11 +373,11 @@
     return scrollers.every(node=>node.scrollTop>=-2&&node.scrollHeight-node.clientHeight-node.scrollTop<=3)?'':'История прокручена выше последних сообщений.';
   }
   function atTail(history) {return tailReason(history)==='';}
-  // A stable latest page is not proof that older messages were loaded. Only
-  // the observed 1688 server boundary has a verified start-of-history meaning.
-  // Alibaba/MIC may paginate or virtualize; their short rendered histories do
-  // not establish that the buyer never shared a contact in an older message.
+  // A stable latest page is not proof that older messages were loaded. 1688
+  // exposes a native boundary; the other adapters require separately verified
+  // native model evidence tied to this exact history, never just scrollTop=0.
   function historyStartKnown(history) {
+    if(['alibaba','mic'].includes(platform())){const context=historyModelContext();return Boolean(context&&context.history===history&&historyBoundaryProofs.get(context.id)===context.signature);}
     if(platform()!=='1688'||!history.matches('.ww_box .ww_message .message-list'))return false;
     const viewers=select(history,'.rc-scrollbars-view');
     if(viewers.length!==1)return false;
@@ -324,23 +392,59 @@
     while(walker.nextNode())if(++count>LIMIT.nodes)return false;
     return true;
   }
+  function workflowEvidence(entry) {
+    const messages=entry.messages||[],last=messages.filter(message=>message.direction!=='system').at(-1);
+    const context=historyModelContext(),model=historyModelTimes.get(entry.id),nativeModelTime=context?.id===entry.id&&context.signature===model?.signature&&last?.id===model?.messageId?nativeTimestamp(String(model.at)):null;
+    const latest=nativeModelTime||(entry.historyTailKnown===true&&entry.historyOrderReliable===true&&last?.at?nativeTimestamp(String(last.at)):null);
+    Object.assign(entry,{latestMessageAt:latest?.at??null,latestMessageAtReliable:latest?.reliable===true,latestMessageAtSource:nativeModelTime?'native-message-model':latest?'last-native-message':'',firstBuyerMessage:null,firstBuyerMessageReliable:false});
+    const previousTime=latestMessageTimes.get(entry.id);
+    if(latest)latestMessageTimes.set(entry.id,{...previousTime,at:latest.at,source:'last-native-message'});
+    else if(previousTime){entry.latestMessageAt=previousTime.at;entry.latestMessageAtReliable=true;entry.latestMessageAtSource='remembered-native-message';}
+    let proof=firstBuyerProofs.get(entry.id);
+    // A correction of an identified first message invalidates its remembered
+    // text. Evidence lives only in this document/account, not in the URL.
+    if(proof?.id&&messages.some(message=>message.id===proof.id&&(message.direction!=='outbound'||message.text!==proof.text))){firstBuyerProofs.delete(entry.id);proof=null;}
+    if(entry.historyStartKnown&&entry.historyStable!==false){
+      const first=messages.find(message=>message.direction==='outbound');
+      const reliable=entry.historyOrderReliable===true&&!entry.coverage?.limited&&!entry.coverage?.unknownSenders&&first?.text&&first.format!=='unrecognized'&&!(first.attachments||[]).some(attachment=>attachment.type!=='link'&&attachment.contentRead!==true);
+      if(reliable){proof={direction:'outbound',text:first.text,...(first.id?{id:first.id}:{}),...(first.at?{at:first.at}:{})};firstBuyerProofs.set(entry.id,proof);}
+      else {firstBuyerProofs.delete(entry.id);proof=null;}
+    }
+    for(const key of [...firstBuyerProofs.keys()].slice(0,-100))firstBuyerProofs.delete(key);
+    if(proof){entry.firstBuyerMessage={...proof};entry.firstBuyerMessageReliable=true;}
+    const load=historyLoads.get(entry.id);
+    if(load)entry.historyLoad={attempts:load.attempts,maxAttempts:HISTORY_LOAD_LIMIT,status:entry.firstBuyerMessageReliable?'complete':load.status,detail:entry.firstBuyerMessageReliable?'Первое ваше сообщение подтверждено началом истории.':load.detail};
+    return entry;
+  }
+  function mergeRowTime(entry,row,preview) {
+    const label=select(row,'.content > .conversation > .time,.contact-info > .contact-time,.record-chatInfo-right > .record-time')[0];
+    const version=JSON.stringify([preview,row.getAttribute('data-modify-time'),row.getAttribute('data-lastmsg-id'),row.getAttribute('data-last-message-at'),label?.textContent||'',label?.getAttribute('title')||'']);
+    let cached=latestMessageTimes.get(entry.id);
+    if(cached?.rowVersion&&cached.rowVersion!==version&&entry.latestMessageAtSource==='remembered-native-message'){
+      latestMessageTimes.delete(entry.id);cached=null;entry.latestMessageAt=null;entry.latestMessageAtReliable=false;entry.latestMessageAtSource='';
+    }
+    const rowTime=latestRowTime(row);
+    if(rowTime&&!['last-native-message','native-message-model'].includes(entry.latestMessageAtSource)&&(rowTime.latestMessageAtReliable||!entry.latestMessageAtReliable))Object.assign(entry,rowTime);
+    if(entry.latestMessageAtReliable){latestMessageTimes.set(entry.id,{at:entry.latestMessageAt,source:entry.latestMessageAtSource,rowVersion:version});}
+    for(const key of [...latestMessageTimes.keys()].slice(0,-100))latestMessageTimes.delete(key);
+  }
   function historyDetail(label,stable,parsed,history){return [!stable?`Ожидание устойчивой истории ${label}.`:'',parsed.pendingFormat?'1688 ещё отображает временную заглушку формата; ожидается повторная проверка.':'',!parsed.reliable?parsed.reason||'Порядок сообщений не подтверждён.':'',tailReason(history),parsed.unsupportedMedia?'Содержимое вложения не прочитано; подготовка ответа заблокирована.':'',parsed.messages.some(message=>message.direction==='unknown')?'Есть сообщения без подтверждённого отправителя.':''].filter(Boolean).join(' ');}
   function readHistory(history,count) {
     if(platform()==='mic'&&history.matches('.conversation-area .window-center-messages-main > .msg-list')){
       const active=select(document,INBOX_MIC).filter(row=>rowActive(row));
       if(active.length!==1||!liveThreadId(active[0])||select(document,'.conversation-area .window-center-messages-main > .msg-list').length!==1)return null;
-      const row=active[0],id=identity(row),parsed=readMessages(history,null,false,row),fingerprint=JSON.stringify([id,parsed.messages]);
+      const row=active[0],id=identity(row),parsed=readMessages(history,null,false,row),startKnown=historyStartKnown(history),fingerprint=JSON.stringify([id,parsed.messages]);
       if(!activeMicEvidence||activeMicEvidence.fingerprint!==fingerprint)activeMicEvidence={fingerprint,since:Date.now()};
       const stable=Date.now()-activeMicEvidence.since>=1000,readComplete=stable&&atTail(history)&&!parsed.pendingFormat,tailKnown=readComplete&&!parsed.unsupportedMedia;
-      return {id,identityReliable:true,title:title(row),url:safeUrl(location.href),unread:unread(row),active:true,orderReliable:parsed.reliable,historyStable:stable,readComplete,historyTailKnown:readComplete,historyOrderReliable:parsed.structuralReliable,historyStartKnown:false,historyComplete:false,tailKnown,messages:parsed.messages,coverage:parsed.coverage,needsRead:!tailKnown,detail:historyDetail('Made-in-China',stable,parsed,history)};
+      return {id,identityReliable:true,title:title(row),url:safeUrl(location.href),unread:unread(row),active:true,orderReliable:parsed.reliable,historyStable:stable,readComplete,historyTailKnown:readComplete,historyOrderReliable:parsed.structuralReliable,historyStartKnown:startKnown,historyComplete:wholeHistory(startKnown,readComplete,parsed,history),tailKnown,messages:parsed.messages,coverage:parsed.coverage,needsRead:!tailKnown,detail:historyDetail('Made-in-China',stable,parsed,history)};
     }
     if(platform()==='alibaba'&&history.matches('.buyer-messenger-container .message-box .im-message-flow .scroll-box')){
       const active=select(document,INBOX_ALIBABA).filter(row=>rowActive(row));
       if(active.length!==1||!liveThreadId(active[0])||select(document,'.buyer-messenger-container .message-box .im-message-flow .scroll-box').length!==1)return null;
-      const row=active[0],id=identity(row),parsed=readMessages(history,null,true),fingerprint=JSON.stringify([id,parsed.messages]);
+      const row=active[0],id=identity(row),parsed=readMessages(history,null,true),startKnown=historyStartKnown(history),fingerprint=JSON.stringify([id,parsed.messages]);
       if(!activeAlibabaEvidence||activeAlibabaEvidence.fingerprint!==fingerprint)activeAlibabaEvidence={fingerprint,since:Date.now()};
       const stable=Date.now()-activeAlibabaEvidence.since>=1000,readComplete=stable&&atTail(history)&&!parsed.pendingFormat,tailKnown=readComplete&&!parsed.unsupportedMedia;
-      return {id,identityReliable:true,title:title(row),url:safeUrl(location.href),unread:unread(row),active:true,orderReliable:parsed.reliable,historyStable:stable,readComplete,historyTailKnown:readComplete,historyOrderReliable:parsed.structuralReliable,historyStartKnown:false,historyComplete:false,tailKnown,messages:parsed.messages,coverage:parsed.coverage,needsRead:!tailKnown,detail:historyDetail('Alibaba',stable,parsed,history)};
+      return {id,identityReliable:true,title:title(row),url:safeUrl(location.href),unread:unread(row),active:true,orderReliable:parsed.reliable,historyStable:stable,readComplete,historyTailKnown:readComplete,historyOrderReliable:parsed.structuralReliable,historyStartKnown:startKnown,historyComplete:wholeHistory(startKnown,readComplete,parsed,history),tailKnown,messages:parsed.messages,coverage:parsed.coverage,needsRead:!tailKnown,detail:historyDetail('Alibaba',stable,parsed,history)};
     }
     // The full 1688 inbox can retain the original touid URL while another row
     // is selected. Until its current thread is proven, that URL is not identity.
@@ -359,12 +463,128 @@
     return {id,identityReliable:provenAccount(root),title:title(root),url:safeUrl(location.href),unread:unread(root),active:true,orderReliable:parsed.reliable,historyTailKnown:atTail(history),historyOrderReliable:parsed.structuralReliable,historyStartKnown:false,historyComplete:false,tailKnown,messages:parsed.messages,coverage:parsed.coverage,needsRead:!tailKnown,detail:!provenAccount(root)?'Аккаунт покупателя не подтверждён; подготовка ответа заблокирована.':!parsed.reliable?'Порядок или содержимое сообщений неоднозначны.':!tailKnown?'Последние сообщения ещё не загружены или история прокручена вверх.':''};
   }
   function frames() {return [...document.querySelectorAll('iframe[src],frame[src]')].slice(0,100).map(frame=>({url:safeUrl(frame.src)?frame.src:'',visible:visible(frame)})).filter(frame=>frame.url);}
+  function historyScroller() {
+    const site=platform(),selector=site==='1688'?'.ww_box .ww_message .message-list .rc-scrollbars-view':site==='alibaba'?'.buyer-messenger-container .message-box .im-message-flow .scroll-box':site==='mic'?'.conversation-area .window-center-messages-main > .msg-list':'';
+    if(!selector)return null;
+    const histories=select(document,selector);if(histories.length!==1)return null;
+    const history=histories[0];
+    if(site==='1688')return history;
+    if(site==='alibaba'){const scroller=history.closest('.common-load-more');return scroller&&visible(scroller)&&scroller.closest('.buyer-messenger-container .message-box .im-message-flow')?scroller:null;}
+    // MIC's full messenger has one known history panel. An inner scrollable
+    // list is preferred; never scroll the entire page or the contact sidebar.
+    const container=history.parentElement;
+    if(/auto|scroll/.test(getComputedStyle(history).overflowY))return history;
+    return container?.matches('.window-center-messages-main')&&visible(container)?container:null;
+  }
+  function scrollBoundary(scroller,start) {
+    const style=getComputedStyle(scroller),reverse=style.display.includes('flex')&&style.flexDirection==='column-reverse';
+    return reverse?(start?-Math.max(0,scroller.scrollHeight-scroller.clientHeight):0):start?0:scroller.scrollHeight;
+  }
+  function inboxScroller() {
+    const site=platform(),selector=site==='1688'?'.ww_conversation_list .conversation-list-scroll':site==='alibaba'?'.buyer-conversation-list .normal-list-container':site==='mic'?'.conversation-record-lst [data-test-id="virtuoso-scroller"]':'';
+    const direct=selector?select(document,selector):[];
+    if(direct.length===1&&/auto|scroll/.test(getComputedStyle(direct[0]).overflowY))return direct[0];
+    const rows=select(document,INBOX);if(!rows.length)return null;
+    const boundary=rows[0].closest(site==='1688'?'.ww_conversation_list':site==='alibaba'?'.buyer-conversation-list':'.conversation-record-lst');
+    if(!boundary||!rows.every(row=>boundary.contains(row)))return null;
+    const candidates=[];
+    for(let node=rows[0].parentElement;node&&boundary.contains(node);node=node.parentElement){if(visible(node)&&rows.every(row=>node.contains(row))&&/auto|scroll/.test(getComputedStyle(node).overflowY))candidates.push(node);if(node===boundary)break;}
+    const overflowing=candidates.filter(node=>node.scrollHeight-node.clientHeight>3);
+    return overflowing.length===1?overflowing[0]:overflowing.length?null:candidates.length===1?candidates[0]:null;
+  }
+  function listCoverage() {
+    const rows=select(document,INBOX),scroller=inboxScroller();
+    if(!scroller)return {token:'',hasMore:false,status:'unsupported',renderedRows:rows.length,complete:false};
+    const signature=JSON.stringify([rows.map(row=>identity(row)),scroller.scrollTop,scroller.scrollHeight,scroller.clientHeight]);
+    if(inboxTraversal.signature!==signature||inboxTraversal.scroller!==scroller)inboxTraversal={...inboxTraversal,token:crypto.randomUUID(),signature,scroller};
+    const hasMore=scroller.scrollHeight-scroller.clientHeight-scroller.scrollTop>3&&inboxTraversal.steps<64;
+    return {token:inboxTraversal.token,hasMore,status:inboxTraversal.steps>=64?'limited':hasMore?'ready':'end_visible',renderedRows:rows.length,complete:false};
+  }
+  function advanceList(request) {
+    if(request?.documentToken!==DOCUMENT_TOKEN||typeof request.listToken!=='string'||!request.listToken)return {ok:false,detail:'Документ или разрешение прокрутки списка устарели.'};
+    const current=snapshot();if(current.status!=='ready')return {ok:false,detail:current.detail};
+    if(Object.values(current.busy).some(Boolean))return {ok:false,busy:true,detail:'Список не прокручивается во время работы пользователя или при открытом черновике.'};
+    const coverage=current.listCoverage,scroller=inboxTraversal.scroller,start=request.direction==='start';
+    if(request.listToken!==coverage.token||!scroller||inboxScroller()!==scroller||(!start&&!coverage.hasMore))return {ok:false,detail:'Список диалогов изменился либо доступная часть уже просмотрена.'};
+    inboxTraversal.token='';inboxTraversal.signature='';
+    if(start){scroller.scrollTop=0;inboxTraversal.steps=0;}
+    else {scroller.scrollTop=Math.min(scroller.scrollHeight-scroller.clientHeight,scroller.scrollTop+Math.max(1,Math.floor(scroller.clientHeight*0.8)));inboxTraversal.steps++;}
+    return {ok:true,advanced:true,direction:start?'start':'next',steps:inboxTraversal.steps};
+  }
+  function loadHistoryStart(request) {
+    if(request?.documentToken!==DOCUMENT_TOKEN||typeof request.conversationId!=='string')return {ok:false,detail:'Документ или диалог изменились.'};
+    const current=snapshot();if(current.status!=='ready')return {ok:false,detail:current.detail};
+    if(Object.values(current.busy).some(Boolean))return {ok:false,busy:true,detail:'История не прокручивается во время ввода пользователя или при открытом черновике.'};
+    const active=current.conversations.filter(row=>row.active&&row.identityReliable),row=active[0];
+    if(active.length!==1||row.id!==request.conversationId)return {ok:false,detail:'Открытый адресат не подтверждён.'};
+    if(row.historyStable!==true)return {ok:false,status:'loading',detail:'Ожидаю устойчивую историю перед чтением первого сообщения.'};
+    if(row.firstBuyerMessageReliable){pendingReveal={platform:platform(),id:row.id,documentToken:DOCUMENT_TOKEN,at:Date.now(),historyOperation:true};return {ok:true,status:'complete',complete:true,detail:'Первое ваше сообщение подтверждено началом истории.'};}
+    const scroller=historyScroller();if(!scroller)return {ok:false,status:'unsupported',detail:'Не подтверждён контейнер ранней истории этой площадки.'};
+    let load=historyLoads.get(row.id);if(!load){load={attempts:0,lastAt:0,status:'loading',detail:''};historyLoads.set(row.id,load);}
+    if(load.attempts>=HISTORY_LOAD_LIMIT&&Date.now()-load.lastAt>=300000){load.attempts=0;load.lastAt=0;load.status='loading';}
+    if(load.attempts>=HISTORY_LOAD_LIMIT)return {ok:false,status:'limited',attempts:load.attempts,detail:'Начало переписки не подтверждено после 8 попыток. Видимое сообщение не считается первым.'};
+    if(load.lastAt&&Date.now()-load.lastAt<1000)return {ok:false,status:'loading',attempts:load.attempts,detail:'Ожидаю загрузку предыдущей части истории.'};
+    load.attempts++;load.lastAt=Date.now();load.status=load.attempts>=HISTORY_LOAD_LIMIT?'limited':'loading';load.detail='Загружаю раннюю историю: требуется подтверждение начала переписки.';
+    pendingReveal={platform:platform(),id:row.id,documentToken:DOCUMENT_TOKEN,at:Date.now(),historyOperation:true};
+    const target=scrollBoundary(scroller,true);
+    // A one-pixel movement retriggers a native load-at-top observer without
+    // clicking a guessed button. A short, stationary list remains unverified.
+    if(scroller.scrollTop===target&&scroller.scrollHeight>scroller.clientHeight)scroller.scrollTop=target===0?1:target+1;
+    scroller.scrollTop=target;
+    if(platform()==='mic'){
+      // The native React scroll handler belongs to .msg-list even where its
+      // scrollable geometry is supplied by the surrounding panel. Notify that
+      // exact history node; a short list need not produce a browser scroll.
+      const history=select(document,'.conversation-area .window-center-messages-main > .msg-list');
+      if(history.length===1)history[0].dispatchEvent(new Event('scroll',{bubbles:true}));
+    }else if(scroller.scrollHeight<=scroller.clientHeight+1){
+      // Short native transcripts can still have older server pages. There is
+      // no physical scroll delta in that case; notify only the verified panel
+      // through its ordinary read-only scroll/wheel handlers, never a guessed
+      // button or an application method. The same eight-attempt cap applies.
+      scroller.dispatchEvent(new Event('scroll'));
+    }
+    for(const key of [...historyLoads.keys()].slice(0,-100))historyLoads.delete(key);
+    return {ok:true,status:'loading',attempts:load.attempts,maxAttempts:HISTORY_LOAD_LIMIT,detail:load.detail};
+  }
   function modelContext(){
     if(platform()!=='1688')return null;
     const active=select(document,INBOX_1688).filter(row=>rowActive(row)),histories=select(document,'.ww_box .message-list');
     if(active.length!==1||!liveThreadId(active[0])||histories.length!==1)return null;
     const rows=select(histories[0],'.rc-scrollbars-view > .message-item-line').slice(-LIMIT.messages),signatures=rows.map(row=>rowSignature(row));
     return {threadId:active[0].id,rows,signatures,fingerprint:JSON.stringify([active[0].id,signatures])};
+  }
+  function historyModelContext(){
+    const site=platform();if(!['alibaba','mic'].includes(site))return null;
+    const active=select(document,site==='alibaba'?INBOX_ALIBABA:INBOX_MIC).filter(row=>rowActive(row));
+    const histories=select(document,site==='alibaba'?'.buyer-messenger-container .message-box .im-message-flow .scroll-box':'.conversation-area .window-center-messages-main > .msg-list');
+    if(active.length!==1||!liveThreadId(active[0])||histories.length!==1)return null;
+    const history=histories[0],signature=rowSignature(history,1000000),id=identity(active[0]);if(!signature)return null;
+    return {platform:site,id,threadId:liveThreadId(active[0]).replace(/^(?:thread|peer):/,''),history,signature,fingerprint:JSON.stringify([site,id,signature])};
+  }
+  function requestHistoryEvidence(result){
+    if(!['alibaba','mic'].includes(result.platform)||result.status!=='ready'||!result.conversations.some(row=>row.active&&row.identityReliable&&!row.historyStartKnown))return;
+    const context=historyModelContext();if(!context)return;
+    if(historyModelAttempt.fingerprint===context.fingerprint&&Date.now()-historyModelAttempt.at<5000)return;
+    if(historyModelRequest?.fingerprint!==context.fingerprint)historyModelRequest={...context,token:crypto.randomUUID()};
+    result.historyEvidenceToken=historyModelRequest.token;
+  }
+  function applyHistoryEvidence(request){
+    if(request?.documentToken!==DOCUMENT_TOKEN||!historyModelRequest||request.historyEvidenceToken!==historyModelRequest.token)return {ok:false,detail:'Разрешение проверки начала истории устарело.'};
+    const current=snapshot(),context=historyModelContext(),evidence=request.evidence;
+    if(current.status!=='ready'||!context||context.fingerprint!==historyModelRequest.fingerprint||request.historyEvidenceToken!==historyModelRequest.token)return {ok:false,detail:'Диалог или сообщения изменились при проверке начала истории.'};
+    historyModelAttempt={fingerprint:context.fingerprint,at:Date.now()};historyModelRequest=null;
+    const schemas={alibaba:'alibaba-no-more-cache-v1',mic:'mic-history-boundary-v1'};
+    if(!evidence||evidence.status!=='ready'||evidence.platform!==context.platform||evidence.url!==location.href||evidence.threadId!==context.threadId||evidence.historySignature!==context.signature||evidence.schema!==schemas[context.platform]||evidence.loading!==false||evidence.limited===true||!Number.isFinite(evidence.capturedAt)||Date.now()-evidence.capturedAt>30000||evidence.capturedAt-Date.now()>5000)return {ok:false,detail:'Площадка ещё не подтвердила начало переписки.'};
+    const row=current.conversations.find(row=>row.active&&row.id===context.id),last=row?.messages.filter(message=>message.direction!=='system').at(-1),time=nativeTimestamp(String(evidence.latestMessageAt));
+    const timeKnown=evidence.covered===true&&last?.id&&last.id===evidence.latestMessageId&&time?.reliable===true;
+    if(timeKnown)historyModelTimes.set(context.id,{signature:context.signature,at:time.at,messageId:last.id});
+    const startKnown=evidence.startKnown===true&&evidence.covered===true;
+    if(!startKnown&&!timeKnown)return {ok:false,detail:'Площадка ещё не подтвердила начало переписки.'};
+    if(startKnown)historyBoundaryProofs.set(context.id,context.signature);
+    for(const key of [...historyBoundaryProofs.keys()].slice(0,-100))historyBoundaryProofs.delete(key);
+    for(const key of [...historyModelTimes.keys()].slice(0,-100))historyModelTimes.delete(key);
+    return {ok:true,startKnown,latestMessageAtKnown:timeKnown===true};
   }
   function requestModelEvidence(result){
     if(result.platform!=='1688'||result.status!=='ready'||!result.conversations.some(row=>row.active&&row.identityReliable&&row.messages.some(message=>message.direction==='unknown')))return;
@@ -411,26 +631,27 @@
     try {
       if(select(document,'#nc_1_wrapper,.nc-container,.geetest_panel,[id*="captcha" i],[class*="captcha" i],iframe[src*="captcha" i],iframe[src*="recaptcha" i],iframe[src*="hcaptcha" i],iframe[src*="_____tmd_____/punish"],#baxia-dialog-content').length){result.status='captcha';result.detail='Видна проверка CAPTCHA; мониторинг ничего не нажимает.';return result;}
       if(select(document,'input[type="password"],[data-login-required="true"],.login-panel').length||/\/(?:login|signin)(?:[/.?]|$)/i.test(location.pathname+location.hash)){
-        if(!loginObserved){micEpoch=crypto.randomUUID();rowTokens=new WeakMap();usedTokens.clear();active1688Evidence=null;activeAlibabaEvidence=null;activeMicEvidence=null;pendingReveal=null;modelRequest=null;modelAttempt='';modelAccepted={threadId:'',rows:new Map()};}loginObserved=true;
+        if(!loginObserved){micEpoch=crypto.randomUUID();rowTokens=new WeakMap();usedTokens.clear();historyLoads.clear();firstBuyerProofs.clear();latestMessageTimes.clear();historyBoundaryProofs.clear();historyModelTimes.clear();historyModelRequest=null;historyModelAttempt={fingerprint:'',at:0};active1688Evidence=null;activeAlibabaEvidence=null;activeMicEvidence=null;pendingReveal=null;modelRequest=null;modelAttempt='';modelAccepted={threadId:'',rows:new Map()};}loginObserved=true;
         result.status='login';result.detail='Нужен вход в аккаунт этой площадки.';return result;
       }
       loginObserved=false;
       if(document.readyState!=='complete'){result.status='loading';result.detail='Страница ещё загружается.';return result;}
       const histories=select(document,HISTORY).filter(node=>!node.closest(ITEM)&&!node.closest(EXCLUDED));
       const leafHistories=histories.filter(node=>!histories.some(other=>other!==node&&node.contains(other)));
-      const conversations=leafHistories.map(history=>readHistory(history,leafHistories.length)).filter(Boolean);
+      const conversations=leafHistories.map(history=>readHistory(history,leafHistories.length)).filter(Boolean).map(workflowEvidence);
       const byId=new Map();
-      for(const entry of conversations){if(byId.has(entry.id)){const other=byId.get(entry.id);other.orderReliable=false;other.tailKnown=false;other.readComplete=false;other.historyTailKnown=false;other.historyOrderReliable=false;other.historyStartKnown=false;other.historyComplete=false;other.detail='Найдено несколько историй одного диалога; нужно уточнить структуру страницы.';}else byId.set(entry.id,entry);}
+      for(const entry of conversations){if(byId.has(entry.id)){const other=byId.get(entry.id);other.orderReliable=false;other.tailKnown=false;other.readComplete=false;other.historyTailKnown=false;other.historyOrderReliable=false;other.historyStartKnown=false;other.historyComplete=false;other.firstBuyerMessage=null;other.firstBuyerMessageReliable=false;other.latestMessageAtReliable=false;firstBuyerProofs.delete(entry.id);other.detail='Найдено несколько историй одного диалога; нужно уточнить структуру страницы.';}else byId.set(entry.id,entry);}
       for(const item of select(document,ITEM).slice(0,LIMIT.conversations)){
         const id=identity(item);if(!id)continue;
         const previewNode=select(item,'[data-message-preview],.message-preview,.conversation-preview,.last-message'+(platform()==='1688'&&item.matches(INBOX_1688)?',.conversation-secondary-line > .desc':platform()==='alibaba'&&item.matches(INBOX_ALIBABA)?',.msg-wrapper .latest-msg > div':platform()==='mic'&&item.matches(INBOX_MIC)?',.rg-last-msg .last-msg':''))[0];const preview=textOf(previewNode,LIMIT.text,true);
-        const existing=byId.get(id);if(existing){if(unread(item)!==null)existing.unread=unread(item);if(!existing.title)existing.title=title(item);if(preview)existing.preview=preview;continue;}
-        byId.set(id,{id,identityReliable:provenAccount(item),title:title(item),url:safeUrl(item.matches('a[href]')?item.href:select(item,'a[href]')[0]?.href||location.href),unread:unread(item),active:item.matches(INBOX)&&rowActive(item),orderReliable:false,tailKnown:false,historyStartKnown:false,historyComplete:false,preview,needsRead:true,messages:[],...selectable(item,id)});
+        const existing=byId.get(id);if(existing){if(unread(item)!==null)existing.unread=unread(item);if(!existing.title)existing.title=title(item);if(preview)existing.preview=preview;mergeRowTime(existing,item,preview);continue;}
+        const cached=latestMessageTimes.get(id),entry={id,identityReliable:provenAccount(item),title:title(item),url:safeUrl(item.matches('a[href]')?item.href:select(item,'a[href]')[0]?.href||location.href),unread:unread(item),active:item.matches(INBOX)&&rowActive(item),orderReliable:false,tailKnown:false,historyStartKnown:false,historyComplete:false,firstBuyerMessage:null,firstBuyerMessageReliable:false,latestMessageAt:cached?.at??null,latestMessageAtReliable:Boolean(cached),latestMessageAtSource:cached?'remembered-native-message':'',preview,needsRead:true,messages:[],...selectable(item,id)};
+        mergeRowTime(entry,item,preview);byId.set(id,entry);
       }
-      result.conversations=[...byId.values()].slice(0,LIMIT.conversations);
+      result.conversations=[...byId.values()].slice(0,LIMIT.conversations);result.listCoverage=listCoverage();
       const nextReplyEvidence=new Map();
       for(const row of result.conversations.filter(item=>item.active)){
-        const signature=JSON.stringify([row.id,row.identityReliable,row.orderReliable,row.tailKnown,row.historyOrderReliable,row.historyTailKnown,row.historyStartKnown,row.historyComplete,row.needsRead,row.messages,row.coverage]);
+        const signature=JSON.stringify([row.id,row.identityReliable,row.orderReliable,row.tailKnown,row.historyOrderReliable,row.historyTailKnown,row.historyStartKnown,row.historyComplete,row.needsRead,row.messages,row.coverage,row.firstBuyerMessage,row.firstBuyerMessageReliable,row.latestMessageAt,row.latestMessageAtReliable]);
         const prior=replyEvidence.get(row.id),entry=prior?.signature===signature?prior:{signature,token:crypto.randomUUID()};
         row.replyFingerprint=entry.token;nextReplyEvidence.set(row.id,entry);
       }
@@ -438,7 +659,7 @@
       if(result.conversations.length){result.status='ready';result.detail=result.conversations.some(item=>item.active)?'Прочитаны доступные сообщения. Предпросмотры других диалогов требуют открытия пользователем.':'Доступен только список диалогов. Откройте нужную переписку, чтобы прочитать сообщения.';}
       else if(select(document,PENDING+(platform()==='mic'?',.conversation-lst .ant-skeleton-active':'')).length){result.status='loading';result.detail='История чата ещё загружается.';}
       else if(result.frames.some(frame=>frame.visible)){result.detail='Чат может находиться во вложенном фрейме; требуется отдельное чтение фрейма.';}
-      requestModelEvidence(result);return result;
+      requestModelEvidence(result);requestHistoryEvidence(result);return result;
     } catch {return {...result,status:'error',detail:'Не удалось прочитать структуру чата. Отправка и ввод не выполнялись.',conversations:[]};}
   }
   function guardReply(expected) {
@@ -449,9 +670,14 @@
     if(current.status!=='ready' || active.length!==1)return invalid('Не подтверждён один открытый диалог без ограничений площадки.');
     const row=active[0];
     if(row.id!==expected.id || row.replyFingerprint!==expected.replyFingerprint || !row.identityReliable)return invalid('Получатель, история или вложения изменились. Ответ остановлен.');
+    if(typeof expected.buyerWechat==='string'&&expected.buyerWechat.trim()){
+      const normalize=value=>String(value||'').normalize('NFKC').replace(/[\u200b-\u200d\ufeff]/g,'').toLowerCase(),needle=normalize(expected.buyerWechat).trim();
+      const contains=text=>{const value=normalize(text);for(let at=value.indexOf(needle);at!==-1;at=value.indexOf(needle,at+1))if(!/[a-z0-9_-]/i.test(value[at-1]||'')&&!/[a-z0-9_-]/i.test(value[at+needle.length]||''))return true;return false;};
+      if(needle&&row.messages.some(message=>contains(message.text)))return invalid('Ваш WeChat уже упомянут в переписке. Диалог завершён, новый ответ не отправляется.');
+    }
     const messages=row.messages.filter(message=>message.direction!=='system');
     if((row.historyOrderReliable??row.orderReliable)!==true || (row.historyTailKnown??row.tailKnown)!==true || row.messages.some(message=>message.direction==='unknown') || messages.at(-1)?.direction!=='inbound')return invalid('Последнее сообщение и порядок истории не подтверждены.');
-    if(!messages.slice(0,-1).some(message=>message.direction==='outbound'))return invalid('Не подтверждён ответ поставщика после вашего первичного обращения.');
+    if(!messages.slice(0,-1).some(message=>message.direction==='outbound')&&!(row.firstBuyerMessageReliable===true&&row.firstBuyerMessage?.direction==='outbound'))return invalid('Не подтверждён ответ поставщика после вашего первичного обращения.');
     return {ok:true,busy:current.busy};
   }
   function guardPreviewCleanup(expected) {
@@ -475,30 +701,29 @@
     if(peers.length!==1||peers[0]!==selected.item)return {ok:false,detail:'Найдено несколько строк одного диалога.'};
     usedTokens.add(request.selectionToken);selectionRows.delete(request.selectionToken);
     selected.item.click();
-    pendingReveal=['alibaba','1688'].includes(platform())?{platform:platform(),id:request.conversationId,documentToken:DOCUMENT_TOKEN,at:Date.now()}:null;
+    pendingReveal={platform:platform(),id:request.conversationId,documentToken:DOCUMENT_TOKEN,at:Date.now()};
     return {ok:true,openedId:request.conversationId};
   }
   function revealLatest(request) {
     const site=platform();
-    if(!['alibaba','1688'].includes(site)||!pendingReveal||pendingReveal.platform!==site||request?.documentToken!==DOCUMENT_TOKEN||request.conversationId!==pendingReveal.id||Date.now()-pendingReveal.at>120000)return {ok:false,detail:'Нет актуального разрешения дочитать открытый диалог.'};
+    if(!['alibaba','1688','mic'].includes(site)||!pendingReveal||pendingReveal.platform!==site||request?.documentToken!==DOCUMENT_TOKEN||request.conversationId!==pendingReveal.id||Date.now()-pendingReveal.at>120000)return {ok:false,detail:'Нет актуального разрешения дочитать открытый диалог.'};
     const current=snapshot();
     if(current.status!=='ready')return {ok:false,detail:current.detail};
     if(Object.values(current.busy).some(Boolean))return {ok:false,busy:true,detail:'Пользователь работает в чате или есть черновик.'};
     const active=current.conversations.filter(row=>row.active&&row.id===request.conversationId&&row.identityReliable);
-    const evidence=site==='alibaba'?activeAlibabaEvidence:active1688Evidence;
+    const evidence=site==='alibaba'?activeAlibabaEvidence:site==='1688'?active1688Evidence:activeMicEvidence;
     if(active.length!==1||!active[0].messages.length||!evidence||Date.now()-evidence.since<1000)return {ok:false,detail:'История выбранного диалога ещё не подтверждена.'};
-    const histories=select(document,site==='alibaba'?'.buyer-messenger-container .message-box .im-message-flow .scroll-box':'.ww_box .ww_message .message-list .rc-scrollbars-view');
-    const scroller=histories.length===1?(site==='alibaba'?histories[0].closest('.common-load-more'):histories[0]):null;
-    if(!scroller||!visible(scroller)||(site==='alibaba'&&!scroller.closest('.buyer-messenger-container .message-box .im-message-flow')))return {ok:false,detail:`Контейнер прокрутки ${site==='1688'?'1688':'Alibaba'} не подтверждён.`};
+    const scroller=historyScroller();
+    if(!scroller||!visible(scroller))return {ok:false,detail:'Контейнер прокрутки истории не подтверждён.'};
     pendingReveal=null;
-    scroller.scrollTop=scroller.scrollHeight;
+    scroller.scrollTop=scrollBoundary(scroller,false);
     return {ok:true,revealedId:request.conversationId};
   }
   for(const type of ['keydown','pointerdown','input','wheel','touchstart'])document.addEventListener(type,event=>{if(event.isTrusted){lastTrustedInput=Date.now();pendingReveal=null;}},{capture:true,passive:true});
-  globalThis.OpenLinksDialogsReader=Object.freeze({snapshot,openConversation,revealLatest,applyModelEvidence,guardReply,guardPreviewCleanup});
+  globalThis.OpenLinksDialogsReader=Object.freeze({snapshot,openConversation,revealLatest,loadHistoryStart,advanceList,applyModelEvidence,applyHistoryEvidence,guardReply,guardPreviewCleanup});
   globalThis.chrome?.runtime?.onMessage?.addListener((message,sender,respond)=>{
-    if(!['DIALOGS_SNAPSHOT','DIALOGS_OPEN_CONVERSATION','DIALOGS_REVEAL_LATEST','DIALOGS_APPLY_MODEL_EVIDENCE'].includes(message?.type))return;
+    if(!['DIALOGS_SNAPSHOT','DIALOGS_OPEN_CONVERSATION','DIALOGS_REVEAL_LATEST','DIALOGS_LOAD_HISTORY_START','DIALOGS_ADVANCE_LIST','DIALOGS_APPLY_HISTORY_EVIDENCE','DIALOGS_APPLY_MODEL_EVIDENCE'].includes(message?.type))return;
     if(sender?.id!==chrome.runtime.id){respond({status:'error',detail:'Источник запроса не подтверждён.'});return;}
-    respond(message.type==='DIALOGS_SNAPSHOT'?snapshot():message.type==='DIALOGS_OPEN_CONVERSATION'?openConversation(message):message.type==='DIALOGS_APPLY_MODEL_EVIDENCE'?applyModelEvidence(message):revealLatest(message));
+    respond(message.type==='DIALOGS_SNAPSHOT'?snapshot():message.type==='DIALOGS_OPEN_CONVERSATION'?openConversation(message):message.type==='DIALOGS_LOAD_HISTORY_START'?loadHistoryStart(message):message.type==='DIALOGS_ADVANCE_LIST'?advanceList(message):message.type==='DIALOGS_APPLY_HISTORY_EVIDENCE'?applyHistoryEvidence(message):message.type==='DIALOGS_APPLY_MODEL_EVIDENCE'?applyModelEvidence(message):revealLatest(message));
   });
 })();

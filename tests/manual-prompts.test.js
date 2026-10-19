@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import {initialDialogs,saveProduct,approveProduct,productFingerprint,productExtractionRequest,buildProductExtractionPrompt,buildDraftPrompt,mergeDialogSnapshot,conversationKey,draftRequest,resolveConversationAttachments,attachmentSourceFingerprint,setDialogSettings} from '../extension/lib/dialogs.js';
+import {initialDialogs,saveProduct,approveProduct,productFingerprint,productExtractionRequest,buildProductExtractionPrompt,buildDraftPrompt,mergeDialogSnapshot,conversationKey,draftRequest,resolveConversationAttachments,attachmentSourceFingerprint,setDialogSettings,saveProductMemory} from '../extension/lib/dialogs.js';
 import {buildManualProductPrompt,buildManualDialogPrompt} from '../extension/lib/manual-prompts.js';
 
 const now=Date.UTC(2026,9,18,11,42,3),id='buyer:me/supplier:private',key=conversationKey('alibaba',id);
@@ -67,6 +67,16 @@ test('dialog TXT keeps the full approved context, recipient language rules and o
   assert.match(result.text,/Верните только текст сообщения/);assert.match(result.text,/MOQ 20 units/);assert.match(result.text,/buyer-contact/);assert.match(result.text,/Chinese/);assert.match(result.text,/Не соглашаться на оплату/);
   assert.equal(result.filename,'openlinks-claude-dialog-alibaba-2026-10-18T11-42-03-000Z.txt');assert.equal(result.filename.includes('supplier'),false);
   assert.deepEqual(result.request,request);assert.deepEqual(state,before);
+});
+
+test('workflow TXT preserves selected product memory and its context guard rather than the current editor',()=>{
+  const state=dialog();setDialogSettings(state,{...state.settings,workflow24h:true},now);const memory=saveProductMemory(state,{name:'Model X',aliases:['220 V']},now);
+  const first={id:'buyer-1',direction:'outbound',text:'Нужно 50 шт. 220 V.',at:now-60000};
+  observe(state,[first,{id:'seller-1',direction:'inbound',text:'MOQ 20 units. Do you need 220 V?',at:now-1000}],{firstBuyerMessage:first,firstBuyerMessageReliable:true,historyStartKnown:true,historyComplete:true});
+  const request=draftRequest(state,key,now);saveProduct(state,{keyPoints:'Unrelated compressor product'},now);
+  const result=buildManualDialogPrompt(state,request,{now}),context=JSON.parse(buildDraftPrompt(state,request,now).user);
+  assert.equal(context.productMemory.id,memory.id);assert.match(context.approvedProduct.keyPoints,/50 шт/);assert.ok(!result.text.includes('Unrelated compressor product'));assert.deepEqual(result.request,request);
+  assert.throws(()=>buildManualDialogPrompt(state,request,{now:now+24*60*60*1000}),/старше 24 часов/);
 });
 
 test('manual export rejects obsolete WeChat invitations and chats still waiting for the supplier',()=>{

@@ -40,6 +40,49 @@ test('completed test cycle survives restart and exposes review data without gran
   assert.doesNotMatch(JSON.stringify(value),/PRIVATE-(?:DOCUMENT|CLEANUP|HISTORY)/);
   assert.deepEqual(restored.sendReceipts,[]);assert.deepEqual(restored.completed,[]);
 });
+test('test platform selection survives storage and is public without completing other platforms or enabling sends',()=>{
+  const context='e'.repeat(64),completed={key:'1688:shop',context,fingerprint:'incoming-1',at:120};
+  for(const platform of ['all','1688','alibaba','mic']) {
+    const raw={autoSend:true,test:{enabled:true,platform,sessionId:id,cycleId:'2fb5a305-cdea-4364-93fb-86f5108664c2',phase:'completed',completed:[completed]}};
+    const stored=normalizeFolder(raw),restarted=normalizeFolder(JSON.parse(JSON.stringify(stored))),view=publicFolder(restarted);
+    assert.equal(stored.test.platform,platform);assert.equal(restarted.test.platform,platform);assert.equal(view.test.platform,platform);
+    assert.equal(restarted.test.phase,'completed');assert.deepEqual(restarted.test.completed,[completed]);assert.deepEqual(restarted.completed,[]);assert.deepEqual(restarted.sendReceipts,[]);assert.equal(view.autoSend,false);
+  }
+  for(const platform of [undefined,null,'unknown','Alibaba',[],{}])assert.equal(normalizeFolder({test:{platform}}).test.platform,'all');
+  assert.equal(normalizeFolder().test.platform,'all');assert.equal(publicFolder(normalizeFolder()).test.platform,'all');
+});
+function manualReview() {
+  const source={tabId:4,frameId:2,documentToken:'PRIVATE-DOCUMENT',sourceUrl:'https://message.alibaba.com/chat',replyFingerprint:'reply-1'};
+  return {phase:'prepared',operationId:id,jobId:'2fb5a305-cdea-4364-93fb-86f5108664c2',key:'alibaba:thread',context:'d'.repeat(64),text:'Please confirm 220 V.',request:{key:'alibaba:thread',revision:3,fingerprint:'history-3',settingsFingerprint:'settings-1',productFingerprint:'memory-specific-context'},source,cleanupToken:{operation:id,platform:'alibaba',id:'PRIVATE-RECIPIENT',documentToken:source.documentToken,sourceUrl:source.sourceUrl,text:'Please confirm 220 V.'},at:200,detail:'Waiting for approval'};
+}
+test('manual composer preview survives storage and exposes only the approval data, never cleanup authority',()=>{
+  const review=manualReview(),state=normalizeFolder({enabled:true,auto:true,autoSend:false,review}),view=publicFolder(state);
+  assert.deepEqual(state.review,review);assert.equal(view.review.operationId,id);assert.equal(view.review.text,review.text);assert.deepEqual(view.review.request,review.request);assert.equal(state.test.enabled,false);
+  assert.equal('source' in view.review,false);assert.equal('cleanupToken' in view.review,false);assert.doesNotMatch(JSON.stringify(view.review),/PRIVATE/);
+  assert.deepEqual(state.sendReceipts,[]);assert.deepEqual(state.completed,[]);assert.equal(state.autoSend,false);
+  assert.deepEqual(normalizeFolder(JSON.parse(JSON.stringify(state))).review,review);
+});
+test('immediate manual approval receives the same request guard as the next storage load',()=>{
+  const state=normalizeFolder();state.review={...manualReview(),request:{...manualReview().request,imageKeys:['resolved-image'],prompt:'PRIVATE-PROMPT'}};
+  const immediate=publicFolder(state),restored=normalizeFolder(JSON.parse(JSON.stringify(state)));
+  assert.equal(immediate.review.phase,'prepared');assert.deepEqual(immediate.review.request,restored.review.request);
+  assert.deepEqual(immediate.review,publicFolder(restored).review);assert.equal('imageKeys' in immediate.review.request,false);assert.doesNotMatch(JSON.stringify(immediate),/PRIVATE-PROMPT/);
+});
+test('interrupted, incomplete and orphaned manual previews preserve cleanup evidence and become blocked',()=>{
+  for(const change of [review=>review.phase='preparing',review=>review.phase='none',review=>review.context='',review=>review.operationId='invalid',review=>review.text='Edited in storage',review=>review.source.documentToken='different']) {
+    const review=manualReview();change(review);const state=normalizeFolder({review});
+    assert.equal(state.review.phase,'blocked');assert.deepEqual(state.review.cleanupToken,review.cleanupToken);assert.equal(state.autoSend,false);assert.deepEqual(state.sendReceipts,[]);
+    assert.equal(normalizeFolder(JSON.parse(JSON.stringify(state))).review.phase,'blocked');
+  }
+  const review=manualReview();review.request.secret='PRIVATE-EXTRA';review.request.prompt='PRIVATE-PROMPT';
+  assert.doesNotMatch(JSON.stringify(normalizeFolder({review}).review.request),/PRIVATE/);
+});
+test('manual skip ledger retains prior choices at capacity and is separate from sent and simulated contexts',()=>{
+  const records=Array.from({length:FOLDER_LIMITS.reviewSkipped+1},(_,index)=>({key:'alibaba:thread-'+index,context:index.toString(16).padStart(64,'0'),at:index}));
+  const state=normalizeFolder({reviewSkipped:[records[0],records[0],{key:'bad',context:'invalid'},...records.slice(1)]});
+  assert.equal(state.reviewSkipped.length,FOLDER_LIMITS.reviewSkipped);assert.deepEqual(state.reviewSkipped[0],records[0]);assert.deepEqual(state.reviewSkipped.at(-1),records[FOLDER_LIMITS.reviewSkipped-1]);
+  assert.equal(publicFolder(state).reviewSkippedCount,FOLDER_LIMITS.reviewSkipped);assert.equal('reviewSkipped' in publicFolder(state),false);assert.deepEqual(state.sendReceipts,[]);assert.deepEqual(state.completed,[]);assert.deepEqual(state.test.completed,[]);
+});
 test('test job completion and cancellation do not suppress real work or create send receipts',()=>{
   for(const status of ['accepted','cancelled']) {
     const state=normalizeFolder({test:{enabled:true,sessionId:id,cycleId:'2fb5a305-cdea-4364-93fb-86f5108664c2',phase:'generating'}});

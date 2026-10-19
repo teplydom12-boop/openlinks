@@ -928,6 +928,7 @@ try:
         settings_ui = prepared_page()
         settings_ui.locator('#dialogs-start').click()
         settings_ui.evaluate('deliverDraft()')
+        expect(settings_ui.locator('#dialogs-draft-text')).to_have_value('Could you confirm the minimum order?')
         settings_ui.locator('#dialogs-draft-text').fill('Keep my edit, but do not use it with changed reading settings.')
         settings_ui.evaluate("async()=>{await chrome.runtime.sendMessage({type:'DIALOGS_SETTINGS',settings:{scanRead:true}});announceDialogs();}")
         expect(settings_ui.locator('#dialogs-draft-text')).to_have_value('Keep my edit, but do not use it with changed reading settings.')

@@ -1,4 +1,4 @@
-import {draftRequest} from './lib/dialogs.js';
+import {draftRequest,textContainsWechatContact,provenFirstBuyerMessage} from './lib/dialogs.js';
 import {withTabOwnership} from './lib/tab-ownership.js';
 import {activate1688} from './lib/native-input.js';
 
@@ -35,7 +35,7 @@ export async function sendDialogReply({api=globalThis.chrome,state,request,text,
       const assertCurrent=async()=>{
         if(await shouldContinue()!==true)throw new Error('Задание остановлено или изменилось.');
         if(state?.running!==true)throw new Error('Мониторинг остановлен.');
-        const current=draftRequest(state,request?.key);
+        const current=draftRequest(state,request?.key,now());
         if(REQUEST_FIELDS.some(field=>current[field]!==request[field]))throw new Error('История, товар или правила изменились. Ответ не отправлен.');
         if(current.purpose==='wechat')throw new Error('Продолжить переписку можно только после ответа поставщика на ваше обращение.');
         const item=state.conversations[current.key];
@@ -44,7 +44,7 @@ export async function sendDialogReply({api=globalThis.chrome,state,request,text,
       };
       const item=await assertCurrent(),platform=item.platform;
       attemptId=dryRun?previewOperation:crypto.randomUUID();
-      const guard={platform,id:item.id,documentToken:source.documentToken,sourceUrl:source.sourceUrl,replyFingerprint:source.replyFingerprint,operation:attemptId};
+      const guard={platform,id:item.id,documentToken:source.documentToken,sourceUrl:source.sourceUrl,replyFingerprint:source.replyFingerprint,operation:attemptId,...(state.settings?.wechat?{buyerWechat:state.settings.wechat}:{})};
       if(dryRun)cleanupToken={operation:attemptId,platform,id:item.id,documentToken:source.documentToken,sourceUrl:source.sourceUrl,text};
       // The shared quota callback runs in the outreach worker's command queue.
       // Reserve BEFORE acquiring tab ownership: that queue can itself be waiting
@@ -68,11 +68,14 @@ export async function sendDialogReply({api=globalThis.chrome,state,request,text,
         const active=Array.isArray(snapshot?.conversations)?snapshot.conversations.filter(row=>row.active):[];
         if(snapshot?.status!=='ready' || snapshot.platform!==platform || snapshot.url!==source.sourceUrl || snapshot.documentToken!==source.documentToken || active.length!==1 || active[0].id!==item.id || active[0].identityReliable!==true || active[0].replyFingerprint!==source.replyFingerprint)throw new Error('Получатель, документ или история изменились. Ответ не отправлен.');
         const row=active[0];
+        // The contact may appear after Claude started working. Check the live
+        // transcript again rather than relying on a cached completion status.
+        if(Array.isArray(row.messages)&&row.messages.some(message=>textContainsWechatContact(message.text,state.settings?.wechat)))throw new Error('Ваш WeChat уже есть в переписке. Диалог завершён; ответ не отправлен.');
         const messages=Array.isArray(row.messages)?row.messages.filter(message=>message.direction!=='system'):[];
         if((row.historyOrderReliable??row.orderReliable)!==true || (row.historyTailKnown??row.tailKnown)!==true || !Array.isArray(row.messages) || row.messages.some(message=>message.direction==='unknown') || messages.at(-1)?.direction!=='inbound')throw new Error('Последние сообщения и порядок истории не подтверждены.');
         // Only freshly read, ordered messages prove that the supplier answered
         // our earlier outreach. Cached or archived history cannot grant access.
-        if(!messages.slice(0,-1).some(message=>message.direction==='outbound'))throw new Error('Не подтверждён ответ поставщика после вашего первичного обращения.');
+        if(!messages.slice(0,-1).some(message=>message.direction==='outbound')&&!(state.settings?.workflow24h&&provenFirstBuyerMessage(row)))throw new Error('Не подтверждён ответ поставщика после вашего первичного обращения.');
         if(initial && busy(snapshot.busy))throw new Error('В чате есть ручной черновик или пользователь работает с редактором.');
         await assertCurrent();
       };

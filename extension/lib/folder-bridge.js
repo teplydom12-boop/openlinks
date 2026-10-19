@@ -3,15 +3,35 @@
 // their unsent preview text and cleanup proof so a restart cannot turn them into sends.
 export const FOLDER_KEY='openlinksClaudeFolder';
 export const FOLDER_HOST='com.openlinks.claude_folder';
-export const FOLDER_LIMITS=Object.freeze({jobs:100,pending:12,poll:20,imageBytes:2*1024*1024,images:8,promptChars:400000,attempts:3,sendReceipts:1000});
+export const FOLDER_LIMITS=Object.freeze({jobs:100,pending:12,poll:20,imageBytes:2*1024*1024,images:8,promptChars:400000,attempts:3,sendReceipts:1000,reviewSkipped:1000});
 const UUID=/^[a-f\d]{8}-[a-f\d]{4}-[a-f\d]{4}-[a-f\d]{4}-[a-f\d]{12}$/i;
 const STATES=new Set(['preparing','unknown','queued','running','done','awaiting_limit','accepted','error','cancelled','stale','sending','sent','send_unknown']);
 export const folderPending=job=>['preparing','unknown','queued','running','done','awaiting_limit'].includes(job.status);
 const short=(value,max=300)=>typeof value==='string'?value.slice(0,max):'';
+function normalizeReview(raw={}) {
+  raw=raw&&typeof raw==='object'&&!Array.isArray(raw)?raw:{};
+  const phases=['none','preparing','prepared','blocked'];
+  const request=raw.request&&typeof raw.request==='object'&&!Array.isArray(raw.request)?{
+    key:short(raw.request.key,1600),revision:Number.isSafeInteger(raw.request.revision)&&raw.request.revision>=0?raw.request.revision:null,
+    fingerprint:short(raw.request.fingerprint,200),settingsFingerprint:short(raw.request.settingsFingerprint,200),productFingerprint:short(raw.request.productFingerprint,200),
+    ...(typeof raw.request.purpose==='string'?{purpose:short(raw.request.purpose,40)}:{})
+  }:null;
+  const source=raw.source?{tabId:Number.isInteger(raw.source.tabId)&&raw.source.tabId>=0?raw.source.tabId:null,frameId:Number.isInteger(raw.source.frameId)&&raw.source.frameId>=0?raw.source.frameId:null,documentToken:short(raw.source.documentToken,200),sourceUrl:short(raw.source.sourceUrl,2000),replyFingerprint:short(raw.source.replyFingerprint,200)}:null;
+  const cleanupToken=raw.cleanupToken?{operation:short(raw.cleanupToken.operation,200),platform:short(raw.cleanupToken.platform,40),id:short(raw.cleanupToken.id,1500),documentToken:short(raw.cleanupToken.documentToken,200),sourceUrl:short(raw.cleanupToken.sourceUrl,2000),text:short(raw.cleanupToken.text,6000)}:null;
+  const review={phase:phases.includes(raw.phase)?raw.phase:'none',operationId:UUID.test(raw.operationId)?raw.operationId:'',jobId:UUID.test(raw.jobId)?raw.jobId:'',key:short(raw.key,1600),context:/^[a-f0-9]{64}$/.test(raw.context)?raw.context:'',text:short(raw.text,6000),request,source,cleanupToken,at:Number.isFinite(raw.at)?raw.at:0,detail:short(raw.detail,1000)};
+  const valid=review.operationId&&review.key&&review.context&&review.text.trim()&&request?.key===review.key&&request.revision!==null&&request.fingerprint&&request.settingsFingerprint&&request.productFingerprint&&source?.tabId!==null&&source?.frameId!==null&&source?.documentToken&&source?.sourceUrl&&source?.replyFingerprint&&cleanupToken?.operation===review.operationId&&cleanupToken.text===review.text&&cleanupToken.documentToken===source.documentToken&&cleanupToken.sourceUrl===source.sourceUrl&&cleanupToken.id&&['1688','alibaba','mic'].includes(cleanupToken.platform);
+  // Retain ownership evidence after interruption. Reloading storage never
+  // authorizes a send or discards the only proof for an unsent editor draft.
+  if(review.phase==='preparing') {review.phase='blocked';review.detail='Заполнение поля было прервано. Проверьте чат; отправка не выполняется автоматически.';}
+  else if(review.phase==='prepared'&&!valid) {review.phase='blocked';review.detail='Данные проверки черновика неполны. Проверьте поле чата перед продолжением.';}
+  else if(review.phase==='none'&&cleanupToken) {review.phase='blocked';review.detail='Сохранён незавершённый черновик в поле чата. Сначала проверьте или пропустите его.';}
+  return review;
+}
 function normalizeTest(raw={}) {
   raw=raw&&typeof raw==='object'?raw:{};
   const enabled=raw.enabled===true,phases=['off','paused','ready','generating','preparing','completed','blocked'];
-  const state={enabled,sessionId:UUID.test(raw.sessionId)?raw.sessionId:'',cycleId:UUID.test(raw.cycleId)?raw.cycleId:'',phase:phases.includes(raw.phase)?raw.phase:enabled?'paused':'off',key:short(raw.key,1600),jobId:UUID.test(raw.jobId)?raw.jobId:'',context:short(raw.context,64),fingerprint:short(raw.fingerprint,200),text:short(raw.text,6000),detail:short(raw.detail,1000),at:Number.isFinite(raw.at)?raw.at:0,source:raw.source?{tabId:Number.isInteger(raw.source.tabId)?raw.source.tabId:null,frameId:Number.isInteger(raw.source.frameId)?raw.source.frameId:null,documentToken:short(raw.source.documentToken,200),sourceUrl:short(raw.source.sourceUrl,2000),replyFingerprint:short(raw.source.replyFingerprint,200)}:null,cleanupToken:raw.cleanupToken?{operation:short(raw.cleanupToken.operation,200),platform:short(raw.cleanupToken.platform,40),id:short(raw.cleanupToken.id,1500),documentToken:short(raw.cleanupToken.documentToken,200),sourceUrl:short(raw.cleanupToken.sourceUrl,2000),text:short(raw.cleanupToken.text,6000)}:null,completed:[],history:[]};
+  const platform=['all','1688','alibaba','mic'].includes(raw.platform)?raw.platform:'all';
+  const state={enabled,platform,sessionId:UUID.test(raw.sessionId)?raw.sessionId:'',cycleId:UUID.test(raw.cycleId)?raw.cycleId:'',phase:phases.includes(raw.phase)?raw.phase:enabled?'paused':'off',key:short(raw.key,1600),jobId:UUID.test(raw.jobId)?raw.jobId:'',context:short(raw.context,64),fingerprint:short(raw.fingerprint,200),text:short(raw.text,6000),detail:short(raw.detail,1000),at:Number.isFinite(raw.at)?raw.at:0,source:raw.source?{tabId:Number.isInteger(raw.source.tabId)?raw.source.tabId:null,frameId:Number.isInteger(raw.source.frameId)?raw.source.frameId:null,documentToken:short(raw.source.documentToken,200),sourceUrl:short(raw.source.sourceUrl,2000),replyFingerprint:short(raw.source.replyFingerprint,200)}:null,cleanupToken:raw.cleanupToken?{operation:short(raw.cleanupToken.operation,200),platform:short(raw.cleanupToken.platform,40),id:short(raw.cleanupToken.id,1500),documentToken:short(raw.cleanupToken.documentToken,200),sourceUrl:short(raw.cleanupToken.sourceUrl,2000),text:short(raw.cleanupToken.text,6000)}:null,completed:[],history:[]};
   if(enabled&&(!state.sessionId||!state.cycleId)){state.phase='blocked';state.detail='Тестовый сеанс повреждён. Проверьте поле и выключите тестовый режим перед новым запуском.';}
   if(state.phase==='preparing'){state.phase='blocked';state.detail='Подготовка тестового поля была прервана. Проверьте вкладку; автоматического повтора нет.';}
   for(const item of (Array.isArray(raw.completed)?raw.completed:[]).slice(-1000))if(item&&/^[a-f0-9]{64}$/.test(item.context))state.completed.push({key:short(item.key,1600),context:item.context,fingerprint:short(item.fingerprint,200),at:Number.isFinite(item.at)?item.at:0});
@@ -26,6 +46,13 @@ export function normalizeFolder(raw={}) {
   let model='haiku';try{model=folderModel(raw.model??'haiku');}catch{}
   const state={enabled:raw.enabled===true,auto:raw.auto===true,autoSend:raw.autoSend===true,model,revision:Number.isSafeInteger(raw.revision)?Math.max(0,raw.revision):0,status:short(raw.status,40)||'disabled',detail:short(raw.detail,800),folder:short(raw.folder,1000),worker:{running:raw.worker?.running===true,heartbeat:Number.isFinite(raw.worker?.heartbeat)?raw.worker.heartbeat:null,status:short(raw.worker?.status,80),pauseReason:short(raw.worker?.pauseReason,80)},claude:{available:raw.claude?.available===true},jobs:[],sendReceipts:[],completed:Array.isArray(raw.completed)?raw.completed.filter(value=>typeof value==='string'&&/^[a-f0-9]{64}$/.test(value)).slice(-1000):[]};
   state.test=normalizeTest(raw.test);if(state.test.enabled)state.autoSend=false;
+  state.review=normalizeReview(raw.review);state.reviewSkipped=[];
+  const skipped=new Set();
+  for(const item of Array.isArray(raw.reviewSkipped)?raw.reviewSkipped:[]){
+    if(state.reviewSkipped.length>=FOLDER_LIMITS.reviewSkipped)break;
+    if(!item||typeof item.key!=='string'||!item.key||item.key.length>1600||!/^[a-f0-9]{64}$/.test(item.context)||skipped.has(item.context))continue;
+    skipped.add(item.context);state.reviewSkipped.push({key:item.key,context:item.context,at:Number.isFinite(item.at)?item.at:0});
+  }
   for(const receipt of (Array.isArray(raw.sendReceipts)?raw.sendReceipts:[]).slice(0,FOLDER_LIMITS.sendReceipts)) {
     if(!receipt||!UUID.test(receipt.id)||!UUID.test(receipt.jobId)||!/^[a-f0-9]{64}$/.test(receipt.context)||!/^[a-f0-9]{64}$/.test(receipt.textHash)||!['reserved','sent','unknown','blocked'].includes(receipt.status)||typeof receipt.key!=='string')continue;
     state.sendReceipts.push({id:receipt.id,jobId:receipt.jobId,context:receipt.context,textHash:receipt.textHash,key:short(receipt.key,1600),fingerprint:short(receipt.fingerprint,200),status:receipt.status==='reserved'?'unknown':receipt.status,at:Number.isFinite(receipt.at)?receipt.at:0});
@@ -39,7 +66,10 @@ export function normalizeFolder(raw={}) {
 }
 export function publicFolder(state) {
   const {source,cleanupToken,history,...test}=state.test;
-  return {enabled:state.enabled,auto:state.auto,autoSend:state.autoSend,test,model:state.model,status:state.status,detail:state.detail,folder:state.folder,worker:state.worker,claude:state.claude,sendReceipts:state.sendReceipts.map(({key,fingerprint,status,at})=>({key,fingerprint,status,at})),jobs:state.jobs.map(({id,kind,key,status,at,detail,testSessionId})=>({id,kind,key,status,at,detail,test:!!testSessionId}))};
+  // Match the next command's storage normalization even when this response
+  // immediately follows preparation and has not gone through loadFolder yet.
+  const {source:reviewSource,cleanupToken:reviewCleanup,...review}=normalizeReview(state.review);
+  return {enabled:state.enabled,auto:state.auto,autoSend:state.autoSend,test,review,reviewSkippedCount:state.reviewSkipped?.length||0,model:state.model,status:state.status,detail:state.detail,folder:state.folder,worker:state.worker,claude:state.claude,sendReceipts:state.sendReceipts.map(({key,fingerprint,status,at})=>({key,fingerprint,status,at})),jobs:state.jobs.map(({id,kind,key,status,at,detail,testSessionId})=>({id,kind,key,status,at,detail,test:!!testSessionId}))};
 }
 export async function folderDigest(value) {
   return Array.from(new Uint8Array(await crypto.subtle.digest('SHA-256',new TextEncoder().encode(typeof value==='string'?value:JSON.stringify(value)))),byte=>byte.toString(16).padStart(2,'0')).join('');

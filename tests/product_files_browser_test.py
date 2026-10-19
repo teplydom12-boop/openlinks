@@ -192,6 +192,18 @@ try:
     assert 'old-orphan' not in result['owners'] and all(x in result['owners'] for x in ['old-kept','fresh-unsaved','mixed-owner']),result
     passed('garbage collection preserves referenced owners, fresh imports and old owners with any fresh asset')
     result=page.evaluate("""async()=>{
+      const {pruneChatAttachmentCache}=await import('/extension/lib/chat-attachments.js');
+      const now=Date.now(),old=now-3*24*60*60*1000;
+      await dbAction(store=>{for(const owner of ['catalog-original','catalog-image','editor-file','chat-file','unreferenced-file'])store.put({key:`test:${owner}`,owner,createdAt:old,blob:new Blob(['saved'])});});
+      const saved={},api={storage:{local:{get:async key=>({[key]:saved[key]}),set:async value=>Object.assign(saved,value)}}};
+      const state={product:{files:[{id:'editor-file'}]},productMemories:{entries:[{id:'wood-splitter',product:{files:[{id:'catalog-original'},{id:'catalog-image'}]}}]},conversations:{supplier:{messages:[{attachments:[{resolution:{ownerId:'chat-file'}}]}]}}};
+      await pruneChatAttachmentCache({api,state,now});
+      return {owners:[...new Set((await allAssets()).map(row=>row.owner))],prunedAt:saved.openlinksMediaPrunedAt,now};
+    }""")
+    assert all(owner in result['owners'] for owner in ['catalog-original','catalog-image','editor-file','chat-file']),result
+    assert 'unreferenced-file' not in result['owners'] and result['prunedAt']==result['now'],result
+    passed('chat cache cleanup preserves files and image owners saved only in product memory')
+    result=page.evaluate("""async()=>{
       await dbAction(store=>store.put({key:'test:quota',owner:'quota',createdAt:Date.now(),blob:{size:files.PRODUCT_FILE_LIMITS.storageBytes}}));
       const [record]=await files.readProductFiles([new File(['new data'],'quota.txt')]);
       const exists=Boolean(await files.readProductOriginal(record.id));await dbAction(store=>store.delete('test:quota'));return {record,exists};

@@ -12,6 +12,7 @@ OBSERVED_ALIBABA = (ROOT / 'tests/fixtures/dialogs-alibaba-observed-structure.ht
 OBSERVED_MIC = (ROOT / 'tests/fixtures/dialogs-mic-observed-structure.html').read_text()
 READER = ROOT / 'extension/dialogs-content.js'
 MODEL_EVIDENCE = (ROOT / 'extension/chat-model-evidence.js').read_text()
+HISTORY_MODEL_EVIDENCE = (ROOT / 'extension/history-model-evidence.js').read_text()
 checks = 0
 TRANSPORT = """
 window.readerListeners=[];
@@ -26,7 +27,7 @@ def passed(name):
 
 with sync_playwright() as p:
     browser = p.chromium.launch(executable_path=os.environ.get('CHROMIUM_PATH', '/usr/bin/chromium'), headless=True)
-    context = browser.new_context(viewport={'width':1280,'height':1000})
+    context = browser.new_context(viewport={'width':1280,'height':1000}, timezone_id='Asia/Irkutsk')
     page = context.new_page()
     errors = []
     page.on('pageerror', lambda error: errors.append(str(error)))
@@ -616,6 +617,229 @@ with sync_playwright() as p:
         assert not page.evaluate('(e)=>OpenLinksDialogsReader.guardReply(e)',expected)['ok']
         assert not page.evaluate('(e)=>OpenLinksDialogsReader.guardReply(e,{preview:true})',expected)['ok']
     passed('fresh guards reject seller-only history, unanswered buyer outreach and unknown initial authors in live and test mode')
+
+    def native_list_time(label, explicit=False):
+        load(OBSERVED_ALIBABA,'https://message.alibaba.com/message/default.htm')
+        page.evaluate('''([label,explicit])=>{
+          Date.now=()=>new Date(2026,9,19,12,0,0).getTime();
+          const row=document.querySelector('.contact-item-container');
+          if(explicit)row.setAttribute('data-last-message-at',label);else row.removeAttribute('data-last-message-at');
+          row.querySelector('.contact-time').textContent=label;
+        }''',[label,explicit])
+        return snapshot()['conversations'][0]
+    local_at=lambda y,m,d,h=0,minute=0: page.evaluate('(v)=>new Date(v[0],v[1]-1,v[2],v[3],v[4]).getTime()',[y,m,d,h,minute])
+    for label,expected in [('09:30', (2026,10,19,9,30)),('Today 09:30',(2026,10,19,9,30)),('今天 09:30',(2026,10,19,9,30)),('Yesterday 23:30',(2026,10,18,23,30)),('昨天 23:30',(2026,10,18,23,30)),('2026-10-18 23:30',(2026,10,18,23,30)),('2026年10月18日 23:30',(2026,10,18,23,30))]:
+        row=native_list_time(label)
+        assert row['latestMessageAtReliable'] and row['latestMessageAt']==local_at(*expected),(label,row)
+    passed('native inbox labels use browser-local today/yesterday and full calendar dates without UTC/local skew')
+    for label,expected in [('10-18 23:30',(2026,10,18,23,30)),('12-31 23:30',(2025,12,31,23,30))]:
+        row=native_list_time(label);assert not row['latestMessageAtReliable'] and row['latestMessageAt']==local_at(*expected)
+    for label in ['2026-10-18','Yesterday','10-18']:
+        row=native_list_time(label);assert row['latestMessageAt'] is not None and not row['latestMessageAtReliable']
+    for label in ['Monday','1天前','25:10','23:00','Yesterday 24:00','2026-02-30 09:00','2026-10-20 09:00','2026-10-18T09:00:00+25:00','2026-02-30T09:00:00Z','2026-10-18T29:00:00Z']:
+        row=native_list_time(label);assert row['latestMessageAt'] is None and not row['latestMessageAtReliable'],label
+    passed('day-only/yearless labels remain imprecise; impossible, missing, ambiguous and future native dates cannot authorize a 24-hour chat')
+    epoch=1792308600000
+    for label in [str(epoch),str(epoch//1000),'2026-10-18T15:30:00+08:00','2026-10-18T07:30:00Z']:
+        row=native_list_time(label,True);assert row['latestMessageAtReliable'] and row['latestMessageAt']==epoch,(label,row['latestMessageAt'])
+    row=native_list_time('9999999999999',True)
+    page.evaluate('document.querySelector(".contact-time").textContent="09:00"')
+    assert not snapshot()['conversations'][0]['latestMessageAtReliable']
+    passed('native millisecond/second/ISO metadata agree; invalid explicit server time cannot fall back to a convenient visible label')
+    load(OBSERVED_ALIBABA,'https://message.alibaba.com/message/default.htm')
+    page.evaluate('document.querySelector(".contact-time").textContent="Unknown date"')
+    assert not snapshot()['conversations'][0]['latestMessageAtReliable']
+    passed('Alibaba contact modification timestamp alone is not evidence of the newest message time')
+
+    load_active1688();page.evaluate('''()=>{
+      const history=document.querySelector('.message-list'),wrapper=document.createElement('div');wrapper.className='ww_message';history.parentElement.insertBefore(wrapper,history);wrapper.append(history);
+      document.querySelectorAll('.first-line > .time')[0].textContent='2026-10-18 09:00:00';document.querySelectorAll('.first-line > .time')[1].textContent='2026-10-19 09:01:00';
+      document.querySelector('.message-item.self').setAttribute('data-message-id','true-first-buyer');
+      document.querySelector('.rc-scrollbars-view').insertAdjacentHTML('afterbegin','<div><span>暂无更多消息</span></div>');
+    }''')
+    active();page.wait_for_timeout(1100);current=active()
+    assert current['firstBuyerMessageReliable'] and current['firstBuyerMessage']['text']=='Do you have model A?'
+    assert current['latestMessageAtReliable'] and current['latestMessageAt']==local_at(2026,10,19,9,1)
+    request={'conversationId':current['id'],'documentToken':snapshot()['documentToken']}
+    assert page.evaluate('(r)=>OpenLinksDialogsReader.loadHistoryStart(r)',request)['complete']
+    page.evaluate('''()=>{document.querySelector('.rc-scrollbars-view > div:first-child').remove();document.querySelector('.message-item.self').closest('.message-item-line').remove()}''')
+    active();page.wait_for_timeout(1100);current=active()
+    assert current['firstBuyerMessageReliable'] and current['firstBuyerMessage']['id']=='true-first-buyer' and not current['historyStartKnown']
+    expected={'platform':'1688','sourceUrl':page.url,'documentToken':snapshot()['documentToken'],'id':current['id'],'replyFingerprint':current['replyFingerprint']}
+    assert page.evaluate('(e)=>OpenLinksDialogsReader.guardReply(e)',expected)['ok']
+    page.evaluate('document.querySelector(".message-item:not(.self)").setAttribute("data-message-id","true-first-buyer")')
+    current=active();assert not current['firstBuyerMessageReliable']
+    passed('actual native history boundary proves the first buyer message; proof survives tail virtualization, participates in reply guard, and conflicting message ID revokes it')
+
+    load_active1688();active();page.wait_for_timeout(1100)
+    assert not active()['firstBuyerMessageReliable']
+    load_active_alibaba();active();page.wait_for_timeout(1100)
+    assert not active()['firstBuyerMessageReliable']
+    load_active_mic();active();page.wait_for_timeout(1100)
+    assert not active()['firstBuyerMessageReliable']
+    passed('a short stationary transcript on any marketplace cannot by itself prove the visible buyer message was the first ever')
+
+    load_active1688();page.evaluate('''()=>{
+      const history=document.querySelector('.message-list'),wrapper=document.createElement('div');wrapper.className='ww_message';history.parentElement.insertBefore(wrapper,history);wrapper.append(history);
+      const scroller=document.querySelector('.rc-scrollbars-view');scroller.style.cssText='height:100px;overflow:auto';for(const item of scroller.children)item.style.minHeight='140px';scroller.scrollTop=scroller.scrollHeight;
+      document.querySelectorAll('.first-line > .time')[0].textContent='2026-10-16 09:00:00';document.querySelectorAll('.first-line > .time')[1].textContent='2026-10-19 09:01:00';
+    }''')
+    active();page.wait_for_timeout(1100);current=active();confirmed_time=current['latestMessageAt'];assert current['latestMessageAtReliable']
+    request={'conversationId':current['id'],'documentToken':snapshot()['documentToken']}
+    assert not page.evaluate('(r)=>OpenLinksDialogsReader.loadHistoryStart({...r,documentToken:"stale"})',request)['ok']
+    effects=page.evaluate('({...readerSideEffects})')
+    result=page.evaluate('(r)=>OpenLinksDialogsReader.loadHistoryStart(r)',request)
+    assert result['ok'] and result['attempts']==1 and page.evaluate('document.querySelector(".rc-scrollbars-view").scrollTop')==0
+    current=active();assert current['latestMessageAtReliable'] and current['latestMessageAt']==confirmed_time and not current['historyTailKnown']
+    assert page.evaluate('(r)=>OpenLinksDialogsReader.revealLatest(r)',request)['ok']
+    assert active()['historyTailKnown'] and page.evaluate('readerSideEffects')==effects
+    page.evaluate('document.querySelector("pre[contenteditable=true]").textContent="Unsent buyer draft"')
+    assert page.evaluate('(r)=>OpenLinksDialogsReader.loadHistoryStart(r)',request)['busy']
+    passed('bounded history loading preserves true latest timestamp while scrolling to old messages, returns to tail, and never clicks, focuses, edits or overwrites drafts')
+
+    request=prepare_alibaba_reveal();page.wait_for_timeout(1100)
+    page.evaluate('const originalNow=Date.now;window.readerClockAdvance=0;Date.now=()=>originalNow()+readerClockAdvance')
+    for attempt in range(1,9):
+        result=page.evaluate('(r)=>OpenLinksDialogsReader.loadHistoryStart(r)',request)
+        assert result['ok'] and result['attempts']==attempt
+        page.evaluate('readerClockAdvance+=1100')
+    result=page.evaluate('(r)=>OpenLinksDialogsReader.loadHistoryStart(r)',request)
+    assert not result['ok'] and result['status']=='limited' and result['attempts']==8
+    assert not active()['firstBuyerMessageReliable'] and page.evaluate('(r)=>OpenLinksDialogsReader.revealLatest(r)',request)['ok']
+    page.evaluate('readerClockAdvance+=300001')
+    assert page.evaluate('(r)=>OpenLinksDialogsReader.loadHistoryStart(r)',request)['attempts']==1
+    passed('eight bounded older-history attempts stop without inventing a first message, allow returning to latest and reset only after five-minute backoff')
+
+    load_active_mic();page.evaluate('const h=document.querySelector(".window-center-messages-main");h.style.cssText="height:70px;overflow-y:auto";document.querySelector(".msg-list").style.minHeight="500px";h.scrollTop=h.scrollHeight')
+    page.evaluate('''()=>{window.nativeHistoryScrolls=0;window.nativeHistoryWheels=0;const h=document.querySelector('.msg-list');h.addEventListener('scroll',e=>{if(e.target===h)nativeHistoryScrolls++});h.addEventListener('wheel',()=>nativeHistoryWheels++)}''')
+    active();page.wait_for_timeout(1100);current=active();request={'conversationId':current['id'],'documentToken':snapshot()['documentToken']}
+    assert page.evaluate('(r)=>OpenLinksDialogsReader.loadHistoryStart(r)',request)['ok']
+    assert page.evaluate('document.querySelector(".window-center-messages-main").scrollTop')==0
+    assert page.evaluate('nativeHistoryScrolls')==1 and page.evaluate('nativeHistoryWheels')==0
+    assert page.evaluate('(r)=>OpenLinksDialogsReader.revealLatest(r)',request)['ok']
+    assert page.evaluate('document.querySelector(".window-center-messages-main").scrollTop')>0
+    passed('MIC scrolls its transcript and notifies the exact native history handler even when the surrounding panel owns scroll geometry; no wheel or focus input')
+
+    load(OBSERVED_ALIBABA,'https://message.alibaba.com/message/default.htm')
+    page.evaluate('''()=>{const list=document.querySelector('.normal-list-container');list.style.cssText='height:120px;overflow-y:auto';for(let i=0;i<8;i++){const row=list.firstElementChild.cloneNode(true);row.setAttribute('data-cid',`91000001${i}-910000009#11011@icbu`);list.append(row)}}''')
+    coverage=snapshot()['listCoverage'];assert coverage['hasMore'] and not coverage['complete']
+    request={'documentToken':snapshot()['documentToken'],'listToken':coverage['token']}
+    effects=page.evaluate('({...readerSideEffects})')
+    assert not page.evaluate('(r)=>OpenLinksDialogsReader.advanceList({...r,listToken:"stale"})',request)['ok']
+    assert page.evaluate('(r)=>OpenLinksDialogsReader.advanceList(r)',request)['ok']
+    assert page.evaluate('document.querySelector(".normal-list-container").scrollTop')>0 and page.evaluate('readerSideEffects')==effects
+    assert not page.evaluate('(r)=>OpenLinksDialogsReader.advanceList(r)',request)['ok']
+    coverage=snapshot()['listCoverage'];request={'documentToken':snapshot()['documentToken'],'listToken':coverage['token'],'direction':'start'}
+    assert page.evaluate('(r)=>OpenLinksDialogsReader.advanceList(r)',request)['ok']
+    assert page.evaluate('document.querySelector(".normal-list-container").scrollTop')==0 and page.evaluate('selectedThreads')==[]
+    passed('inbox traversal scrolls only the verified list with one-use tokens, overlaps batches and resets to newest without selecting or closing chats')
+
+    for text,blocked in [('Added your WeChat wx_buyer-12.',True),('Added ＷＸ＿ＢＵＹＥＲ－１２.',True),('Added wx_\u200bbuyer-12.',True),('Added wx_buyer-123.',False),('Added other_wx_buyer-12.',False)]:
+        load();page.evaluate('(text)=>document.querySelectorAll("[data-message-text]")[1].textContent=text',text)
+        current=active();expected={'platform':'1688','sourceUrl':page.url,'documentToken':snapshot()['documentToken'],'id':current['id'],'replyFingerprint':current['replyFingerprint'],'buyerWechat':'wx_buyer-12'}
+        assert page.evaluate('(e)=>OpenLinksDialogsReader.guardReply(e)',expected)['ok'] is (not blocked)
+    passed('synchronous send guard treats exact own WeChat from either participant as terminal, normalizes Unicode and rejects substring lookalikes')
+
+    def mic_history_evidence(more=False, loading=False):
+        load_active_mic()
+        page.evaluate('''([more,loading])=>{
+          const history=document.querySelector('.msg-list'),supplier=history.querySelector('.msg-box'),buyer=supplier.cloneNode(true),body=buyer.querySelector('.contact-chatInfo');
+          body.className='mine-chatInfo';body.id='10000000-0000-0000-0000-000000000002';buyer.querySelector('.msg-text').textContent='Do you supply wood splitters?';history.insertBefore(buyer,supplier);
+          window.nativeHistoryData={friend:{userId:'synthetic-peer-with-hyphens'},recent:{hasMoreHistoryMsg:more,fetchingHistoryMsg:loading,msgList:[
+            {svrMsgId:body.id,userId:'synthetic-buyer',toUserId:'synthetic-peer-with-hyphens',timestamp:1792300000000,isSend:true,isSystemMsg:false},
+            {svrMsgId:supplier.querySelector('.contact-chatInfo').id,userId:'synthetic-peer-with-hyphens',toUserId:'synthetic-buyer',timestamp:1792300001000,isSend:false,isSystemMsg:false}
+          ]}};
+          Object.defineProperty(history,'__reactInternalInstance$synthetic',{value:{memoizedProps:{className:'msg-list'},return:{memoizedProps:nativeHistoryData,return:null}}});
+        }''',[more,loading])
+        active();page.wait_for_timeout(1100)
+        source=snapshot();evidence=page.evaluate(HISTORY_MODEL_EVIDENCE)
+        return {'documentToken':source['documentToken'],'historyEvidenceToken':source['historyEvidenceToken'],'evidence':evidence}
+    request=mic_history_evidence();effects=page.evaluate('({...readerSideEffects})');count=len(requests)
+    assert request['evidence']['status']=='ready' and request['evidence']['startKnown'] and request['evidence']['covered']
+    assert page.evaluate('(r)=>OpenLinksDialogsReader.applyHistoryEvidence(r)',request)['ok']
+    current=active();assert current['historyStartKnown'] and current['historyComplete'] and current['firstBuyerMessageReliable']
+    assert current['firstBuyerMessage']['text']=='Do you supply wood splitters?' and page.evaluate('readerSideEffects')==effects and len(requests)==count
+    assert not page.evaluate('(r)=>OpenLinksDialogsReader.applyHistoryEvidence(r)',request)['ok']
+    passed('MIC React16 native no-more-history flag proves the first message only for exact recipient and complete ordered DOM UUID coverage; collector is read-only and permit single-use')
+
+    for more,loading in [(True,False),(False,True)]:
+        request=mic_history_evidence(more,loading);assert not request['evidence']['startKnown']
+        assert not page.evaluate('(r)=>OpenLinksDialogsReader.applyHistoryEvidence(r)',request)['ok'] and not active()['firstBuyerMessageReliable']
+    request=mic_history_evidence();page.evaluate("nativeHistoryData.friend.userId='different-peer'")
+    assert page.evaluate(HISTORY_MODEL_EVIDENCE)['status']=='unsupported'
+    request=mic_history_evidence();page.evaluate("nativeHistoryData.recent.msgList.unshift({svrMsgId:'10000000-0000-0000-0000-000000000003',userId:'synthetic-buyer',toUserId:'synthetic-peer-with-hyphens',timestamp:1792299999000,isSend:true,isSystemMsg:false})")
+    evidence=page.evaluate(HISTORY_MODEL_EVIDENCE);assert evidence['status']=='ready' and not evidence['covered'] and not evidence['startKnown']
+    passed('pending native pages, active-recipient mismatch and virtualized missing oldest model messages cannot grant first-message evidence')
+
+    request=mic_history_evidence(True,False)
+    page.evaluate('nativeHistoryData.recent.lastMsgTimestamp=1792300001000')
+    request['evidence']=page.evaluate(HISTORY_MODEL_EVIDENCE)
+    result=page.evaluate('(r)=>OpenLinksDialogsReader.applyHistoryEvidence(r)',request)
+    assert result['ok'] and not result['startKnown'] and result['latestMessageAtKnown']
+    current=active();assert current['latestMessageAt']==1792300001000 and current['latestMessageAtSource']=='native-message-model' and current['latestMessageAtReliable']
+    assert not current['firstBuyerMessageReliable'] and not current['historyStartKnown']
+    passed('native newest-message timestamp can establish chat age before older pages finish without granting first-message proof')
+
+    request=mic_history_evidence(True,False)
+    page.evaluate('nativeHistoryData.recent.lastMsgTimestamp=1792300001107')
+    evidence=page.evaluate(HISTORY_MODEL_EVIDENCE)
+    assert evidence['latestMessageAt']==1792300001000 and evidence['covered'] and not evidence['startKnown']
+    page.evaluate('nativeHistoryData.recent.lastMsgTimestamp=1792300002501')
+    assert 'latestMessageAt' not in page.evaluate(HISTORY_MODEL_EVIDENCE)
+    passed('MIC allows bounded sub-second native summary bookkeeping skew but returns the exact newest message time; later missing-message metadata blocks age proof')
+
+    request=mic_history_evidence(True,False)
+    page.evaluate('''()=>{
+      const history=document.querySelector('.msg-list'),row=document.createElement('div');row.className='msg-box';
+      row.innerHTML='<div class="msg-system-box"><div class="msg-inquiry-assign iAmBuyer">Synthetic inquiry assignment notice</div></div>';history.prepend(row);
+      const msg={svrMsgId:'10000000-0000-0000-0000-000000000003',friendId:'synthetic-peer-with-hyphens',timestamp:1792299999000,isSend:false,isSystemMsg:false};
+      nativeHistoryData.recent.msgList.unshift(msg);nativeHistoryData.recent.lastMsgTimestamp=1792300001000;
+      Object.defineProperty(row,'__reactInternalInstance$synthetic',{value:{memoizedProps:{className:'msg-box'},return:{memoizedProps:{friend:nativeHistoryData.friend,msg},return:null}}});
+    }''')
+    active();page.wait_for_timeout(1100);source=snapshot()
+    request={'documentToken':source['documentToken'],'historyEvidenceToken':source['historyEvidenceToken'],'evidence':page.evaluate(HISTORY_MODEL_EVIDENCE)}
+    assert request['evidence']['covered'] and request['evidence']['latestMessageAt']==1792300001000 and not request['evidence']['startKnown']
+    assert page.evaluate('(r)=>OpenLinksDialogsReader.applyHistoryEvidence(r)',request)['latestMessageAtKnown']
+    page.evaluate("document.querySelector('.msg-inquiry-assign').className='unknown-message-card'")
+    assert page.evaluate(HISTORY_MODEL_EVIDENCE)['status']=='unsupported'
+    passed('MIC native inquiry-assignment model is matched to its exact known system card and recipient, preserving full coverage without ignoring unknown cards')
+
+    request=mic_history_evidence();page.evaluate("document.querySelector('.mine-chatInfo .msg-text').textContent='Edited first outreach'")
+    assert not page.evaluate('(r)=>OpenLinksDialogsReader.applyHistoryEvidence(r)',request)['ok']
+    request=mic_history_evidence();request['evidence']['threadId']='another-peer'
+    assert not page.evaluate('(r)=>OpenLinksDialogsReader.applyHistoryEvidence(r)',request)['ok']
+    request=mic_history_evidence();page.evaluate("()=>{window.nativeGetterCalls=0;Object.defineProperty(nativeHistoryData.recent,'hasMoreHistoryMsg',{get(){nativeGetterCalls++;return false}})}")
+    assert page.evaluate(HISTORY_MODEL_EVIDENCE)['status']=='unsupported' and page.evaluate('nativeGetterCalls')==0
+    passed('history-boundary evidence rejects changed DOM/thread and native getters are never invoked')
+
+    def alibaba_history_evidence(no_more=True, loading=False):
+        load_active_alibaba()
+        page.evaluate('''([noMore,loading])=>{
+          const history=document.querySelector('.scroll-box'),cid=document.querySelector('.contact-item-container').getAttribute('data-cid'),accountId=930000001;
+          const messages=[{messageId:940000001,conversationCode:cid,contact:{accountId},sendTime:1792300000000},{messageId:940000002,conversationCode:cid,contact:{accountId},sendTime:1792300001000}];
+          const rows=[...history.querySelectorAll('.message-item-wrapper')];for(let i=0;i<2;i++)Object.defineProperty(rows[i],'__reactFiber$synthetic',{value:{memoizedProps:{className:'message-item-wrapper'},return:{memoizedProps:{itemData:messages[i]},return:null}}});
+          window.nativeHistoryData={summaryData:{contact:{cid,accountId}},sessionData:{[accountId]:messages},noMoreCache:{[accountId]:noMore},msgLoading:loading};
+          Object.defineProperty(history,'__reactFiber$synthetic',{value:{memoizedProps:{list:[...messages,{contact:{cid},content:'Synthetic platform notice'}]},return:{memoizedProps:nativeHistoryData,return:null}}});
+        }''',[no_more,loading])
+        active();page.wait_for_timeout(1100);source=snapshot()
+        return {'documentToken':source['documentToken'],'historyEvidenceToken':source['historyEvidenceToken'],'evidence':page.evaluate(HISTORY_MODEL_EVIDENCE)}
+    request=alibaba_history_evidence();evidence=request['evidence'];assert evidence['status']=='ready' and evidence['startKnown'] and evidence['covered'] and evidence['cacheChecked']
+    assert page.evaluate('(r)=>OpenLinksDialogsReader.applyHistoryEvidence(r)',request)['ok']
+    current=active();assert current['historyStartKnown'] and current['firstBuyerMessageReliable'] and current['firstBuyerMessage']['text']=='Do you have stock?'
+    passed('Alibaba native account-keyed no-more cache is bound to active conversation, full message cache and exact rendered message IDs before proving first outreach')
+    for no_more,loading in [(False,False),(True,True)]:
+        request=alibaba_history_evidence(no_more,loading);assert not request['evidence']['startKnown']
+        assert not page.evaluate('(r)=>OpenLinksDialogsReader.applyHistoryEvidence(r)',request)['ok']
+    request=alibaba_history_evidence();page.evaluate("nativeHistoryData.summaryData.contact.cid='910000002-910000009#11011@icbu'")
+    assert page.evaluate(HISTORY_MODEL_EVIDENCE)['status']=='unsupported'
+    request=alibaba_history_evidence();page.evaluate('''()=>{const data=nativeHistoryData;data.sessionData[930000001]=[{messageId:940000000,conversationCode:data.summaryData.contact.cid,contact:{accountId:930000001},sendTime:1792299999000},...data.sessionData[930000001]]}''')
+    evidence=page.evaluate(HISTORY_MODEL_EVIDENCE);assert evidence['status']=='ready' and not evidence['startKnown'] and not evidence['covered']
+    passed('Alibaba loading, incomplete pagination, mismatched recipient and cache history omitted from the DOM cannot authorize first-message context')
+    request=alibaba_history_evidence();page.evaluate('''()=>{window.nativeGetterCalls=0;Object.defineProperty(nativeHistoryData.noMoreCache,'930000001',{get(){nativeGetterCalls++;return true}})}''')
+    assert page.evaluate(HISTORY_MODEL_EVIDENCE)['status']=='unsupported' and page.evaluate('nativeGetterCalls')==0
+    request=alibaba_history_evidence();page.evaluate('nativeHistoryData.noMoreCache=Object.create({930000001:true})')
+    assert page.evaluate(HISTORY_MODEL_EVIDENCE)['status']=='unsupported'
+    passed('Alibaba boundary cache requires own plain data properties and never calls getters or trusts inherited flags')
 
     assert not errors, errors
     browser.close()

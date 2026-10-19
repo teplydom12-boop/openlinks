@@ -134,6 +134,7 @@ export async function pruneChatAttachmentCache({api=globalThis.chrome,state,now=
   const key='openlinksMediaPrunedAt',saved=(await api.storage.local.get(key))[key];
   if(Number.isFinite(saved)&&saved<=now&&now-saved<60*60*1000)return;
   const retained=new Set((state.product?.files||[]).map(file=>file.id));
+  for(const memory of state.productMemories?.entries||[])for(const file of memory.product?.files||[])retained.add(file.id);
   for(const conversation of Object.values(state.conversations||{}))for(const message of [...(conversation.messages||[]),...(conversation.archivedMessages||[])])for(const attachment of message.attachments||[])if(attachment.resolution?.ownerId)retained.add(attachment.resolution.ownerId);
   // A recent unreferenced file may still be edited in a product tab. Its grace
   // period protects those imports; retained product/history assets never expire.
