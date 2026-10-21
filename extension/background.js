@@ -8,7 +8,7 @@ import {localTimestamp} from './lib/time.js';
 import {installDialogMonitor,isMonitoredTab} from './dialog-monitor.js';
 import {withTabOwnership} from './lib/tab-ownership.js';
 import {WORK_COORDINATOR_KEY,normalizeWorkCoordinator,assessWorkCoordination} from './lib/work-coordinator.js';
-import {folderDigest} from './lib/folder-bridge.js';
+import {evaluateSendPermission} from './lib/send-permission.js';
 const {makeRule,mergeRule}=globalThis.OpenLinksRules;
 const routes1688=globalThis.OpenLinks1688;
 const supplierChat=globalThis.OpenLinksSupplierChat;
@@ -502,22 +502,43 @@ async function performSend(state, job) {
   // Focus may fail while the user closes or minimizes a window. Finish that
   // before reserving a send so a failed activation is never an unknown click.
   await activateOutreachTab(job);
+  const sendFrame=(await frames(job)).find(frame=>frame.frameId===job.frameId);
+  if(!sendFrame || sendFrame.url!==job.reviewUrl || typeof sendFrame.documentId!=='string' || !sendFrame.documentId) {
+    await askForHelp(state,job,'Документ чата изменился после подготовки. Повторно проверю получателя и редактор до отправки.','send');return;
+  }
+  job.sendDocumentId=sendFrame.documentId;
   // Persist BEFORE the side effect. Never retry a send after a disconnect/restart.
   job.status = 'sending';
   job.attemptId = crypto.randomUUID();
   job.sendAt = Date.now();
-  state.slots.push({platform:job.platform, kind:'send', at:job.sendAt, jobId:job.id});
+  const attemptId=job.attemptId;
+  const sendReservation={platform:job.platform, kind:'send', at:job.sendAt, jobId:job.id};
+  state.slots.push(sendReservation);
   event(state, 'send_attempt', job, 'Редактор чата и текст проверены повторно. Лимит отправки зарезервирован; нажимаю кнопку ровно один раз. Формы Inquiry не используются.');
   await save(state);
   let result;
-  try {result=await call(job, job.frameId, 'SEND', {expectedUrl:job.reviewUrl,attemptId:job.attemptId});}
+  try {result=await call(job, job.frameId, 'SEND', {expectedUrl:job.reviewUrl,attemptId:job.attemptId},job.sendDocumentId);}
   catch {
     event(state,'send_disconnect',job,'Ответ вкладки потерян после начала попытки. Нажатие могло сработать; повтор и ожидание результата отключены.','observation');
     await interruptedSend(state,job,'Попытка зарегистрирована без ответа вкладки.');
     return;
   }
   if(result?.clicked!==true && result?.clicked!==false){await interruptedSend(state,job,'Вкладка не сообщила, было ли выполнено нажатие.');return;}
-  if(!result.clicked){await askForHelp(state,job,result.reason || 'Отправка остановлена до нажатия','send');return;}
+  if(!result.clicked){
+    // Only the content script's explicit proof for a fresh, never-clicked
+    // operation can release this reservation. A legacy false reply or a
+    // duplicate operation may follow an earlier click and keeps its quota.
+    if(result.notAttempted===true && job.attemptId===attemptId && job.sendAt===sendReservation.at) {
+      const index=state.slots.indexOf(sendReservation);
+      if(index!==-1) {
+        state.slots.splice(index,1);
+        event(state,'send_not_clicked',job,'Проверка остановила отправку до нажатия кнопки. Резерв этой попытки отменён; прежние отправки и посещения остаются учтены.','observation');
+        Object.assign(state.activity,{attemptId,sendAt:sendReservation.at,reservationReleased:true});
+        delete job.attemptId;delete job.sendAt;delete job.sendDocumentId;
+      }
+    }
+    await askForHelp(state,job,result.reason || 'Отправка остановлена до нажатия','send');return;
+  }
   event(state,'clicked',job,'Кнопка чата нажата. Доставка и прочтение не проверяются.');
   if(job.platform==='1688' && result.accepted!==true) {
     await interruptedSend(state,job,result.reason || 'Редактор 1688 не очистился после нажатия.');return;
@@ -962,27 +983,10 @@ async function dispatch(message, sender) {
 // a permission is tied to an already approved and reserved real operation.
 async function sendPermission(message,sender) {
   const values=await chrome.storage.local.get([KEY,'openlinksDialogs','openlinksClaudeFolder']);
-  const state=migrateState(values[KEY]),platform=classify(sender.url).platform;
-  if(typeof message.expectedUrl!=='string'||message.expectedUrl!==sender.url)return false;
-  if(message.scope==='outreach') {
-    const job=state.queue.find(item=>item.id===state.activeId);
-    if(!state.running||state.learning||!job||job.status!=='sending'||job.approved!==true||
-      job.id!==message.jobId||job.attemptId!==message.attemptId||!job.attemptId||
-      job.tabId!==sender.tab.id||job.frameId!==sender.frameId||job.platform!==platform||
-      job.reviewUrl!==message.expectedUrl||job.message!==message.message)return false;
-    if(!state.slots.some(slot=>slot.kind==='send'&&slot.jobId===job.id&&slot.platform===platform&&slot.at===job.sendAt))return false;
-    return !await isMonitoredTab(job.tabId);
-  }
-  if(message.scope==='dialog') {
-    const folder=values.openlinksClaudeFolder,dialogs=values.openlinksDialogs;
-    if(folder?.test?.enabled===true||dialogs?.running!==true||dialogs.settings?.wechatAudit===true||
-      dialogs.bindings?.[platform]?.tabId!==sender.tab.id||message.jobId!==message.attemptId||
-      message.dialogOperation!==message.attemptId||typeof message.dialogId!=='string')return false;
-    const receipt=folder?.sendReceipts?.find(item=>item.id===message.attemptId&&item.status==='reserved'&&item.key===platform+':'+message.dialogId);
-    return !!receipt&&typeof message.message==='string'&&receipt.textHash===await folderDigest(message.message)&&
-      state.slots.some(slot=>slot.kind==='send'&&slot.platform===platform&&slot.dialogAttemptId===message.attemptId&&slot.jobId==='dialog:'+receipt.jobId);
-  }
-  return false;
+  return evaluateSendPermission({message,sender,runtimeId:chrome.runtime.id,state:migrateState(values[KEY]),
+    dialogs:values.openlinksDialogs,folder:values.openlinksClaudeFolder,isMonitoredTab,
+    getCurrentFrame:async(tabId,frameId)=>(await chrome.webNavigation.getAllFrames({tabId}))?.find(frame=>frame.frameId===frameId),
+  });
 }
 chrome.runtime.onMessage.addListener((message,sender,respond) => {
   if(message?.type==='OPENLINKS_TEST_SEND_GUARD') {
@@ -990,8 +994,8 @@ chrome.runtime.onMessage.addListener((message,sender,respond) => {
     // outreach serializer: that queue may be awaiting this very content SEND.
     let valid=false;
     try {valid=sender.id===chrome.runtime.id && Number.isInteger(sender.tab?.id) && !!classify(sender.url).platform;}catch{}
-    if(!valid){respond({ok:false,canSend:false});return;}
-    sendPermission(message,sender).then(canSend=>respond({ok:true,canSend}),()=>respond({ok:false,canSend:false}));
+    if(!valid){respond({ok:false,canSend:false,reasonCode:'invalid_sender'});return;}
+    sendPermission(message,sender).then(respond,()=>respond({ok:false,canSend:false,reasonCode:'permission_check_failed'}));
     return true;
   }
   if(typeof message?.type==='string' && message.type.startsWith('DIALOGS_'))return;

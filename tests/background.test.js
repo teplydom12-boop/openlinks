@@ -11,7 +11,7 @@ let scheduled,removed,canClose,nativeRequired,debuggerFailure,debuggerCalls,nati
 let afterPrepare,querySendGuard,createdTabs,windowReplies,lastNormalWindow,windowUpdates;
 let scriptCalls,scriptReply,preloadCalls,preloadAttach,preloadSession,allTabUpdates;
 let nativeContactResult,nativeContactThrow,afterContactMark,contactGestures;
-const documentedFrames=()=> (frameList || [{frameId:0,url:frameUrl}]).map(frame=>({...frame,documentId:frame.documentId || 'document-'+frame.frameId+'-'+frame.url}));
+const documentedFrames=()=> (frameList || [{frameId:0,url:frameUrl}]).map(frame=>({...frame,documentId:Object.hasOwn(frame,'documentId')?frame.documentId:'document-'+frame.frameId+'-'+frame.url}));
 let extraStorage={};
 const metadataFixture=readFileSync(new URL('./fixtures/1688-metadata.html',import.meta.url),'utf8');
 globalThis.fetch=async(url,options)=>{fetches.push({url,credentials:options.credentials});const html=lookupPages.get(url);if(html===undefined)throw new Error('No local metadata fixture');return new Response(html,{headers:{'content-type':'text/html'}});};
@@ -25,7 +25,7 @@ globalThis.chrome={runtime,alarms,storage:{local:{get:async keys=>{
  remove:async id=>{removed.push(id);},
  sendMessage:async(tab,data,options)=>{
   if(options.documentId)options={...options,frameId:documentedFrames().find(frame=>frame.documentId===options.documentId)?.frameId};
-  deliveries.push({tabId:tab,frameId:options.frameId,type:data.type,active:tabReplies.get(tab)?.active===true,focused:windowReplies.get(tabReplies.get(tab)?.windowId??10)?.focused===true});
+  deliveries.push({tabId:tab,frameId:options.frameId,documentId:options.documentId,type:data.type,active:tabReplies.get(tab)?.active===true,focused:windowReplies.get(tabReplies.get(tab)?.windowId??10)?.focused===true});
   commands.push(data.type);
   requests.push(structuredClone(data));
   if(data.type==='CHAT_READY')return {ok:chatReady,waiting:!chatReady,reason:'Loading chat'};
@@ -36,7 +36,7 @@ globalThis.chrome={runtime,alarms,storage:{local:{get:async keys=>{
   if(data.type==='CAN_CLOSE')return {ok:canClose};
   if(data.type==='SEND'){if(querySendGuard){const guard=await message('OPENLINKS_TEST_SEND_GUARD',{
    scope:'outreach',jobId:data.jobId,attemptId:data.attemptId,expectedUrl:data.expectedUrl,message:data.message
-  },{id:'test',tab:{id:tab},frameId:options.frameId,url:documentedFrames().find(frame=>frame.frameId===options.frameId)?.url || frameUrl});if(!guard?.canSend)return {clicked:false,reason:'Нет разрешённой попытки отправки'};}clicks++;beforeClick=structuredClone(stored);if(sendResult==='disconnect')throw new Error('Disconnected');if(sendResult==='malformed')return {ok:false};return {clicked:sendResult!==false,accepted:sendResult===true,reason:'Кнопка изменилась'};}
+  },{id:'test',tab:{id:tab},frameId:options.frameId,documentId:documentedFrames().find(frame=>frame.frameId===options.frameId)?.documentId,url:(documentedFrames().find(frame=>frame.frameId===options.frameId)?.url || frameUrl).split('#')[0]});if(!guard?.canSend)return {clicked:false,notAttempted:true,reason:'Нет разрешённой попытки отправки'};}beforeClick=structuredClone(stored);if(sendResult&&typeof sendResult==='object'){if(sendResult.clicked===true)clicks++;return structuredClone(sendResult);}clicks++;if(sendResult==='disconnect')throw new Error('Disconnected');if(sendResult==='malformed')return {ok:false};return {clicked:sendResult!==false,accepted:sendResult===true,reason:'Кнопка изменилась'};}
   if(data.type==='CONTACT'){contactClicks++;afterContactMark?.();return {ok:true,key:probeKey,contactToken:'01234567-0123-4567-8901-012345678901',pageUrl:frameList?.find(frame=>frame.frameId===options.frameId)?.url || frameUrl};}
   if(data.type==='DISMISS_CHALLENGE'){if(obstacle?.stuck)return {clicked:true,closed:false};obstacle=null;return {clicked:true,closed:true};}
   return {ok:true};
@@ -51,6 +51,10 @@ const ui={id:'test',url:'chrome-extension://test/dashboard.html'};
 const message=(type,extra={},sender=ui)=>new Promise(resolve=>{
  for(const listen of runtime.onMessage.list)listen({type,...extra},sender,resolve);
 });
+function assertPermission(reply,expected) {
+ const {reasonCode,...status}=reply;assert.deepEqual(status,expected);
+ if(!expected.canSend)assert.ok(typeof reasonCode==='string'&&reasonCode.length>0,'Permission refusal must identify its reason');
+}
 async function tick(){alarms.onAlarm.list[0]({name:'openlinks-tick'});await message('GET');}
 function reset(){nativeContactResult={ok:true};nativeContactThrow=false;afterContactMark=null;contactGestures=[];scriptCalls=[];scriptReply=null;preloadCalls=[];preloadAttach=false;preloadSession=false;allTabUpdates=[];createdTabs=[];windowReplies=new Map([[10,{id:10,type:'normal'}]]);lastNormalWindow={id:10,type:'normal'};windowUpdates=[];afterPrepare=null;querySendGuard=false;stored=initialState();extraStorage={};stored.settings.message='Hello';clicks=0;contactClicks=0;commands=[];requests=[];beforeClick=null;probeKind='chat';sendResult=true;frameUrl='https://a.en.alibaba.com/chat';tabCount=0;opened=[];missing=false;obstacle=null;prepareOk=true;lookupPages=new Map();fetches=[];probeRoute=null;updated=[];probeKey='#contact';listedTabs=[];frameList=null;tabReplies=new Map();frameProbes=new Map();deliveries=[];scheduled=[];removed=[];canClose=true;nativeRequired=false;debuggerFailure=null;debuggerCalls=[];nativeFailure=null;chatReady=true;}
 async function review(url='https://a.en.alibaba.com/'){await message('IMPORT',{text:url});await message('START');await tick();await tick();}
@@ -290,6 +294,41 @@ test('teaching send reserves quota before the replay and counts it as user appro
 });
 test('refused click schedules a retry without waiting for a server result',async()=>{
  reset();sendResult=false;await review();await message('APPROVE');await tick();assert.equal(stored.queue[0].status,'retry_wait');assert.equal(stored.queue[0].helpField,'send');assert.equal(stored.learning,null);assert.ok(!commands.includes('CHECK_SENT'));
+});
+test('proven pre-click guard refusal releases only its new reservation and retry does not wait its own 420-second interval',async t=>{
+ reset();let now=2000000;t.mock.method(Date,'now',()=>now);await review();
+ const jobId=stored.queue[0].id;
+ stored.slots.push(
+  {platform:'alibaba',kind:'send',at:now-420000,jobId},
+  {platform:'alibaba',kind:'send',at:now-500000,jobId:'another-supplier'},
+  {platform:'mic',kind:'send',at:now,jobId:'another-platform'},
+  {platform:'1688',kind:'visit',at:now,jobId:'preserved-visit'});
+ const previousSlots=structuredClone(stored.slots);
+ sendResult={clicked:false,notAttempted:true,reason:'Не подтверждена текущая разрешённая попытка отправки'};
+ await message('APPROVE');await tick();
+ assert.equal(clicks,0);assert.deepEqual(stored.slots,previousSlots);
+ assert.equal(stored.queue[0].status,'retry_wait');assert.equal(stored.queue[0].errorCount,1);
+ assert.equal(stored.queue[0].attemptId,undefined);assert.equal(stored.queue[0].sendAt,undefined);assert.equal(stored.queue[0].sendDocumentId,undefined);
+ const proof=stored.events.find(event=>event.type==='send_not_clicked');
+ assert.equal(proof.attemptId,beforeClick.queue[0].attemptId);assert.equal(proof.sendAt,beforeClick.queue[0].sendAt);
+ assert.equal(proof.reservationReleased,true);assert.equal(stored.pendingClosures?.length||0,0);
+ sendResult=true;now+=10001;await retryDue();
+ assert.equal(clicks,1);assert.equal(stored.queue[0].status,'attempted');
+ assert.equal(stored.slots.length,previousSlots.length+1);
+ assert.deepEqual(stored.slots.slice(0,-1),previousSlots);
+ assert.equal(stored.slots.at(-1).at,now);
+ assert.ok(!stored.events.some(event=>event.type==='quota_deferred'));
+});
+test('ambiguous, duplicate, legacy and clicked send results keep their reserved quota',async()=>{
+ for(const response of [false,{clicked:false},{clicked:false,notAttempted:false},'malformed','disconnect',{clicked:true,accepted:true,notAttempted:true}]) {
+  reset();await review();sendResult=response;await message('APPROVE');await tick();
+  const reserved=beforeClick.slots.filter(slot=>slot.kind==='send');
+  assert.equal(reserved.length,1,JSON.stringify(response));
+  assert.deepEqual(stored.slots.filter(slot=>slot.kind==='send'),reserved,JSON.stringify(response));
+  assert.equal(stored.queue[0].attemptId,beforeClick.queue[0].attemptId);
+  assert.equal(stored.queue[0].sendAt,beforeClick.queue[0].sendAt);
+  assert.ok(!stored.events.some(event=>event.type==='send_not_clicked'));
+ }
 });
 test('composer changing after approval schedules recovery without reserving a send',async()=>{
  reset();await review();prepareOk=false;await message('APPROVE');await tick();assert.equal(clicks,0);assert.equal(stored.queue[0].status,'retry_wait');assert.equal(stored.slots.filter(s=>s.kind==='send').length,0);
@@ -1094,20 +1133,46 @@ test('a window focus failure before SEND consumes no send quota and is not repor
  assert.equal(stored.queue[0].status,'retry_wait');assert.ok(!commands.includes('SEND'));
  assert.ok(!stored.events.some(event=>event.type==='send_attempt'||event.type==='send_disconnect'));
 });
+test('outreach persists the current document before sending and targets that document instead of a reusable frame ID',async()=>{
+ reset();await review();await message('APPROVE');await tick();
+ const job=beforeClick.queue[0],delivery=deliveries.find(item=>item.type==='SEND');
+ assert.equal(job.sendDocumentId,documentedFrames()[0].documentId);
+ assert.equal(delivery.documentId,job.sendDocumentId);assert.equal(delivery.frameId,job.frameId);
+ assert.equal(job.status,'sending');assert.equal(clicks,1);
+});
+test('Alibaba iframe sends through the runtime guard when Chrome strips its sender URL fragment',async()=>{
+ reset();querySendGuard=true;
+ const chatUrl='https://onetalk.alibaba.com/message/weblite.htm#/';
+ frameList=[{frameId:0,url:frameUrl},{frameId:13,parentFrameId:0,url:chatUrl,documentId:'alibaba-chat-document'}];
+ frameProbes.set(0,{kind:'waiting',opened:true,frames:[{url:chatUrl,visible:true}]});
+ await review();await message('APPROVE');await tick();
+ assert.equal(clicks,1);assert.equal(stored.queue[0].status,'attempted');
+ assert.equal(beforeClick.queue[0].reviewUrl,chatUrl);assert.equal(beforeClick.queue[0].sendDocumentId,'alibaba-chat-document');
+ assert.equal(deliveries.find(item=>item.type==='SEND').documentId,'alibaba-chat-document');
+ assert.ok(!stored.events.some(event=>event.type==='send_not_clicked'||event.type==='retry_scheduled'));
+});
+test('a missing current document or frame stops before the send quota is reserved',async()=>{
+ for(const frame of [{frameId:0,url:'https://a.en.alibaba.com/chat',documentId:null},{frameId:99,url:'https://a.en.alibaba.com/chat',documentId:'another-frame'}]) {
+  reset();await review();await message('APPROVE');frameList=[frame];await tick();
+  assert.equal(clicks,0);assert.equal(stored.slots.filter(slot=>slot.kind==='send').length,0);
+  assert.equal(stored.queue[0].status,'retry_wait');assert.ok(!commands.includes('SEND'));
+  assert.ok(!stored.events.some(event=>event.type==='send_attempt'||event.type==='send_disconnect'));
+ }
+});
 test('primary permission requires the exact approved sending operation and reserved quota',async()=>{
  reset();await review();await message('APPROVE');await tick();
  const sending=structuredClone(beforeClick),job=sending.queue[0];
  stored=structuredClone(sending);extraStorage.openlinksClaudeFolder={test:{enabled:true}};
- const source={id:'test',tab:{id:job.tabId},frameId:job.frameId,url:job.reviewUrl};
+ const source={id:'test',tab:{id:job.tabId},frameId:job.frameId,documentId:job.sendDocumentId,url:job.reviewUrl};
  const request={scope:'outreach',jobId:job.id,attemptId:job.attemptId,expectedUrl:job.reviewUrl,message:job.message};
  const allowed=()=>message('OPENLINKS_TEST_SEND_GUARD',request,source);
- assert.deepEqual(await allowed(),{ok:true,canSend:true});
+ assertPermission(await allowed(),{ok:true,canSend:true});
  assert.deepEqual(stored,sending,'The permission check must remain read-only');
  for(const patch of [{scope:'dialog'},{scope:undefined},{jobId:'old-preview'},{attemptId:'old-preview'},{expectedUrl:'https://b.en.alibaba.com/chat'},{message:'Different message'}]) {
-  assert.deepEqual(await message('OPENLINKS_TEST_SEND_GUARD',{...request,...patch},source),{ok:true,canSend:false});
+  assertPermission(await message('OPENLINKS_TEST_SEND_GUARD',{...request,...patch},source),{ok:true,canSend:false});
  }
  for(const patch of [{tab:{id:job.tabId+1}},{frameId:99},{url:'https://b.en.alibaba.com/chat'}]) {
-  assert.deepEqual(await message('OPENLINKS_TEST_SEND_GUARD',request,{...source,...patch}),{ok:true,canSend:false});
+  assertPermission(await message('OPENLINKS_TEST_SEND_GUARD',request,{...source,...patch}),{ok:true,canSend:false});
  }
  for(const mutate of [
   state=>{state.running=false;},state=>{state.activeId=null;},state=>{state.queue[0].status='review';},
@@ -1115,15 +1180,15 @@ test('primary permission requires the exact approved sending operation and reser
   state=>{state.slots=[];},state=>{state.slots.find(slot=>slot.kind==='send').jobId='other';},
   state=>{state.slots.find(slot=>slot.kind==='send').at++;}
  ]) {
-  stored=structuredClone(sending);mutate(stored);assert.deepEqual(await allowed(),{ok:true,canSend:false});
+  stored=structuredClone(sending);mutate(stored);assertPermission(await allowed(),{ok:true,canSend:false});
  }
  stored=structuredClone(sending);extraStorage.openlinksDialogs={bindings:{alibaba:{tabId:job.tabId}}};
- assert.deepEqual(await allowed(),{ok:true,canSend:false});
+ assertPermission(await allowed(),{ok:true,canSend:false});
 });
 test('content send permission is authenticated and independent of the outreach lock',async()=>{
- reset();const source={id:'test',tab:{id:7},frameId:0,url:frameUrl};
- assert.deepEqual(await message('OPENLINKS_TEST_SEND_GUARD',{},source),{ok:true,canSend:false});
- for(const invalid of [{...source,id:'foreign'},{...source,url:'https://example.com/'},{id:'test',url:frameUrl}])assert.deepEqual(await message('OPENLINKS_TEST_SEND_GUARD',{},invalid),{ok:false,canSend:false});
+ reset();const source={id:'test',tab:{id:7},frameId:0,documentId:documentedFrames()[0].documentId,url:frameUrl};
+ assertPermission(await message('OPENLINKS_TEST_SEND_GUARD',{},source),{ok:true,canSend:false});
+ for(const invalid of [{...source,id:'foreign'},{...source,url:'https://example.com/'},{id:'test',url:frameUrl}])assertPermission(await message('OPENLINKS_TEST_SEND_GUARD',{},invalid),{ok:false,canSend:false});
  await review();await message('APPROVE');querySendGuard=true;extraStorage.openlinksClaudeFolder={test:{enabled:true}};
  let timer;try{await Promise.race([tick(),new Promise((_,reject)=>{timer=setTimeout(()=>reject(new Error('Send guard deadlocked behind outreach command')),1000);})]);}finally{clearTimeout(timer);}
  assert.equal(clicks,1);
@@ -1132,25 +1197,25 @@ test('legacy reply permission retains preview denial and matches its own bound r
  reset();const {reserveDialogSendQuota}=await import('../extension/background.js');
  const jobId=crypto.randomUUID(),attemptId=crypto.randomUUID(),dialogId='seller-chat';
  const request={scope:'dialog',jobId:attemptId,attemptId,dialogOperation:attemptId,dialogId,expectedUrl:frameUrl,message:'Reply'};
- const source={id:'test',tab:{id:7},frameId:0,url:frameUrl};
+ const source={id:'test',tab:{id:7},frameId:0,documentId:documentedFrames()[0].documentId,url:frameUrl};
  const folder={test:{enabled:false},sendReceipts:[{id:attemptId,jobId,key:'alibaba:'+dialogId,status:'reserved',textHash:await folderDigest(request.message)}]};
  extraStorage.openlinksDialogs={running:true,settings:{wechatAudit:false},bindings:{alibaba:{tabId:7}}};
  extraStorage.openlinksClaudeFolder=structuredClone(folder);
  assert.equal((await reserveDialogSendQuota({platform:'alibaba',jobId,attemptId})).ok,true);
  const allowed=()=>message('OPENLINKS_TEST_SEND_GUARD',request,source);
- assert.deepEqual(await allowed(),{ok:true,canSend:true});
+ assertPermission(await allowed(),{ok:true,canSend:true});
  for(const mutate of [value=>{value.test.enabled=true;},value=>{value.sendReceipts[0].status='sent';},value=>{value.sendReceipts[0].jobId=crypto.randomUUID();},value=>{value.sendReceipts[0].textHash='wrong';}]) {
   extraStorage.openlinksClaudeFolder=structuredClone(folder);mutate(extraStorage.openlinksClaudeFolder);
-  assert.deepEqual(await allowed(),{ok:true,canSend:false});
+  assertPermission(await allowed(),{ok:true,canSend:false});
  }
  extraStorage.openlinksClaudeFolder=structuredClone(folder);
- assert.deepEqual(await message('OPENLINKS_TEST_SEND_GUARD',{...request,scope:'outreach'},source),{ok:true,canSend:false});
- assert.deepEqual(await message('OPENLINKS_TEST_SEND_GUARD',{...request,message:'Other reply'},source),{ok:true,canSend:false});
- extraStorage.openlinksDialogs.settings.wechatAudit=true;assert.deepEqual(await allowed(),{ok:true,canSend:false});
+ assertPermission(await message('OPENLINKS_TEST_SEND_GUARD',{...request,scope:'outreach'},source),{ok:true,canSend:false});
+ assertPermission(await message('OPENLINKS_TEST_SEND_GUARD',{...request,message:'Other reply'},source),{ok:true,canSend:false});
+ extraStorage.openlinksDialogs.settings.wechatAudit=true;assertPermission(await allowed(),{ok:true,canSend:false});
 });
 test('content send-mode guard fails closed when trusted storage is unavailable',async t=>{
  reset();t.mock.method(chrome.storage.local,'get',async()=>{throw new Error('Storage unavailable');});
- assert.deepEqual(await message('OPENLINKS_TEST_SEND_GUARD',{}, {id:'test',tab:{id:7},url:frameUrl}),{ok:false,canSend:false});assert.equal(clicks,0);
+ assertPermission(await message('OPENLINKS_TEST_SEND_GUARD',{}, {id:'test',tab:{id:7},url:frameUrl}),{ok:false,canSend:false});assert.equal(clicks,0);
 });
 
 const coordination=await import('../extension/background.js');

@@ -213,7 +213,8 @@ try:
           let listener;
           window.lessonMessages=[];
           window.adapterMessages=[];
-          window.chrome={runtime:{id:'adapter-test',onMessage:{addListener(fn){listener=fn}},sendMessage:async message=>{adapterMessages.push(message);if(message.type==='OPENLINKS_TEST_SEND_GUARD')return {ok:true,canSend:true};if(message.type==='LEARN_PICK')lessonMessages.push(message);return {ok:true};}}};
+          window.sendGuardMode='allow';
+          window.chrome={runtime:{id:'adapter-test',onMessage:{addListener(fn){listener=fn}},sendMessage:async message=>{adapterMessages.push(message);if(message.type==='OPENLINKS_TEST_SEND_GUARD'){if(sendGuardMode==='error')throw Error('Guard transport unavailable');return sendGuardMode==='allow'?{ok:true,canSend:true}:{ok:true,canSend:false,reasonCode:'document_mismatch'};}if(message.type==='LEARN_PICK')lessonMessages.push(message);return {ok:true};}}};
           window.contactCommands=[];
           chrome.debugger={attach:async()=>{},detach:async()=>{},sendCommand:(target,method,params)=>new Promise(resolve=>contactCommands.push({method,params,resolve}))};
           const rawAdapter=(type,extra={})=>new Promise(resolve=>listener({type,jobId:'test-job',profile:{},message:'Hello, WeChat: demo',...extra},{id:'adapter-test'},resolve));
@@ -258,9 +259,24 @@ try:
         assert result['ok']
         expect(supplier.locator('#message')).to_have_value('Hello, WeChat: demo')
         passed('preparation fills React-style native input and enables initially disabled Send')
+        supplier.evaluate("sendGuardMode='deny'")
+        denied=supplier.evaluate("adapter('SEND', {attemptId:'guard-denied',expectedUrl:location.href})")
+        assert not denied['clicked'] and denied['notAttempted'] and supplier.evaluate('clicks')==0
+        assert denied['permissionReasonCode']=='document_mismatch' and 'document_mismatch' in denied['reason']
+        expect(supplier.locator('#message')).to_have_value('Hello, WeChat: demo')
+        supplier.evaluate("sendGuardMode='error'")
+        disconnected=supplier.evaluate("adapter('SEND', {attemptId:'guard-unavailable',expectedUrl:location.href})")
+        assert not disconnected['clicked'] and disconnected['notAttempted'] and supplier.evaluate('clicks')==0
+        supplier.evaluate("sendGuardMode='allow'")
+        passed('permission denial and guard transport failure prove no click and preserve the prepared draft')
         assert supplier.evaluate("adapter('SEND', {expectedUrl:location.href})")['clicked']
         assert supplier.evaluate('clicks')==1
         assert not supplier.evaluate("adapter('SEND', {expectedUrl:location.href})")['clicked']
+        supplier.evaluate("sendGuardMode='deny'")
+        duplicate=supplier.evaluate("adapter('SEND', {expectedUrl:location.href})")
+        assert not duplicate['clicked'] and duplicate['notAttempted'] is False and supplier.evaluate('clicks')==1
+        supplier.evaluate("sendGuardMode='allow'")
+        passed('a denied duplicate of a previously clicked operation never authorizes releasing its quota')
         passed('single send without result checks and duplicate-click prevention')
         supplier.evaluate("()=>{let e=document.querySelector('#message');e.value='My existing draft';window.replacementInputs=[];e.addEventListener('input',()=>replacementInputs.push(e.value));}")
         replaced=supplier.evaluate("adapter('PREPARE')")

@@ -551,8 +551,14 @@
       if(request.dialogPreview===true||[operation,request.jobId,request.dialogGuard?.operation].some(id=>previewOperations.has(id)))return {clicked:false,reason:'Тестовая операция не имеет права отправлять сообщения.'};
       // Content scripts cannot read TRUSTED_CONTEXTS storage. Ask the worker via
       // its read-only guard outside the command queue, then recheck the DOM.
-      try {const allowed=await chrome.runtime.sendMessage({type:'OPENLINKS_TEST_SEND_GUARD',scope:request.dialogGuard?'dialog':'outreach',jobId:request.jobId,attemptId:operation,expectedUrl:request.expectedUrl,message:request.message,...(request.dialogGuard?{dialogOperation:request.dialogGuard.operation,dialogId:request.dialogGuard.id}:{})});if(allowed?.ok!==true||allowed.canSend!==true)return {clicked:false,reason:'Не подтверждена текущая разрешённая попытка отправки. Обновите состояние очереди.'};}
-      catch{return {clicked:false,reason:'Не удалось проверить текущую попытку отправки. Отправка остановлена.'};}
+      try {
+        const allowed=await chrome.runtime.sendMessage({type:'OPENLINKS_TEST_SEND_GUARD',scope:request.dialogGuard?'dialog':'outreach',jobId:request.jobId,attemptId:operation,expectedUrl:request.expectedUrl,message:request.message,...(request.dialogGuard?{dialogOperation:request.dialogGuard.operation,dialogId:request.dialogGuard.id}:{})});
+        if(allowed?.ok!==true||allowed.canSend!==true) {
+          const reasonCode=typeof allowed?.reasonCode==='string'&&/^[a-z0-9_-]{1,80}$/i.test(allowed.reasonCode)?allowed.reasonCode:undefined;
+          return {clicked:false,notAttempted:!sentOps.has(operation),permissionReasonCode:reasonCode,reason:'Не подтверждена текущая разрешённая попытка отправки. Обновите состояние очереди.'+(reasonCode?' Код: '+reasonCode+'.':'')};
+        }
+      }
+      catch{return {clicked:false,notAttempted:!sentOps.has(operation),reason:'Не удалось проверить текущую попытку отправки. Отправка остановлена.'};}
       if(sentOps.has(operation)) return {clicked:false,reason:'Эта попытка уже выполнялась. Повтор запрещён.'};
       if(location.href!==request.expectedUrl) return {clicked:false,reason:'Адрес страницы изменился. Проверьте получателя.'};
       const found=inspect(profile);
