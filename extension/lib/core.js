@@ -132,11 +132,11 @@ export function dueJob(state, now) {
     const reasons=[...new Set([...visit.reasons,...send.reasons])];
     if(job.requestedAt>now)reasons.push('Заданное время посещения ещё не наступило');
     const due={job,at:Math.max(visit.at,send.at,job.requestedAt || 0),reasons,quotaUntil:Math.max(visit.quotaUntil,send.quotaUntil)};
-    if(due.quotaUntil>now) {blocked.push(due);continue;}
-    // Only a hard quota permits overtaking. An interval or explicit date on the
-    // first eligible platform keeps its place; wake sooner if an earlier quota clears.
-    const selected=[...blocked,due].reduce((best,item)=>item.at<best.at?item:best);
-    return {...selected,deferred:blocked.filter(item=>item.job!==selected.job)};
+    // Preserve order within each platform, but never let its interval, quota
+    // or scheduled time block another platform that can run now. Recalculate
+    // from actual visits every time: switching platforms removes adjacency.
+    if(due.at>now) {blocked.push(due);continue;}
+    return {...due,deferred:blocked};
   }
   if(blocked.length) {
     const selected=blocked.reduce((best,item)=>item.at<best.at?item:best);
@@ -214,7 +214,7 @@ export const EVENT_LABELS = {
   learning:'Жду обучающего клика',learned:'Правило сохранено',learning_cancel:'Обучение отменено',rule_removed:'Правило удалено',
   challenge_close:'Закрываю окно проверки',direct_chat:'Прямой переход в чат',chat_route:'Адрес чата сохранён',
   chat_lookup:'Определяю получателя 1688',chat_lookup_fallback:'Перехожу к обычному открытию чата',chat_route_removed:'Адрес чата забыт',
-  quota_deferred:'Площадка отложена из-за лимита',quota_resume:'Возврат к отложенной задаче',
+  quota_deferred:'Площадка временно отложена',quota_resume:'Возврат к отложенной задаче',
   remove_job:'Строка удалена',manual_retry:'Повтор по решению пользователя',editor_input:'Ввод текста',composer_accepted:'Редактор 1688 очистился',
   chat_close_scheduled:'Закрытие чата назначено',chat_closed:'Вкладка чата закрыта',chat_close_cancelled:'Закрытие чата отменено',
   skip_tab_closed:'Вкладка закрыта при пропуске',skip_tab_kept:'Вкладка не закрыта при пропуске',

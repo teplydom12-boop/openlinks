@@ -51,14 +51,28 @@ test('interval applies only between neighboring visits of the same platform, not
   assert.equal(nextAllowed(state,'mic','send',now),now);
   assert.equal(nextAllowed(state,'alibaba','send',now),now);
 });
-test('strict FIFO: a cooldown blocks later platforms in both scheduler and exported plan',()=>{
+test('a cooldown yields to the first ready platform in both scheduler and exported plan',()=>{
   const state=initialState(),now=1000000;
   state.slots=[{platform:'alibaba',kind:'visit',at:now}];
   state.queue=[{id:'a',url:'https://a.alibaba.com/',platform:'alibaba',status:'pending'}, {id:'b',url:'https://a.1688.com/',platform:'1688',status:'pending'}];
-  assert.equal(dueJob(state,now).job.id,'a');
+  const due=dueJob(state,now);
+  assert.equal(due.job.id,'b');assert.equal(due.at,now);
+  assert.deepEqual(due.deferred.map(item=>item.job.id),['a']);
   const plan=makePlan(state,now);
-  assert.equal(plan[0].plannedAt,now+420000); assert.equal(plan[1].plannedAt,now+420001);
-  assert.match(scheduleText(state,now),/alibaba.com/);
+  assert.equal(plan[0].plannedAt,now+1); assert.equal(plan[1].plannedAt,now);
+  assert.ok(scheduleText(state,now).includes(localTimestamp(now+1)+'\tAlibaba\tpending\thttps://a.alibaba.com/'));
+});
+test('each platform cooldown permits another platform while preserving its own first pending row',()=>{
+  for(const [waiting,ready] of [['1688','alibaba'],['1688','mic'],['alibaba','1688'],['alibaba','mic'],['mic','1688']]) {
+    const state=initialState(),now=1000000;
+    state.slots=[{platform:waiting,kind:'visit',at:now}];
+    state.queue=[{id:'first',platform:waiting,status:'pending'},{id:'second',platform:waiting,status:'pending'},{id:'other',platform:ready,status:'pending'}];
+    const before=structuredClone(state),due=dueJob(state,now);
+    assert.equal(due.job.id,'other',waiting+' -> '+ready);assert.equal(due.at,now);
+    assert.deepEqual(due.deferred.map(item=>item.job.id),['first']);assert.deepEqual(state,before);
+    state.queue[2].status='attempted';state.slots.push({platform:ready,kind:'visit',at:now+1});
+    assert.equal(dueJob(state,now+2).job.id,'first');assert.equal(dueJob(state,now+2).at,now+2);
+  }
 });
 test('clock rollback keeps previous reservations and therefore waits',()=>{
   const state=initialState();state.slots=[{platform:'alibaba',kind:'send',at:2000000}];
@@ -73,9 +87,24 @@ test('Alibaba -> 1688 -> Alibaba has no configured interval between visits',()=>
 test('same-platform interval is measured from the last actual visit even after an error',()=>{
   const state=initialState(), now=1000000;
   state.slots=[{kind:'visit',platform:'alibaba',at:now}];
-  state.queue=parseList('https://a.alibaba.com/\nhttps://b.1688.com/',[],now).jobs;
+  state.queue=parseList('https://a.alibaba.com/\nhttps://b.alibaba.com/',[],now).jobs;
   assert.equal(dueJob(state,now+1000).at,now+420000);
   assert.equal(dueJob(state,now+500000).at,now+500000);
+});
+test('when every platform waits, the earliest full eligibility wins across interval, quota and scheduled time',()=>{
+  const now=3000000;
+  for(const {quotaWait,requestedWait,selected,wait} of [
+    {quotaWait:20000,requestedWait:45000,selected:'quota',wait:20000},
+    {quotaWait:90000,requestedWait:10000,selected:'scheduled',wait:10000},
+    {quotaWait:90000,requestedWait:100000,selected:'interval',wait:60000},
+  ]) {
+    const state=initialState();
+    state.slots=[...Array.from({length:3},(_,i)=>({platform:'alibaba',kind:'send',at:now-WINDOW_MS+quotaWait-1000+i})),{platform:'mic',kind:'visit',at:now}];
+    state.queue=[{id:'interval',platform:'mic',status:'pending'},{id:'quota',platform:'alibaba',status:'pending'},{id:'scheduled',platform:'1688',status:'pending',requestedAt:now+requestedWait}];
+    const due=dueJob(state,now);
+    assert.equal(due.job.id,selected);assert.equal(due.at,now+wait);
+    assert.equal(dueJob(state,due.at).job.id,selected);
+  }
 });
 test('hard quota permits another platform then returns to the first deferred row',()=>{
   const state=initialState(),now=1000000;
@@ -109,6 +138,12 @@ test('mixed-platform plan respects rolling quotas for visits and sends through r
  const state=initialState(),now=3000000;
  state.queue=Array.from({length:60},(_,i)=>({id:String(i),platform:['alibaba','alibaba','1688','mic'][i%4],status:'pending',requestedAt:now}));
  const plan=makePlan(state,now);
+ const chronological=[...plan].sort((a,b)=>a.plannedAt-b.plannedAt);
+ for(let index=1;index<chronological.length;index++) {
+   const prior=chronological[index-1],job=chronological[index];
+   assert.ok(job.plannedAt>prior.plannedAt);
+   if(job.platform===prior.platform)assert.ok(job.plannedAt-prior.plannedAt>=state.settings.intervals[job.platform]*1000);
+ }
  for(const [platform,limit] of [['alibaba',3],['1688',7]]) {
    const same=plan.filter(job=>job.platform===platform);
    for(const job of same)assert.ok(same.filter(other=>other.plannedAt>job.plannedAt-WINDOW_MS && other.plannedAt<=job.plannedAt).length<=limit);
@@ -125,11 +160,13 @@ test('v3 migration keeps persisted lessons, chat routes and reservations and bro
  assert.deepEqual(upgraded.chatRoutes,state.chatRoutes);assert.deepEqual(upgraded.slots,state.slots);
  assert.deepEqual(migrateState(upgraded),upgraded);
 });
-test('explicit future time never allows later links to overtake',()=>{
+test('explicit future time is honored without holding up another ready platform or reordering its own platform',()=>{
   const state=initialState();
-  state.queue=[{id:'a',platform:'alibaba',status:'pending',requestedAt:5000000},{id:'b',platform:'1688',status:'pending',requestedAt:1}];
-  assert.equal(dueJob(state,1000000).job.id,'a');
-  assert.deepEqual(makePlan(state,1000000).map(job=>job.plannedAt),[5000000,5000001]);
+  state.queue=[{id:'a',platform:'alibaba',status:'pending',requestedAt:5000000},{id:'same',platform:'alibaba',status:'pending',requestedAt:1},{id:'b',platform:'1688',status:'pending',requestedAt:1}];
+  assert.equal(dueJob(state,1000000).job.id,'b');
+  assert.deepEqual(makePlan(state,1000000).map(job=>job.plannedAt),[5000000,5420000,1000000]);
+  state.queue[2].status='attempted';
+  assert.equal(dueJob(state,1000000).job.id,'a');assert.equal(dueJob(state,1000000).at,5000000);
 });
 test('upgrade retains history and quotas, enables review and pauses old inquiry-capable tasks',()=>{
   const state=initialState();state.version=1;state.running=true;state.settings.review=false;

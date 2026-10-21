@@ -121,7 +121,7 @@ function render() {
     link.href=job.url; link.target='_blank'; link.rel='noreferrer'; link.title=job.url; urlCell.append(link);
     const status=element('td');status.title=job.reason || '';
     const deferred=job.quotaDeferredUntil>now;
-    status.append(element('span',deferred?'Отложено до '+time(job.quotaDeferredUntil):STATUS[job.status] || job.status,'badge '+(deferred?'deferred_send':job.status)));
+    status.append(element('span',deferred?'Временно отложено':STATUS[job.status] || job.status,'badge '+(deferred?'deferred_send':job.status)));
     const action=element('td');
     if(['pending','deferred_send'].includes(job.status)) {
       const skip=element('button','Пропустить','link-button');

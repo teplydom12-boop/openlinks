@@ -48,6 +48,16 @@ test('intervals and explicit dates preserve outreach priority',()=>{
   const scheduled=assessWorkCoordination(state,joint,now);
   assert.equal(scheduled.phase,'outreach');assert.equal(scheduled.nextAt,now+30_000);
 });
+test('a ready alternative retains immediate outreach priority during another platform interval or scheduled wait',()=>{
+  for(const scheduled of [false,true]) {
+    const state=queue('1688','alibaba','mic');
+    if(scheduled)state.queue[0].requestedAt=now+90000;
+    else state.slots=[{kind:'visit',platform:'1688',at:now}];
+    const result=assessWorkCoordination(state,joint,now);
+    assert.equal(result.phase,'outreach');assert.equal(result.allowDialogs,false);assert.equal(result.nextAt,null);
+    assert.match(result.detail,/доступная площадка/);
+  }
+});
 test('ready platform retains priority even if an earlier quota will clear before its scheduled visit',()=>{
   const state=queue('alibaba','mic');exhaust(state,'alibaba', 'send',now-WINDOW_MS+1000);
   state.queue[1].requestedAt=now+50_000;

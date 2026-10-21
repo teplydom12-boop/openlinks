@@ -134,15 +134,15 @@ function event(state, type, job, detail = '', level = 'action') {
   state.activity=entry;
 }
 async function waitFor(state,job,at,reasons,kind) {
-  const detail=`${reasons.join('; ')}. Продолжение не ранее ${localTimestamp(at)}. Обход очереди разрешён только для площадок с исчерпанной квотой.`;
+  const detail=`${reasons.join('; ')}. Ближайшая проверка ${localTimestamp(at)}. ${kind==='visit'?'Сейчас ни одна из оставшихся площадок не доступна для посещения.':'Текущий чат ожидает допустимого времени отправки.'}`;
   if(state.waiting?.jobId!==job.id || state.waiting?.until!==at || state.waiting?.kind!==kind) {
     state.waiting={jobId:job.id,until:at,kind,detail};
     event(state,'wait',job,detail,'wait'); await save(state);
   }
   await alarm(at);
 }
-function deferQuota(state,job,at,reasons) {
-  const detail=`${reasons.join('; ')}. Возврат не ранее ${localTimestamp(at)}; проверяю доступность других площадок.`;
+function deferJob(state,job,at,reasons) {
+  const detail=`${reasons.join('; ')}. Текущая оценка доступности: ${localTimestamp(at)}; проверяю другие площадки. После смены площадки интервал пересчитывается.`;
   if(job.quotaDeferredUntil!==at)event(state,'quota_deferred',job,detail,'decision');
   job.quotaDeferredUntil=at;job.reason=detail;
 }
@@ -463,7 +463,7 @@ async function performSend(state, job) {
   const allowed = eligibility(state, job.platform, 'send', now);
   if (allowed.at > now) {
     if(allowed.quotaUntil>now) {
-      deferQuota(state,job,allowed.at,allowed.reasons);job.status='deferred_send';state.activeId=null;state.waiting=null;
+      deferJob(state,job,allowed.at,allowed.reasons);job.status='deferred_send';state.activeId=null;state.waiting=null;
       await save(state);await alarm(Date.now()+1000);
     } else await waitFor(state,job,allowed.at,allowed.reasons,'send');
     return;
@@ -544,9 +544,9 @@ async function tick() {
     if (!due) { state.running = false; event(state, 'complete', null, 'Очередь завершена'); await save(state); return; }
     if (due.at > Date.now()) { await waitFor(state,due.job,due.at,due.reasons,'visit'); return; }
     job = due.job;
-    for(const deferred of due.deferred || [])deferQuota(state,deferred.job,deferred.at,deferred.reasons);
+    for(const deferred of due.deferred || [])deferJob(state,deferred.job,deferred.at,deferred.reasons);
     if(job.quotaDeferredUntil) {
-      event(state,'quota_resume',job,'Лимит снова позволяет обработку. Возвращаюсь к первой отложенной строке этой площадки.','decision');
+      event(state,'quota_resume',job,'Задача снова доступна с учётом интервала, времени и лимитов. Возвращаюсь к первой отложенной строке этой площадки.','decision');
       delete job.quotaDeferredUntil;job.reason='';
     }
     if(job.status==='deferred_send') {
@@ -567,7 +567,7 @@ async function tick() {
     const previous=state.slots.filter(slot=>slot.kind==='visit').at(-1);
     const transition=previous ? (previous.platform===job.platform ? 'Та же площадка; настроенный интервал выдержан.' : `Смена ${PLATFORMS[previous.platform].label} → ${PLATFORMS[job.platform].label}: дополнительная пауза не нужна.`) : 'Первое посещение.';
     state.waiting = null;
-    event(state,'decision',job,`Выбрана ссылка №${state.queue.indexOf(job)+1}${due.deferred?.length?' после временного пропуска площадок с исчерпанной квотой':' по порядку списка'}. ${transition} Лимиты посещений и отправок за 20 минут проверены.`,'decision');
+    event(state,'decision',job,`Выбрана ссылка №${state.queue.indexOf(job)+1}${due.deferred?.length?' после временного пропуска ожидающих площадок':' по порядку списка'}. ${transition} Лимиты посещений и отправок за 20 минут проверены.`,'decision');
     job.status = 'visiting'; job.visitAt = Date.now(); job.stepAt = Date.now();
     job.message = state.settings.message.trim(); job.profile = {...structuredClone(state.settings.profiles[job.platform]),rules:state.rules.filter(rule=>rule.platform===job.platform)};
     state.slots.push({platform:job.platform, kind:'visit', at:job.visitAt, jobId:job.id});
@@ -802,20 +802,22 @@ async function dispatch(message, sender) {
       const parsed = parseList(String(message.text), state.queue);
       if (state.queue.length + parsed.jobs.length > 5000) throw new Error('В очереди может быть до 5000 ссылок');
       state.queue.push(...parsed.jobs);
+      if(state.running&&parsed.jobs.length&&!state.activeId)state.waiting=null;
       event(state, 'import', null, `Добавлено: ${parsed.jobs.length}; пропущено: ${parsed.errors.length}`);
-      await save(state); await alarm(); return {ok:true, added:parsed.jobs.length, errors:parsed.errors};
+      await save(state); await alarm(state.running&&parsed.jobs.length?Date.now()+1000:undefined); return {ok:true, added:parsed.jobs.length, errors:parsed.errors};
     }
     case 'SETTINGS':
       if (state.activeId || state.queue.some(item=>item.status==='deferred_send')) throw new Error('Завершите или пропустите подготовленные задачи перед изменением настроек');
       state.settings = validateSettings(message.settings);
-      event(state,'settings',null,`Сообщение ${state.settings.message.length} символов; подтверждение ${state.settings.review ? 'включено' : 'выключено'}. Режим: только чат; обход очереди только при исчерпании квоты.`);
-      await save(state); return {ok:true};
+      state.waiting=null;
+      event(state,'settings',null,`Сообщение ${state.settings.message.length} символов; подтверждение ${state.settings.review ? 'включено' : 'выключено'}. Режим: только чат; ожидающая площадка не блокирует доступные площадки.`);
+      await save(state); if(state.running)await alarm(Date.now()+1000); return {ok:true};
     case 'START':
       if (!state.settings.message.trim()) throw new Error('Сначала сохраните текст сообщения');
       if (job && ['blocked','uncertain'].includes(job.status)) throw new Error('Сначала разрешите ситуацию с текущим поставщиком');
       await bindQueueWindow(state,sender,job);
       await disableJoint(state,'Первичная очередь запущена отдельно. Текущий режим переписки не изменён.');
-      state.running=true; event(state,'start',null,'Очередь запущена: только чат; интервал между соседними магазинами одной площадки. При исчерпании квоты перехожу к доступной площадке и затем возвращаюсь; лимиты 7/20 и 3/20 сохраняются.'); await save(state); await alarm(Date.now()+1000); return {ok:true};
+      state.running=true; event(state,'start',null,'Очередь запущена: только чат; интервал между соседними магазинами одной площадки. При ожидании интервала, квоты или назначенного времени перехожу к доступной площадке и затем возвращаюсь; лимиты 7/20 и 3/20 сохраняются.'); await save(state); await alarm(Date.now()+1000); return {ok:true};
     case 'PAUSE':
       await disableJoint(state,'Первичная очередь приостановлена отдельно. Текущий режим переписки не изменён.');
       await stopLearning(state,job);

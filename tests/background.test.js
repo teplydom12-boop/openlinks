@@ -204,9 +204,48 @@ test('automatic mode uses built-ins/learned rules and rejects website UI command
 test('pause prevents pending tab opening',async()=>{
  reset();await message('IMPORT',{text:'https://a.en.alibaba.com/'});await message('START');await message('PAUSE');await tick();assert.equal(opened.length,0);
 });
-test('FIFO waits for first platform and logs identical wait only once',async()=>{
- reset();stored.slots.push({platform:'alibaba',kind:'visit',at:Date.now()});await message('IMPORT',{text:'https://a.en.alibaba.com/\nhttps://b.1688.com/'});await message('START');await tick();await tick();
+test('when no other platform is available the interval wait is logged only once',async()=>{
+ reset();stored.slots.push({platform:'alibaba',kind:'visit',at:Date.now()});await message('IMPORT',{text:'https://a.en.alibaba.com/\nhttps://b.en.alibaba.com/'});await message('START');await tick();await tick();
  assert.equal(opened.length,0);assert.equal(stored.waiting.jobId,stored.queue[0].id);assert.equal(stored.events.filter(e=>e.type==='wait').length,1);
+});
+test('a platform interval yields to another platform, keeps one active supplier and returns in platform order',async t=>{
+ const now=2000000;t.mock.method(Date,'now',()=>now);
+ for(const [waiting,first,second,other] of [
+   ['1688','https://first.1688.com/','https://second.1688.com/','https://ready.en.alibaba.com/'],
+   ['alibaba','https://first.en.alibaba.com/','https://second.en.alibaba.com/','https://ready.1688.com/'],
+   ['alibaba','https://first.en.alibaba.com/','https://second.en.alibaba.com/','https://ready.en.made-in-china.com/'],
+ ]) {
+   reset();frameUrl=other;stored.slots=[{platform:waiting,kind:'visit',at:now}];
+   await message('IMPORT',{text:[first,second,other].join('\n')});await message('START');await tick();
+   assert.deepEqual(opened,[other]);assert.equal(stored.activeId,stored.queue[2].id);
+   assert.equal(stored.queue[0].status,'pending');assert.equal(stored.queue[1].status,'pending');assert.equal(stored.waiting,null);
+   assert.ok(stored.events.some(event=>event.type==='quota_deferred'&&event.jobId===stored.queue[0].id));
+   await tick();await tick();
+   assert.equal(stored.queue[2].status,'review');assert.deepEqual(opened,[other]);assert.equal(clicks,0);
+   assert.equal(stored.slots.filter(slot=>slot.kind==='visit').length,2);
+   await message('SKIP',{id:stored.activeId});frameUrl=first;await tick();
+   assert.deepEqual(opened,[other,first]);assert.equal(stored.activeId,stored.queue[0].id);
+   assert.equal(stored.queue[1].status,'pending');assert.equal(clicks,0);
+ }
+});
+test('importing a ready platform during an interval wait wakes the queue in one second',async t=>{
+ reset();const now=2000000;t.mock.method(Date,'now',()=>now);
+ stored.slots=[{platform:'alibaba',kind:'visit',at:now}];
+ await message('IMPORT',{text:'https://waiting.en.alibaba.com/'});await message('START');await tick();
+ assert.equal(stored.waiting.until,now+420000);assert.equal(scheduled.at(-1).when,now+420000);
+ const result=await message('IMPORT',{text:'https://ready.en.made-in-china.com/'});
+ assert.equal(result.added,1);assert.equal(stored.waiting,null);assert.equal(scheduled.at(-1).name,'openlinks-tick');assert.equal(scheduled.at(-1).when,now+1000);
+ await tick();assert.deepEqual(opened,['https://ready.en.made-in-china.com/']);assert.equal(stored.queue[0].status,'pending');assert.equal(clicks,0);
+});
+test('changing intervals during a wait replaces the old wake time without resetting reservations',async t=>{
+ reset();const now=2000000;t.mock.method(Date,'now',()=>now);
+ stored.slots=[{platform:'alibaba',kind:'visit',at:now-31000}];
+ await message('IMPORT',{text:'https://ready.en.alibaba.com/'});await message('START');await tick();
+ assert.equal(stored.waiting.until,now+389000);const reservations=structuredClone(stored.slots);
+ const settings=structuredClone(stored.settings);settings.intervals.alibaba=30;
+ assert.equal((await message('SETTINGS',{settings})).ok,true);
+ assert.equal(stored.waiting,null);assert.deepEqual(stored.slots,reservations);assert.equal(scheduled.at(-1).when,now+1000);
+ await tick();assert.deepEqual(opened,['https://ready.en.alibaba.com/']);assert.equal(stored.slots.length,2);assert.equal(clicks,0);
 });
 test('no chat within the opening deadline schedules a bounded retry without sending',async()=>{
  reset();probeKind='inquiry';await review();await openingTimedOut();assert.equal(stored.running,true);assert.equal(stored.queue[0].status,'retry_wait');assert.equal(stored.queue[0].helpField,'contact');assert.equal(clicks,0);assert.equal(stored.learning,null);
