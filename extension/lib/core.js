@@ -91,9 +91,13 @@ export function eligibility(state, platform, kind, now) {
   let next = now,quotaUntil=now;
   const reasons = [];
   const last = state.slots.filter(slot => slot.kind === 'visit').at(-1);
-  if (kind === 'visit' && last?.platform === platform) {
-    const intervalAt = last.at + state.settings.intervals[platform] * 1000;
-    if (intervalAt > now) { next = Math.max(next, intervalAt); reasons.push(`Соседние магазины на ${PLATFORMS[platform].label}: интервал ${state.settings.intervals[platform]} с`); }
+  // Activity on another marketplace must not reset this marketplace's timer.
+  // Use the latest timestamp, including future reservations after clock rollback,
+  // rather than relying on storage insertion order. Separate visit/send timers
+  // also prevent a long preparation from bunching two actual sends together.
+  if (slots.length) {
+    const intervalAt = slots.at(-1) + state.settings.intervals[platform] * 1000;
+    if (intervalAt > now) { next = Math.max(next, intervalAt); reasons.push(`Интервал ${PLATFORMS[platform].label}: ${state.settings.intervals[platform]} с (${kind === 'visit' ? 'посещения' : 'отправки'})`); }
   }
   // Clock rollback must not turn future reservations into unused capacity.
   if (slots.at(-1) > now) { next = Math.max(next, slots.at(-1) + 1000); reasons.push('Системные часы отстают от сохранённых операций'); }
@@ -134,7 +138,7 @@ export function dueJob(state, now) {
     const due={job,at:Math.max(visit.at,send.at,job.requestedAt || 0),reasons,quotaUntil:Math.max(visit.quotaUntil,send.quotaUntil)};
     // Preserve order within each platform, but never let its interval, quota
     // or scheduled time block another platform that can run now. Recalculate
-    // from actual visits every time: switching platforms removes adjacency.
+    // from actual visits every time; each platform retains its own timer.
     if(due.at>now) {blocked.push(due);continue;}
     return {...due,deferred:blocked};
   }

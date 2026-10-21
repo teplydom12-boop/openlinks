@@ -536,9 +536,8 @@
       if(found.contact.closest('form')||found.contact.form||found.contact.matches(':disabled')||found.contact.getAttribute('aria-disabled')==='true')return {ok:false,reason:'Кнопка чата недоступна либо находится в форме. Открытие остановлено.'};
       const href=found.contact.getAttribute('href') || '';
       if(/^[a-z][a-z\d+.-]*:/i.test(href.trim())&&!/^\s*(https?:|javascript:)/i.test(href)) return {ok:false,reason:'Контакт открывается во внешнем приложении. Откройте веб-чат вручную.'};
-      // The worker invokes this exact control in MAIN with popup capture armed.
-      // Never click here: isolated-world window.open overrides do not affect
-      // the marketplace's native handlers.
+      // The worker invokes this exact marker through Chrome with userGesture
+      // so native popups can open without replacing window.open or page events.
       if(contactMarker?.node)contactMarker.node.removeAttribute('data-openlinks-contact');
       contactMarker={node:found.contact,token:crypto.randomUUID()};
       found.contact.setAttribute('data-openlinks-contact',contactMarker.token);

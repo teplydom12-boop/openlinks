@@ -4,13 +4,13 @@ import {readFileSync} from 'node:fs';
 import {initialState,WINDOW_MS} from '../extension/lib/core.js';
 import {initialDialogs,bindDialogTab} from '../extension/lib/dialogs.js';
 import {domReply} from './debugger-harness.js';
-import {cancelAllBackgroundPages} from '../extension/lib/background-page-guard.js';
 import {folderDigest} from '../extension/lib/folder-bridge.js';
 const listener=()=>{const list=[];return {list,addListener(fn){list.push(fn);}};};
 let stored,clicks,contactClicks,commands,requests,beforeClick,probeKind,sendResult,frameUrl,tabCount,opened,missing,obstacle,prepareOk,lookupPages,fetches,probeRoute,updated,probeKey,listedTabs,frameList,tabReplies,frameProbes,deliveries;
 let scheduled,removed,canClose,nativeRequired,debuggerFailure,debuggerCalls,nativeFailure,chatReady;
 let afterPrepare,querySendGuard,createdTabs,windowReplies,lastNormalWindow,windowUpdates;
 let scriptCalls,scriptReply,preloadCalls,preloadAttach,preloadSession,allTabUpdates;
+let nativeContactResult,nativeContactThrow,afterContactMark,contactGestures;
 const documentedFrames=()=> (frameList || [{frameId:0,url:frameUrl}]).map(frame=>({...frame,documentId:frame.documentId || 'document-'+frame.frameId+'-'+frame.url}));
 let extraStorage={};
 const metadataFixture=readFileSync(new URL('./fixtures/1688-metadata.html',import.meta.url),'utf8');
@@ -21,11 +21,11 @@ globalThis.chrome={runtime,alarms,storage:{local:{get:async keys=>{
  const all={...extraStorage,openlinksState:stored};
  return structuredClone(keys==null?all:Object.fromEntries((Array.isArray(keys)?keys:[keys]).map(key=>[key,all[key]])));
 },set:async data=>{if(Object.hasOwn(data,'openlinksState'))stored=structuredClone(data.openlinksState);for(const [key,value] of Object.entries(data))if(key!=='openlinksState')extraStorage[key]=structuredClone(value);},setAccessLevel:async()=>{}}},
- tabs:{onUpdated:listener(),onCreated:listener(),create:async data=>{opened.push(data.url);preloadAttach=data.url==='about:blank';createdTabs.push(structuredClone(data));return {id:++tabCount,windowId:data.windowId};},update:async(id,data)=>{allTabUpdates.push({id,...data});if(opened[id-1]==='about:blank'&&data.url)opened[id-1]=data.url;else updated.push({id,...data});return {id,windowId:10,url:data.url};},query:async()=>structuredClone(listedTabs.map(tab=>({windowId:10,...tab}))),get:async id=>({windowId:10,status:'complete',...(tabReplies.get(id) || {id,url:frameUrl})}),
+ tabs:{onUpdated:listener(),onCreated:listener(),create:async data=>{opened.push(data.url);createdTabs.push(structuredClone(data));const tab={id:++tabCount,windowId:data.windowId,active:data.active};tabReplies.set(tab.id,tab);return tab;},update:async(id,data)=>{allTabUpdates.push({id,...data});if(data.url)updated.push({id,...data});const tab={id,windowId:10,...tabReplies.get(id),...(Object.hasOwn(data,'active')?{active:data.active}:{})};tabReplies.set(id,tab);return {...tab,url:data.url};},query:async()=>structuredClone(listedTabs.map(tab=>({windowId:10,...tab}))),get:async id=>({id,url:frameUrl,windowId:10,status:'complete',...tabReplies.get(id)}),
  remove:async id=>{removed.push(id);},
  sendMessage:async(tab,data,options)=>{
   if(options.documentId)options={...options,frameId:documentedFrames().find(frame=>frame.documentId===options.documentId)?.frameId};
-  deliveries.push({tabId:tab,frameId:options.frameId,type:data.type});
+  deliveries.push({tabId:tab,frameId:options.frameId,type:data.type,active:tabReplies.get(tab)?.active===true,focused:windowReplies.get(tabReplies.get(tab)?.windowId??10)?.focused===true});
   commands.push(data.type);
   requests.push(structuredClone(data));
   if(data.type==='CHAT_READY')return {ok:chatReady,waiting:!chatReady,reason:'Loading chat'};
@@ -37,23 +37,22 @@ globalThis.chrome={runtime,alarms,storage:{local:{get:async keys=>{
   if(data.type==='SEND'){if(querySendGuard){const guard=await message('OPENLINKS_TEST_SEND_GUARD',{
    scope:'outreach',jobId:data.jobId,attemptId:data.attemptId,expectedUrl:data.expectedUrl,message:data.message
   },{id:'test',tab:{id:tab},frameId:options.frameId,url:documentedFrames().find(frame=>frame.frameId===options.frameId)?.url || frameUrl});if(!guard?.canSend)return {clicked:false,reason:'Нет разрешённой попытки отправки'};}clicks++;beforeClick=structuredClone(stored);if(sendResult==='disconnect')throw new Error('Disconnected');if(sendResult==='malformed')return {ok:false};return {clicked:sendResult!==false,accepted:sendResult===true,reason:'Кнопка изменилась'};}
-  if(data.type==='CONTACT'){contactClicks++;return {ok:true,key:probeKey,contactToken:'01234567-0123-4567-8901-012345678901',pageUrl:frameList?.find(frame=>frame.frameId===options.frameId)?.url || frameUrl};}
+  if(data.type==='CONTACT'){contactClicks++;afterContactMark?.();return {ok:true,key:probeKey,contactToken:'01234567-0123-4567-8901-012345678901',pageUrl:frameList?.find(frame=>frame.frameId===options.frameId)?.url || frameUrl};}
   if(data.type==='DISMISS_CHALLENGE'){if(obstacle?.stuck)return {clicked:true,closed:false};obstacle=null;return {clicked:true,closed:true};}
   return {ok:true};
- }},webNavigation:{onCreatedNavigationTarget:listener(),getAllFrames:async()=>{if(missing)throw new Error('No tab');return documentedFrames();}},scripting:{executeScript:async request=>{scriptCalls.push(request);const frame=documentedFrames().find(frame=>request.target.documentIds.includes(frame.documentId));return [{documentId:frame?.documentId,frameId:frame?.frameId,result:scriptReply?scriptReply(request):{ok:true,urls:[]}}];}},action:{onClicked:listener()},windows:{get:async id=>{if(!windowReplies.has(id))throw new Error('Window closed');return structuredClone(windowReplies.get(id));},getLastFocused:async()=>structuredClone(lastNormalWindow),update:async(id,data)=>{windowUpdates.push({id,...data});},create:async data=>{windowUpdates.push(data);}}};
+ }},webNavigation:{onCreatedNavigationTarget:listener(),getAllFrames:async()=>{if(missing)throw new Error('No tab');return documentedFrames();}},scripting:{executeScript:async request=>{scriptCalls.push(request);const frame=documentedFrames().find(frame=>request.target.documentIds.includes(frame.documentId));return [{documentId:frame?.documentId,frameId:frame?.frameId,result:scriptReply?scriptReply(request):{ok:true,urls:[]}}];}},action:{onClicked:listener()},windows:{get:async id=>{if(!windowReplies.has(id))throw new Error('Window closed');return structuredClone(windowReplies.get(id));},getLastFocused:async()=>structuredClone(lastNormalWindow),update:async(id,data)=>{windowUpdates.push({id,...data});windowReplies.set(id,{...windowReplies.get(id),...data});},create:async data=>{windowUpdates.push(data);}}};
 await import('../extension/background.js');
 chrome.debugger={
  attach:async target=>{preloadSession=preloadAttach;preloadAttach=false;(preloadSession?preloadCalls:debuggerCalls).push({type:'attach',target});if(debuggerFailure&&!preloadSession)throw new Error(debuggerFailure);},
  detach:async target=>{(preloadSession?preloadCalls:debuggerCalls).push({type:'detach',target});preloadSession=false;},
- sendCommand:async(target,method,params)=>{(preloadSession?preloadCalls:debuggerCalls).push({target,method,params});return method==='Page.addScriptToEvaluateOnNewDocument'?{identifier:'preload'}:domReply(method);},
+ sendCommand:async(target,method,params)=>{(preloadSession?preloadCalls:debuggerCalls).push({target,method,params});if(method==='DOM.resolveNode')return {object:{objectId:'contact-node'}};if(method==='Runtime.callFunctionOn'){contactGestures.push(params);if(nativeContactThrow)throw new Error('Native contact transport interrupted');return {result:{value:nativeContactResult}};}return method==='Page.addScriptToEvaluateOnNewDocument'?{identifier:'preload'}:domReply(method);},
 };
-test.afterEach(()=>cancelAllBackgroundPages(chrome));
 const ui={id:'test',url:'chrome-extension://test/dashboard.html'};
 const message=(type,extra={},sender=ui)=>new Promise(resolve=>{
  for(const listen of runtime.onMessage.list)listen({type,...extra},sender,resolve);
 });
 async function tick(){alarms.onAlarm.list[0]({name:'openlinks-tick'});await message('GET');}
-function reset(){scriptCalls=[];scriptReply=null;preloadCalls=[];preloadAttach=false;preloadSession=false;allTabUpdates=[];createdTabs=[];windowReplies=new Map([[10,{id:10,type:'normal'}]]);lastNormalWindow={id:10,type:'normal'};windowUpdates=[];afterPrepare=null;querySendGuard=false;stored=initialState();extraStorage={};stored.settings.message='Hello';clicks=0;contactClicks=0;commands=[];requests=[];beforeClick=null;probeKind='chat';sendResult=true;frameUrl='https://a.en.alibaba.com/chat';tabCount=0;opened=[];missing=false;obstacle=null;prepareOk=true;lookupPages=new Map();fetches=[];probeRoute=null;updated=[];probeKey='#contact';listedTabs=[];frameList=null;tabReplies=new Map();frameProbes=new Map();deliveries=[];scheduled=[];removed=[];canClose=true;nativeRequired=false;debuggerFailure=null;debuggerCalls=[];nativeFailure=null;chatReady=true;}
+function reset(){nativeContactResult={ok:true};nativeContactThrow=false;afterContactMark=null;contactGestures=[];scriptCalls=[];scriptReply=null;preloadCalls=[];preloadAttach=false;preloadSession=false;allTabUpdates=[];createdTabs=[];windowReplies=new Map([[10,{id:10,type:'normal'}]]);lastNormalWindow={id:10,type:'normal'};windowUpdates=[];afterPrepare=null;querySendGuard=false;stored=initialState();extraStorage={};stored.settings.message='Hello';clicks=0;contactClicks=0;commands=[];requests=[];beforeClick=null;probeKind='chat';sendResult=true;frameUrl='https://a.en.alibaba.com/chat';tabCount=0;opened=[];missing=false;obstacle=null;prepareOk=true;lookupPages=new Map();fetches=[];probeRoute=null;updated=[];probeKey='#contact';listedTabs=[];frameList=null;tabReplies=new Map();frameProbes=new Map();deliveries=[];scheduled=[];removed=[];canClose=true;nativeRequired=false;debuggerFailure=null;debuggerCalls=[];nativeFailure=null;chatReady=true;}
 async function review(url='https://a.en.alibaba.com/'){await message('IMPORT',{text:url});await message('START');await tick();await tick();}
 async function openingTimedOut(){stored.queue[0].chatOpening.at=Date.now()-21000;await tick();}
 
@@ -61,26 +60,26 @@ async function retryDue(){stored.queue.find(j=>j.id===stored.activeId).retryAt=D
 // Compatibility fixture for already-persisted manual/automatic interventions.
 function legacyUncertain(){stored.queue[0].status='uncertain';stored.activeId=stored.queue[0].id;stored.running=false;}
 async function fireClose(token){alarms.onAlarm.list[0]({name:'openlinks-close:'+token});await message('GET');}
-test('automatic outreach tabs stay inactive in the window bound at Start, even after focus changes',async()=>{
+test('automatic outreach activates supplier tabs in the window bound at Start, even after focus changes',async()=>{
  reset();windowReplies.set(22,{id:22,type:'normal'});
  await message('IMPORT',{text:'https://a.en.alibaba.com/\nhttps://b.en.made-in-china.com/'});
  await message('START',{}, {...ui,tab:{id:100,windowId:22}});
  assert.equal(stored.queueWindowId,22);
  lastNormalWindow={id:33,type:'normal'};windowReplies.set(33,lastNormalWindow);
  await tick();
- assert.deepEqual(createdTabs,[{url:'about:blank',active:false,windowId:22}]);
- assert.deepEqual(allTabUpdates,[{id:1,url:'https://a.en.alibaba.com/'}]);
+ assert.deepEqual(createdTabs,[{url:'https://a.en.alibaba.com/',active:true,windowId:22}]);
+ assert.deepEqual(windowUpdates,[{id:22,focused:true}]);
  await message('SKIP',{id:stored.activeId});await tick();
  assert.equal(createdTabs.length,2);
- assert.ok(createdTabs.every(tab=>tab.active===false && tab.windowId===22));
- assert.ok(!updated.some(tab=>tab.active===true));assert.deepEqual(windowUpdates,[]);
+ assert.ok(createdTabs.every(tab=>tab.active===true && tab.windowId===22));
+ assert.ok(windowUpdates.every(window=>window.id===22 && window.focused));assert.deepEqual(preloadCalls,[]);
 });
 test('popup dashboard binds a normal browser window and never creates outreach tabs in its popup',async()=>{
  reset();windowReplies.set(20,{id:20,type:'popup'});
  await message('IMPORT',{text:'https://a.en.alibaba.com/'});
  assert.equal((await message('START',{}, {...ui,tab:{id:100,windowId:20}})).ok,true);
- await tick();assert.equal(createdTabs[0].windowId,10);assert.equal(createdTabs[0].active,false);
- assert.deepEqual(windowUpdates,[]);
+ await tick();assert.equal(createdTabs[0].windowId,10);assert.equal(createdTabs[0].active,true);
+ assert.deepEqual(windowUpdates,[{id:10,focused:true}]);
 });
 test('closing the queue window pauses before spending a visit and never falls back to another window',async()=>{
  reset();await message('IMPORT',{text:'https://a.en.alibaba.com/'});await message('START');
@@ -90,7 +89,7 @@ test('closing the queue window pauses before spending a visit and never falls ba
  assert.equal(stored.slots.length,0);assert.equal(createdTabs.length,0);assert.equal(stored.activeId,null);
  assert.match(stored.activity.detail,/Окно очереди закрыто/);
  assert.equal((await message('START')).ok,true);await tick();
- assert.equal(createdTabs[0].windowId,33);assert.equal(createdTabs[0].active,false);
+ assert.equal(createdTabs[0].windowId,33);assert.equal(createdTabs[0].active,true);
 });
 test('Start without an available normal browser window does not start or create a window itself',async()=>{
  reset();windowReplies.clear();lastNormalWindow=null;
@@ -106,7 +105,7 @@ test('browser restart clears remembered window IDs before a future explicit Star
 test('explicit toolbar opening still focuses the existing interface window',async()=>{
  reset();listedTabs=[{id:101,windowId:77,url:'chrome-extension://test/dashboard.html'}];
  await chrome.action.onClicked.list[0]();
- assert.deepEqual(updated,[{id:101,active:true}]);assert.deepEqual(windowUpdates,[{id:77,focused:true}]);
+ assert.deepEqual(allTabUpdates,[{id:101,active:true}]);assert.deepEqual(windowUpdates,[{id:77,focused:true}]);
 });
 
 test('completed send schedules closure for 10 seconds later without delaying another platform',async t=>{
@@ -218,13 +217,13 @@ test('when no other platform is available the interval wait is logged only once'
  assert.equal(opened.length,0);assert.equal(stored.waiting.jobId,stored.queue[0].id);assert.equal(stored.events.filter(e=>e.type==='wait').length,1);
 });
 test('a platform interval yields to another platform, keeps one active supplier and returns in platform order',async t=>{
- const now=2000000;t.mock.method(Date,'now',()=>now);
+ const now=2000000;let clock=now;t.mock.method(Date,'now',()=>clock);
  for(const [waiting,first,second,other] of [
    ['1688','https://first.1688.com/','https://second.1688.com/','https://ready.en.alibaba.com/'],
    ['alibaba','https://first.en.alibaba.com/','https://second.en.alibaba.com/','https://ready.1688.com/'],
    ['alibaba','https://first.en.alibaba.com/','https://second.en.alibaba.com/','https://ready.en.made-in-china.com/'],
  ]) {
-   reset();frameUrl=other;stored.slots=[{platform:waiting,kind:'visit',at:now}];
+   reset();clock=now;frameUrl=other;stored.slots=[{platform:waiting,kind:'visit',at:now}];
    await message('IMPORT',{text:[first,second,other].join('\n')});await message('START');await tick();
    assert.deepEqual(opened,[other]);assert.equal(stored.activeId,stored.queue[2].id);
    assert.equal(stored.queue[0].status,'pending');assert.equal(stored.queue[1].status,'pending');assert.equal(stored.waiting,null);
@@ -233,9 +232,26 @@ test('a platform interval yields to another platform, keeps one active supplier 
    assert.equal(stored.queue[2].status,'review');assert.deepEqual(opened,[other]);assert.equal(clicks,0);
    assert.equal(stored.slots.filter(slot=>slot.kind==='visit').length,2);
    await message('SKIP',{id:stored.activeId});frameUrl=first;await tick();
+   assert.deepEqual(opened,[other]);assert.equal(stored.waiting.until,now+stored.settings.intervals[waiting]*1000);
+   clock=stored.waiting.until;await tick();
    assert.deepEqual(opened,[other,first]);assert.equal(stored.activeId,stored.queue[0].id);
    assert.equal(stored.queue[1].status,'pending');assert.equal(clicks,0);
  }
+});
+test('a prepared chat waiting on its send interval yields to another platform and later reuses its reservation',async t=>{
+ reset();const now=3000000;let clock=now;t.mock.method(Date,'now',()=>clock);
+ await review();const first=stored.queue[0];await message('APPROVE');
+ stored.slots.push({platform:'alibaba',kind:'send',at:now,jobId:'earlier-supplier'});
+ await message('IMPORT',{text:'https://ready.en.made-in-china.com/'});
+ await tick();assert.equal(stored.queue[0].status,'deferred_send');assert.equal(stored.queue[0].approved,true);
+ assert.equal(stored.activeId,null);assert.equal(stored.waiting,null);assert.equal(clicks,0);
+ frameUrl='https://ready.en.made-in-china.com/';await tick();
+ assert.equal(stored.activeId,stored.queue[1].id);assert.equal(createdTabs.length,2);
+ await message('SKIP',{id:stored.activeId});await tick();assert.equal(stored.waiting.until,now+420000);
+ clock=now+420000;frameUrl=first.reviewUrl;await tick();
+ assert.equal(stored.activeId,first.id);assert.equal(stored.queue[0].status,'review');assert.equal(stored.queue[0].tabId,first.tabId);
+ await tick();assert.equal(clicks,1);assert.equal(stored.queue[0].status,'attempted');assert.equal(createdTabs.length,2);
+ assert.equal(stored.slots.filter(slot=>slot.kind==='visit'&&slot.jobId===first.id).length,1);
 });
 test('importing a ready platform during an interval wait wakes the queue in one second',async t=>{
  reset();const now=2000000;t.mock.method(Date,'now',()=>now);
@@ -532,13 +548,13 @@ test('a matching 1688 chat in another browser window is not silently borrowed by
  await tick();assert.equal(stored.queue[0].tabId,1);assert.equal(stored.learning.field,'contact');
  listedTabs.push({id:31,windowId:10,url:messenger1688});frameUrl=messenger1688;probeKind='chat';await tick();
  assert.equal(stored.queue[0].tabId,31);assert.equal(stored.queue[0].status,'review');
- assert.deepEqual(windowUpdates,[]);assert.ok(!updated.some(tab=>tab.active===true));
+ assert.ok(allTabUpdates.some(tab=>tab.id===31&&tab.active));assert.ok(windowUpdates.some(window=>window.id===10&&window.focused));
 });
-test('an identified marketplace popup can be adopted without focusing either browser window',async()=>{
- await waitingFor1688Contact();
+test('an identified marketplace popup becomes active in its own browser window',async()=>{
+ await waitingFor1688Contact();windowReplies.set(33,{id:33,type:'popup'});tabReplies.set(30,{id:30,windowId:33,active:false});
  chrome.tabs.onCreated.list[0]({id:30,windowId:33,openerTabId:1,url:messenger1688,active:true});await message('GET');
  assert.equal(stored.queue[0].tabId,30);assert.equal(stored.queue[0].windowId,33);assert.equal(stored.queueWindowId,10);
- assert.deepEqual(windowUpdates,[]);assert.ok(!updated.some(tab=>Object.hasOwn(tab,'active')));
+ assert.ok(windowUpdates.some(window=>window.id===33&&window.focused));assert.ok(allTabUpdates.some(tab=>tab.id===30&&tab.active));
 });
 
 test('ambiguous or unrelated 1688 tabs never pick another supplier, including older tasks without supplierTabId',async()=>{
@@ -606,71 +622,72 @@ test('new opener authorizes and persists at most three clicks, five seconds apar
   assert.equal(stored.slots.filter(slot=>slot.kind==='send').length,0);assert.equal(clicks,0);
  }
 });
-test('native MIC popup is captured in exact documents and navigates only its existing background tab',async()=>{
+test('native MIC contact click keeps normal popup handling and adopts the related messenger',async()=>{
  await beginSupplierOpening('https://shop.en.made-in-china.com/');
+ assert.equal((await openingEvent('attempt',{attempt:1})).ok,true);
+ const contact=requests.find(request=>request.type==='CONTACT');assert.equal(contact.foreground,undefined);assert.equal(contactGestures.length,1);assert.equal(contactGestures[0].userGesture,true);assert.equal(debuggerCalls.at(-1).type,'detach');
+ assert.equal(scriptCalls.length,0);assert.equal(preloadCalls.length,0);assert.equal(contactClicks,1);
  const target='https://webim.made-in-china.com/super-tm/#/chat/Fixture_123?data=private-fixture-token&refer='+encodeURIComponent(frameUrl)+'&isLiteTM=true&isSAChat=false';
- let captured=false;
- scriptReply=request=>{if(request.args[0].action==='click')captured=true;return {ok:true,urls:captured?[target]:[]};};
- assert.equal((await openingEvent('attempt',{attempt:1})).ok,true);
- assert.equal(updated.at(-1).url,target);assert.equal(updated.at(-1).id,1);
- assert.equal(createdTabs.length,1);assert.ok(createdTabs.every(tab=>tab.active===false));
- assert.ok(allTabUpdates.every(tab=>!Object.hasOwn(tab,'active')));assert.deepEqual(windowUpdates,[]);
- assert.ok(scriptCalls.every(call=>call.world==='MAIN'&&call.target.documentIds.length===1&&!Object.hasOwn(call.target,'frameIds')));
- assert.equal(stored.queue[0].chatOpened,true);assert.equal(stored.queue[0].contactCaptures,undefined);
- assert.ok(!JSON.stringify(stored).includes('private-fixture-token'));assert.equal(clicks,0);
+ chrome.tabs.onCreated.list[0]({id:30,windowId:10,openerTabId:1,url:target});await message('GET');
+ assert.equal(stored.queue[0].tabId,30);assert.equal(stored.queue[0].chatOpened,true);
+ assert.ok(allTabUpdates.some(tab=>tab.id===30&&tab.active));assert.equal(clicks,0);
 });
-test('unproven Alibaba popup stops safely without opening or activating any extra tab',async()=>{
- await beginSupplierOpening();let captured=false;
- scriptReply=request=>{if(request.args[0].action==='click')captured=true;return {ok:true,urls:captured?['https://onetalk.alibaba.com/message/weblite.htm']:[]};};
- assert.equal((await openingEvent('attempt',{attempt:1})).ok,false);
- assert.equal(stored.queue[0].status,'retry_wait');assert.match(stored.queue[0].reason,/адрес.*не подтверждает получателя/);
- assert.deepEqual(updated,[]);assert.equal(createdTabs.length,1);assert.deepEqual(windowUpdates,[]);assert.equal(clicks,0);
+test('native Alibaba messenger popup is adopted from the storefront instead of rejecting its generic route',async()=>{
+ await beginSupplierOpening();assert.equal((await openingEvent('attempt',{attempt:1})).ok,true);
+ const target='https://onetalk.alibaba.com/message/weblite.htm';
+ chrome.tabs.onCreated.list[0]({id:30,windowId:10,openerTabId:1,url:target});await message('GET');
+ assert.equal(stored.queue[0].tabId,30);assert.equal(stored.queue[0].chatOpened,true);
+ assert.ok(allTabUpdates.some(tab=>tab.id===30&&tab.active));assert.equal(scriptCalls.length,0);assert.equal(clicks,0);
 });
-test('inline chat permanently wins over simultaneous or delayed popup capture',async()=>{
- await beginSupplierOpening();
- scriptReply=request=>{if(request.args[0].action==='click')probeKind='chat';return {ok:true,urls:['https://onetalk.alibaba.com/message/weblite.htm']};};
- assert.equal((await openingEvent('attempt',{attempt:1})).ok,true);
- assert.equal(stored.queue[0].contactCaptures,undefined);assert.deepEqual(updated,[]);
- await tick();assert.equal(stored.queue[0].status,'review');assert.deepEqual(updated,[]);assert.equal(clicks,0);
+test('inline chat continues in the visible storefront without intercepted popup navigation',async()=>{
+ await beginSupplierOpening();assert.equal((await openingEvent('attempt',{attempt:1})).ok,true);probeKind='chat';
+ await tick();assert.equal(stored.queue[0].status,'review');assert.equal(stored.queue[0].tabId,1);
+ assert.deepEqual(updated,[]);assert.equal(scriptCalls.length,0);assert.equal(clicks,0);
 });
-test('delayed 1688 startup popup is captured on the next tick before any contact click',async()=>{
+test('a delayed native1688 startup popup is adopted without demanding a contact click',async()=>{
  reset();frameUrl='https://shop.1688.com/';probeKind='waiting';await review(frameUrl);
- assert.ok(stored.queue[0].contactCaptures?.length);assert.equal(contactClicks,0);
- scriptReply=()=>({ok:true,urls:[messenger1688]});await tick();
- assert.equal(updated.at(-1).url,globalThis.OpenLinks1688.route(messenger1688));
- assert.equal(stored.queue[0].chatOpened,true);assert.equal(contactClicks,0);assert.equal(clicks,0);
- assert.equal(createdTabs.length,1);assert.deepEqual(windowUpdates,[]);
+ assert.equal(contactClicks,0);assert.equal(preloadCalls.length,0);
+ chrome.tabs.onCreated.list[0]({id:30,windowId:10,openerTabId:1,url:messenger1688});await message('GET');
+ assert.equal(stored.queue[0].tabId,30);assert.equal(stored.queue[0].chatOpened,true);
+ assert.ok(allTabUpdates.some(tab=>tab.id===30&&tab.active));assert.equal(contactClicks,0);assert.equal(clicks,0);
 });
-test('pause releases a pending preload and reuses the already-created background tab on resume',async()=>{
+test('pause leaves native page loading intact and resumes the same visible tab without another visit',async()=>{
  reset();await message('IMPORT',{text:frameUrl});await message('START');await tick();
- assert.equal(preloadCalls.filter(item=>item.type==='attach').length,1);
- tabReplies.set(1,{id:1,url:'about:blank',pendingUrl:frameUrl,status:'loading'});
- const slots=structuredClone(stored.slots);
- await message('PAUSE');assert.equal(preloadCalls.filter(item=>item.type==='detach').length,1);
- assert.equal(stored.queue[0].resumeBackgroundPage,true);
- const methods=preloadCalls.map(call=>call.method || call.type);
- assert.ok(methods.indexOf('Page.stopLoading')<methods.indexOf('Page.removeScriptToEvaluateOnNewDocument'));
- tabReplies.set(1,{id:1,url:'about:blank',status:'complete'});
- await message('START');await tick();assert.equal(createdTabs.length,1);assert.equal(clicks,0);
- assert.deepEqual(updated.at(-1),{id:1,url:frameUrl});assert.deepEqual(stored.slots,slots);
- assert.equal(stored.queue[0].resumeBackgroundPage,undefined);
- tabReplies.set(1,{id:1,url:frameUrl,status:'complete'});await tick();
- assert.equal(stored.queue[0].status,'review');assert.equal(createdTabs.length,1);assert.equal(clicks,0);
+ tabReplies.set(1,{id:1,url:frameUrl,status:'loading',active:true});const slots=structuredClone(stored.slots);
+ await message('PAUSE');assert.equal(preloadCalls.length,0);assert.equal(stored.queue[0].resumeBackgroundPage,undefined);
+ tabReplies.set(1,{id:1,url:frameUrl,status:'complete',active:false});
+ await message('START');await tick();assert.equal(createdTabs.length,1);assert.equal(stored.queue[0].status,'review');
+ assert.deepEqual(stored.slots,slots);assert.ok(allTabUpdates.some(tab=>tab.id===1&&tab.active));assert.equal(clicks,0);
 });
-test('guarded loading timeout retries the stopped navigation in its existing tab without another visit',async t=>{
- reset();const started=Date.now();t.mock.method(Date,'now',()=>started);
- await message('IMPORT',{text:frameUrl});await message('START');await tick();
- const slots=structuredClone(stored.slots);
- tabReplies.set(1,{id:1,url:'about:blank',pendingUrl:frameUrl,status:'loading'});
- t.mock.method(Date,'now',()=>started+120001);await tick();
- assert.equal(stored.queue[0].status,'retry_wait');assert.equal(stored.queue[0].resumeBackgroundPage,true);
- assert.equal(stored.queue[0].errorCount,1);
- tabReplies.set(1,{id:1,url:'about:blank',status:'complete'});
- t.mock.method(Date,'now',()=>started+130002);await tick();
- assert.deepEqual(updated.at(-1),{id:1,url:frameUrl});assert.deepEqual(stored.slots,slots);
- assert.equal(createdTabs.length,1);assert.equal(stored.queue[0].resumeBackgroundPage,undefined);
- tabReplies.set(1,{id:1,url:frameUrl,status:'complete'});await tick();
- assert.equal(stored.queue[0].status,'review');assert.equal(clicks,0);
+test('persisted interrupted background navigation resumes visibly in the existing reserved tab',async()=>{
+ reset();await message('IMPORT',{text:frameUrl});await message('START');await tick();
+ stored.queue[0].resumeBackgroundPage=true;stored.queue[0].contactCaptures=[{tabId:1,documentId:'old'}];
+ tabReplies.set(1,{id:1,url:'about:blank',status:'complete',active:false});const slots=structuredClone(stored.slots);
+ await tick();assert.deepEqual(updated.at(-1),{id:1,url:frameUrl,active:true});
+ assert.deepEqual(stored.slots,slots);assert.equal(createdTabs.length,1);assert.equal(stored.queue[0].resumeBackgroundPage,undefined);
+ assert.equal(stored.queue[0].contactCaptures,undefined);assert.equal(preloadCalls.length,0);
+ tabReplies.set(1,{id:1,url:frameUrl,status:'complete',active:true});await tick();assert.equal(stored.queue[0].status,'review');assert.equal(clicks,0);
+});
+test('an old page guard pauses with a reload instruction and never consumes automatic error retries',async()=>{
+ await beginSupplierOpening();nativeContactResult={ok:false,reason:'reload_required',reloadRequired:true};
+ assert.equal((await openingEvent('attempt',{attempt:1})).ok,false);
+ assert.equal(stored.running,false);assert.equal(stored.queue[0].status,'blocked');
+ assert.match(stored.queue[0].reason,/Обновите вкладку/);assert.equal(stored.queue[0].errorCount||0,0);
+ const count=contactGestures.length;await tick();await tick();assert.equal(contactGestures.length,count);
+ assert.ok(!stored.events.some(event=>event.type==='retry_scheduled'));assert.equal(clicks,0);assert.equal(debuggerCalls.at(-1).type,'detach');
+});
+test('an uncertain contact invocation stops without a blind second click or supplier send',async()=>{
+ await beginSupplierOpening();nativeContactThrow=true;
+ assert.equal((await openingEvent('attempt',{attempt:1})).ok,false);
+ assert.equal(stored.running,false);assert.equal(stored.queue[0].status,'blocked');
+ assert.match(stored.queue[0].reason,/Нажатие могло выполниться/);assert.equal(stored.queue[0].errorCount||0,0);
+ await tick();assert.equal(contactGestures.length,1);assert.equal(clicks,0);assert.equal(debuggerCalls.at(-1).type,'detach');
+});
+test('a document replacement after contact marking prevents native contact activation',async()=>{
+ await beginSupplierOpening();afterContactMark=()=>{frameList=[{frameId:0,url:frameUrl,documentId:'replacement-document'}];};
+ assert.equal((await openingEvent('attempt',{attempt:1})).ok,false);
+ assert.equal(contactGestures.length,0);assert.equal(debuggerCalls.length,0);assert.equal(clicks,0);
+ assert.equal(stored.queue[0].status,'retry_wait');assert.match(stored.queue[0].reason,/Страница изменилась/);
 });
 test('opener events require the current job, tab, frame, platform and token',async()=>{
  await beginSupplierOpening();const opening=stored.queue[0].chatOpening;
@@ -1008,13 +1025,15 @@ test('tab ownership validation is serialized even while Chrome lookup is delayed
  }
 });
 
-test('dialogue replies reserve outreach quota atomically and never authorize a duplicate attempt',async()=>{
+test('dialogue replies reserve outreach quota atomically, respect send intervals and never authorize a duplicate attempt',async t=>{
  reset();const {reserveDialogSendQuota}=await import('../extension/background.js');
  const jobId=crypto.randomUUID(),attemptId=crypto.randomUUID();
  const first=await reserveDialogSendQuota({platform:'alibaba',jobId,attemptId});assert.equal(first.ok,true);
  const replay=await reserveDialogSendQuota({platform:'alibaba',jobId,attemptId});assert.equal(replay.ok,false);assert.equal(replay.unknown,true);assert.equal(stored.slots.length,1);
  const rest=await Promise.all(Array.from({length:4},()=>reserveDialogSendQuota({platform:'alibaba',jobId:crypto.randomUUID(),attemptId:crypto.randomUUID()})));
- assert.equal(rest.filter(r=>r.ok).length,2);assert.equal(stored.slots.length,3);assert.ok(rest.filter(r=>!r.ok).every(r=>r.retryAt>Date.now()));assert.equal(clicks,0);
+ assert.equal(rest.filter(r=>r.ok).length,0);assert.equal(stored.slots.length,1);assert.ok(rest.every(r=>r.retryAt>=first.at+stored.settings.intervals.alibaba*1000));
+ t.mock.method(Date,'now',()=>first.at+stored.settings.intervals.alibaba*1000);
+ assert.equal((await reserveDialogSendQuota({platform:'alibaba',jobId:crypto.randomUUID(),attemptId:crypto.randomUUID()})).ok,true);assert.equal(stored.slots.length,2);assert.equal(clicks,0);
 });
 test('dialogue quota includes prior outreach sends and protects future reservations after clock rollback',async()=>{
  reset();const {reserveDialogSendQuota}=await import('../extension/background.js');
@@ -1036,7 +1055,7 @@ test('legacy dialogue test flag cannot block independent primary start, approval
  await tick();assert.equal(clicks,1);assert.equal(stored.queue[0].status,'attempted');
  assert.equal(stored.slots.filter(s=>s.kind==='send').length,1);
  assert.deepEqual(extraStorage.openlinksClaudeFolder,preview);
- assert.ok(createdTabs.every(tab=>tab.active===false));assert.ok(!allTabUpdates.some(tab=>tab.active));assert.deepEqual(windowUpdates,[]);
+ assert.ok(createdTabs.every(tab=>tab.active===true));assert.ok(windowUpdates.some(window=>window.focused));assert.deepEqual(preloadCalls,[]);
  const quota=await reserveDialogSendQuota({platform:'mic',jobId:crypto.randomUUID(),attemptId:crypto.randomUUID()});
  assert.equal(quota.ok,false);assert.match(quota.reason,/тестовый режим/);assert.equal(clicks,1);
 });
@@ -1045,14 +1064,35 @@ test('legacy dialogue test flag appearing during primary preparation does not ca
  await tick();assert.equal(clicks,1);assert.equal(stored.queue[0].status,'attempted');
  assert.equal(stored.slots.filter(s=>s.kind==='send').length,1);assert.equal(commands.includes('SEND'),true);
 });
-test('1688 primary native activation and automatic send work in background despite a stale dialogue preview',async()=>{
+test('1688 primary native activation and automatic send work visibly despite a stale dialogue preview',async()=>{
  reset();frameUrl='https://air.1688.com/chat';nativeRequired=true;querySendGuard=true;stored.settings.review=false;
  extraStorage.openlinksClaudeFolder={test:{enabled:true,sessionId:'old-preview'}};
  await review('https://a.1688.com/');assert.equal(stored.queue[0].approved,true);
  assert.equal(debuggerCalls[0].type,'attach');assert.equal(debuggerCalls.at(-1).type,'detach');
  await tick();assert.equal(clicks,1);assert.equal(stored.queue[0].status,'attempted');
  assert.equal(stored.slots.filter(slot=>slot.kind==='send').length,1);
- assert.ok(createdTabs.every(tab=>tab.active===false));assert.ok(!allTabUpdates.some(tab=>tab.active));assert.deepEqual(windowUpdates,[]);
+ assert.ok(createdTabs.every(tab=>tab.active===true));assert.ok(windowUpdates.some(window=>window.focused));assert.deepEqual(preloadCalls,[]);
+});
+test('visible outreach restores its minimized window and refocuses before native input and send',async()=>{
+ for(const [platform,url] of [['1688','https://a.1688.com/chat'],['alibaba','https://a.en.alibaba.com/chat'],['mic','https://a.en.made-in-china.com/chat']]) {
+  reset();frameUrl=url;querySendGuard=true;stored.settings.review=false;nativeRequired=platform==='1688';
+  windowReplies.set(10,{id:10,type:'normal',state:'minimized',focused:false});
+  afterPrepare=()=>{const tab=tabReplies.get(1);tabReplies.set(1,{...tab,active:false});windowReplies.set(10,{id:10,type:'normal',state:'normal',focused:false});};
+  await review(url);
+  assert.equal(clicks,1,platform);assert.equal(stored.queue[0].status,'attempted',platform);
+  assert.ok(windowUpdates.some(window=>window.id===10&&window.state==='normal'&&window.focused),platform);
+  const mutations=deliveries.filter(item=>['PREPARE','NATIVE_INPUT','SEND'].includes(item.type));
+  assert.ok(mutations.length>=3,platform);assert.ok(mutations.every(item=>item.active&&item.focused),platform);
+  assert.equal(preloadCalls.length,0,platform);
+ }
+});
+test('a window focus failure before SEND consumes no send quota and is not reported as an unknown click',async t=>{
+ reset();await review();await message('APPROVE');
+ afterPrepare=()=>{windowReplies.set(10,{id:10,type:'normal',focused:false});};
+ t.mock.method(chrome.windows,'update',async()=>{throw new Error('Window disappeared');});
+ await tick();assert.equal(clicks,0);assert.equal(stored.slots.filter(slot=>slot.kind==='send').length,0);
+ assert.equal(stored.queue[0].status,'retry_wait');assert.ok(!commands.includes('SEND'));
+ assert.ok(!stored.events.some(event=>event.type==='send_attempt'||event.type==='send_disconnect'));
 });
 test('primary permission requires the exact approved sending operation and reserved quota',async()=>{
  reset();await review();await message('APPROVE');await tick();
@@ -1131,7 +1171,7 @@ test('joint start preserves approval and Claude settings and gives ready outreac
   let ran=false;const turn=await coordination.withDialogTurn(()=>{ran=true;});assert.equal(turn.allowed,false);assert.equal(ran,false);
   const reserved=await coordination.reserveDialogSendQuota({platform:'mic',jobId:crypto.randomUUID(),attemptId:crypto.randomUUID()});
   assert.equal(reserved.ok,false);assert.equal(reserved.coordination,true);assert.equal(stored.slots.length,0);
-  await tick();assert.equal(createdTabs.length,1);assert.equal(createdTabs[0].active,false);assert.equal(clicks,0);
+  await tick();assert.equal(createdTabs.length,1);assert.equal(createdTabs[0].active,true);assert.equal(clicks,0);
 });
 test('joint start ignores the dormant dialogue test flag and preserves its preview evidence',async()=>{
   reset();extraStorage.openlinksClaudeFolder={test:{enabled:true,sessionId:'old-preview',history:[{id:'old-preview'}]}};
@@ -1240,6 +1280,6 @@ test('retired preview callback cannot stop joint primary work',async()=>{
   reset();await jointQueue();extraStorage.openlinksClaudeFolder={test:{enabled:true}};
   await coordination.pauseOutreachForTest();
   assert.equal(extraStorage.openlinksWorkCoordinator.enabled,true);assert.equal(stored.running,true);
-  await tick();assert.equal(createdTabs.length,1);assert.equal(createdTabs[0].active,false);
+  await tick();assert.equal(createdTabs.length,1);assert.equal(createdTabs[0].active,true);
   assert.equal(clicks,0);assert.equal(stored.slots.filter(slot=>slot.kind==='visit').length,1);
 });

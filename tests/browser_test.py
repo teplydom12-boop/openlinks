@@ -6,6 +6,7 @@ The actual core, content script, dashboard and file writer run unmodified.
 """
 import functools
 import io
+import json
 from openpyxl import load_workbook
 import http.server
 import os
@@ -35,7 +36,7 @@ threading.Thread(target=server.serve_forever, daemon=True).start()
 BASE = f'http://127.0.0.1:{server.server_port}'
 try:
     with sync_playwright() as p:
-        browser = p.chromium.launch(executable_path=os.environ.get('CHROMIUM_PATH', '/usr/bin/chromium'), headless=True)
+        browser = p.chromium.launch(executable_path=os.environ.get('CHROMIUM_PATH', '/usr/bin/chromium'), headless=True, ignore_default_args=['--disable-popup-blocking'])
         context = browser.new_context(viewport={'width': 1440, 'height': 1050}, timezone_id='Asia/Irkutsk')
         errors = []
         context.on('page', lambda page: page.on('pageerror', lambda error: errors.append(str(error))))
@@ -177,37 +178,67 @@ try:
         ui.get_by_role('button',name='Очередь поставщиков').click()
 
 
+        schedule_ui=context.new_page()
+        schedule_ui.add_init_script('Date.now=()=>1900000000000;')
+        schedule_ui.goto(BASE+'/extension/dashboard.html')
+        schedule_ui.get_by_role('button',name='Сообщение и настройки').click()
+        schedule_ui.locator('#interval-1688').fill('137')
+        schedule_ui.get_by_role('button',name='Сохранить настройки').click()
+        expect(schedule_ui.locator('#toast')).to_have_text('Настройки сохранены')
+        schedule_ui.get_by_role('button',name='Очередь поставщиков').click()
+        schedule_ui.locator('#supplier-input').fill('\n'.join(
+            link for index in range(5) for link in [f'https://fixture{index}.1688.com/',f'https://fixture{index}.en.made-in-china.com/']))
+        schedule_ui.locator('#add').click()
+        expect(schedule_ui.locator('#queue-body tr')).to_have_count(10)
+        forecast=schedule_ui.evaluate("""async()=>{
+          const {state}=await chrome.runtime.sendMessage({type:'GET'});
+          const {makePlan,scheduleText}=await import('/extension/lib/core.js');
+          const {displayTime}=await import('/extension/lib/time.js');
+          const dates=makePlan(state,Date.now()).filter(row=>row.platform==='1688').map(row=>row.plannedAt);
+          const displayed=[...document.querySelectorAll('#queue-body tr')].filter(row=>row.children[2].textContent==='1688').map(row=>row.children[3].textContent);
+          return {dates,expected:dates.map(displayTime),displayed,schedule:scheduleText(state,Date.now())};
+        }""")
+        assert forecast['dates']==[1900000000000+index*137000 for index in range(5)]
+        assert forecast['displayed']==forecast['expected'] and len(set(forecast['displayed']))==5
+        schedule_lines=[line.split('\t')[0] for line in forecast['schedule'].splitlines() if '\t1688\t' in line]
+        assert len(set(schedule_lines))==5
+        schedule_ui.close()
+        passed('dashboard and exported schedule show five distinct 1688 times 137 seconds apart despite intervening MIC shops')
+
         context.route('https://test.en.alibaba.com/**', lambda route: route.fulfill(
             body=(ROOT/'tests/fixtures'/('chat.html' if '/chat' in route.request.url else 'store.html')).read_text(), content_type='text/html'))
         supplier = context.new_page()
-        contact_source=(ROOT/'extension/lib/outreach-chat-open.js').read_text().replace('export function ', 'function ')
+        contact_source=(ROOT/'extension/lib/native-contact.js').read_text().replace('export ','')
         adapter_transport=contact_source+"""
           let listener;
           window.lessonMessages=[];
           window.adapterMessages=[];
           window.chrome={runtime:{id:'adapter-test',onMessage:{addListener(fn){listener=fn}},sendMessage:async message=>{adapterMessages.push(message);if(message.type==='OPENLINKS_TEST_SEND_GUARD')return {ok:true,canSend:true};if(message.type==='LEARN_PICK')lessonMessages.push(message);return {ok:true};}}};
+          window.contactCommands=[];
+          chrome.debugger={attach:async()=>{},detach:async()=>{},sendCommand:(target,method,params)=>new Promise(resolve=>contactCommands.push({method,params,resolve}))};
           const rawAdapter=(type,extra={})=>new Promise(resolve=>listener({type,jobId:'test-job',profile:{},message:'Hello, WeChat: demo',...extra},{id:'adapter-test'},resolve));
           window.adapter=async(type,extra={})=>{
-            if(type!=='CONTACT')return rawAdapter(type,extra);
-            // Match the worker's two-world protocol: arm the MAIN-world guard,
-            // mark one exact contact through content, then invoke its handler.
-            // These fixtures have inline/counter handlers; no captured popup
-            // should be followed or turned into a supplier request by the test.
-            const pageUrl=location.href;
-            const armed=await controlledContact({action:'arm',pageUrl});
-            if(!armed.ok)return armed;
-            const marked=await rawAdapter(type,extra);
-            if(!marked.ok)return marked;
-            if(marked.pageUrl!==pageUrl||!marked.contactToken)throw new Error('Invalid contact marker');
-            const clicked=await controlledContact({action:'click',pageUrl,token:marked.contactToken});
-            if(!clicked.ok)return clicked;
-            const captured=await controlledContact({action:'read',pageUrl});
-            if(!captured.ok)return captured;
-            if(captured.urls.length)throw new Error('Legacy inline fixture unexpectedly requested a popup');
-            if(document.querySelector('[data-openlinks-contact="'+marked.contactToken+'"]'))throw new Error('Contact marker was not consumed');
-            return {...marked,...clicked};
+            const result=await rawAdapter(type,extra);
+            return type==='CONTACT'&&result.ok?clickNativeContact({tabId:1},result):result;
           };
         """
+        contact_cdp=context.new_cdp_session(supplier)
+        def contact_eval(expression):
+            return contact_cdp.send('Runtime.evaluate',{'expression':expression,'returnByValue':True,'userGesture':False})['result'].get('value')
+        def contact_call(expression):
+            contact_eval('window.contactResult=null;Promise.resolve('+expression+').then(value=>{contactResult={value}},error=>{contactResult={error:error.message}});void 0')
+            deadline=time.monotonic()+10
+            while time.monotonic()<deadline:
+                command=contact_eval('contactCommands[0]&&{method:contactCommands[0].method,params:contactCommands[0].params}')
+                if command:
+                    reply=contact_cdp.send(command['method'],command['params'])
+                    contact_eval('contactCommands.shift().resolve('+json.dumps(reply)+');void 0')
+                result=contact_eval('contactResult')
+                if result:
+                    assert 'error' not in result,result
+                    return result['value']
+                supplier.wait_for_timeout(1)
+            raise AssertionError('Native contact CDP bridge timed out')
         supplier.add_init_script(adapter_transport)
         supplier.goto('https://test.en.alibaba.com/')
         supplier.add_script_tag(path=str(ROOT/'extension/rules-shared.js'))
@@ -257,7 +288,7 @@ try:
         assert not supplier.evaluate("adapter('SEND',{jobId:'forbidden',expectedUrl:location.href,profile:{chat:'body',editor:'#message',send:'#send'}})")['clicked']
         passed('inquiry is neither filled nor sent, even with explicit selectors')
         supplier.evaluate("document.body.innerHTML='<a href=/sendInquiry id=contact>Send inquiry</a>'")
-        assert not supplier.evaluate("adapter('CONTACT',{profile:{contact:'#contact'}})")['ok']
+        assert not contact_call("adapter('CONTACT',{profile:{contact:'#contact'}})")['ok']
         passed('explicit contact selector cannot click Send inquiry')
         supplier.evaluate("document.body.innerHTML='<textarea id=message></textarea><button id=send>Send</button>'")
         assert supplier.evaluate("adapter('PROBE')")['kind']!='chat'
@@ -298,7 +329,7 @@ try:
         supplier.add_script_tag(path=str(ROOT/'extension/content.js'))
         result=supplier.evaluate("adapter('PROBE')")
         assert result['kind']=='contact' and result['diagnostics']['adapter']=='mic'
-        assert supplier.evaluate("adapter('CONTACT')")['ok']
+        assert contact_call("adapter('CONTACT')")['ok']
         assert supplier.evaluate('headerClicks')==0 and supplier.evaluate('otherClicks')==1
         expect(supplier.locator('#inquiryContent')).to_have_value('')
         assert supplier.evaluate('inquiryClicks')==0
@@ -309,7 +340,7 @@ try:
         passed('MIC inqueryForm and inquiry markers stay blocked even when action URL is absent')
         supplier.evaluate("document.querySelector('.shop-sign__btns-wrap').insertAdjacentHTML('beforeend','<a class=J-open-tm href=javascript:;>Chat Now</a>')")
         assert supplier.evaluate("adapter('PROBE')")['kind']=='contact'
-        assert supplier.evaluate("adapter('CONTACT')")['ok']
+        assert contact_call("adapter('CONTACT')")['ok']
         assert supplier.evaluate('otherClicks')==2 and supplier.evaluate('headerClicks')==0
         passed('repeated MIC chat controls follow the reference selector/DOM order without stopping on duplicate hooks')
 
@@ -332,10 +363,10 @@ try:
         passed('native disabled and aria-disabled still prevent Alibaba sending')
         supplier.evaluate("document.querySelector('.send-box-container').remove()")
         assert supplier.evaluate("adapter('PROBE')")['kind']=='contact'
-        assert supplier.evaluate("adapter('CONTACT')")['ok']
+        assert contact_call("adapter('CONTACT')")['ok']
         assert supplier.evaluate('headerClicks')==1 and supplier.evaluate('toolbarClicks')==0
         supplier.evaluate("document.querySelector('.shop-sign-container').remove()")
-        assert supplier.evaluate("adapter('CONTACT')")['ok']
+        assert contact_call("adapter('CONTACT')")['ok']
         assert supplier.evaluate('toolbarClicks')==1
         passed('captured Alibaba contacts: Russian storefront action first, Chat Now! toolbar fallback')
 
@@ -345,13 +376,13 @@ try:
         supplier.add_script_tag(path=str(ROOT/'extension/supplier-chat.js'))
         supplier.add_script_tag(path=str(ROOT/'extension/content.js'))
         assert 'CAPTCHA' in supplier.evaluate("adapter('PROBE')")['obstacle']
-        assert not supplier.evaluate("adapter('CONTACT')")['ok']
+        assert not contact_call("adapter('CONTACT')")['ok']
         assert supplier.evaluate('contactClicks')==0
         initial_overlay=supplier.evaluate("adapter('PROBE')")
         assert initial_overlay['canDismiss']
         supplier.evaluate("window.savedModal=document.querySelector('.J_MIDDLEWARE_FRAME_WIDGET')")
         assert supplier.evaluate("key=>adapter('DISMISS_CHALLENGE',{dismissKey:key})",initial_overlay['dismissKey'])['closed']
-        assert supplier.evaluate("adapter('CONTACT')")['ok']
+        assert contact_call("adapter('CONTACT')")['ok']
         assert supplier.evaluate('contactClicks')==1
         passed('1688 native close control dismisses the known overlay before customer-service click')
         for appearance in range(3):
@@ -363,7 +394,7 @@ try:
             assert not supplier.evaluate("adapter('PROBE')").get('obstacle')
         passed('reused 1688 modal closes on every reappearance and rejects stale close commands')
         supplier.evaluate("document.body.innerHTML='<div id=application><div class=service-entry><span>客服</span></div></div>';window.serviceClicks=0;document.querySelector('.service-entry').addEventListener('click',()=>serviceClicks++)")
-        assert supplier.evaluate("adapter('CONTACT')")['ok']
+        assert contact_call("adapter('CONTACT')")['ok']
         assert supplier.evaluate('serviceClicks')==1
         passed('1688 customer-service text works without a specific id and preserves event bubbling')
 
@@ -463,7 +494,7 @@ try:
         supplier.evaluate("rule=>{window.namedRule=JSON.parse(rule);document.body.innerHTML='<button class=vendor-contact>Talk to our team</button>';window.namedClicks=0;document.querySelector('button').onclick=()=>namedClicks++;}",named_rule)
         result=supplier.evaluate("adapter('PROBE',{profile:{rules:[namedRule]}})")
         assert result['kind']=='contact' and result['diagnostics']['learning']['applied']
-        assert supplier.evaluate("adapter('CONTACT',{profile:{rules:[namedRule]}})")['ok']
+        assert contact_call("adapter('CONTACT',{profile:{rules:[namedRule]}})")['ok']
         assert supplier.evaluate('namedClicks')==1
         passed('trusted 1688 contact lesson transfers between different named subdomains after page reload')
         # The user's draft is visibly present but Send remains inactive until
@@ -656,7 +687,7 @@ try:
         result=supplier.evaluate("adapter('PROBE',{profile:{rules:[micRule]}})")
         assert result['kind']=='contact' and result['diagnostics']['learning']['applied']
         assert any('min-first' in reason for reason in result['diagnostics']['learning']['rejected'])
-        assert supplier.evaluate("adapter('CONTACT',{profile:{rules:[micRule]}})")['ok']
+        assert contact_call("adapter('CONTACT',{profile:{rules:[micRule]}})")['ok']
         assert supplier.evaluate('minimizedClicks')==1
         # All selectors now match multiple controls, so the rule must not choose
         # an arbitrary supplier from a minimized-conversations list.

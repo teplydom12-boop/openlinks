@@ -42,14 +42,18 @@ for(const [platform,limit] of [['1688',7],['alibaba',3]]) {
     for(const job of plan) assert.ok(plan.filter(other=>other.plannedAt>job.plannedAt-WINDOW_MS && other.plannedAt<=job.plannedAt).length<=limit);
   });
 }
-test('interval applies only between neighboring visits of the same platform, not sends',()=>{
+test('each platform retains separate visit and send intervals after activity on another platform',()=>{
   const state=initialState(); const now=Date.now();
   state.slots=[{platform:'mic',kind:'visit',at:now},{platform:'alibaba',kind:'visit',at:now}];
-  assert.equal(nextAllowed(state,'mic','visit',now),now);
+  assert.equal(nextAllowed(state,'mic','visit',now),now+60000);
   assert.equal(nextAllowed(state,'alibaba','visit',now),now+420000);
   assert.equal(nextAllowed(state,'1688','visit',now),now);
   assert.equal(nextAllowed(state,'mic','send',now),now);
   assert.equal(nextAllowed(state,'alibaba','send',now),now);
+  state.slots.push({platform:'mic',kind:'send',at:now},{platform:'alibaba',kind:'send',at:now});
+  assert.equal(nextAllowed(state,'mic','send',now),now+60000);
+  assert.equal(nextAllowed(state,'alibaba','send',now),now+420000);
+  assert.equal(nextAllowed(state,'1688','send',now),now);
 });
 test('a cooldown yields to the first ready platform in both scheduler and exported plan',()=>{
   const state=initialState(),now=1000000;
@@ -59,8 +63,8 @@ test('a cooldown yields to the first ready platform in both scheduler and export
   assert.equal(due.job.id,'b');assert.equal(due.at,now);
   assert.deepEqual(due.deferred.map(item=>item.job.id),['a']);
   const plan=makePlan(state,now);
-  assert.equal(plan[0].plannedAt,now+1); assert.equal(plan[1].plannedAt,now);
-  assert.ok(scheduleText(state,now).includes(localTimestamp(now+1)+'\tAlibaba\tpending\thttps://a.alibaba.com/'));
+  assert.equal(plan[0].plannedAt,now+420000); assert.equal(plan[1].plannedAt,now);
+  assert.ok(scheduleText(state,now).includes(localTimestamp(now+420000)+'\tAlibaba\tpending\thttps://a.alibaba.com/'));
 });
 test('each platform cooldown permits another platform while preserving its own first pending row',()=>{
   for(const [waiting,ready] of [['1688','alibaba'],['1688','mic'],['alibaba','1688'],['alibaba','mic'],['mic','1688']]) {
@@ -71,18 +75,18 @@ test('each platform cooldown permits another platform while preserving its own f
     assert.equal(due.job.id,'other',waiting+' -> '+ready);assert.equal(due.at,now);
     assert.deepEqual(due.deferred.map(item=>item.job.id),['first']);assert.deepEqual(state,before);
     state.queue[2].status='attempted';state.slots.push({platform:ready,kind:'visit',at:now+1});
-    assert.equal(dueJob(state,now+2).job.id,'first');assert.equal(dueJob(state,now+2).at,now+2);
+    assert.equal(dueJob(state,now+2).job.id,'first');assert.equal(dueJob(state,now+2).at,now+state.settings.intervals[waiting]*1000);
   }
 });
 test('clock rollback keeps previous reservations and therefore waits',()=>{
   const state=initialState();state.slots=[{platform:'alibaba',kind:'send',at:2000000}];
-  assert.equal(nextAllowed(state,'alibaba','send',1000000),2001000);
+  assert.equal(nextAllowed(state,'alibaba','send',1000000),2420000);
 });
-test('Alibaba -> 1688 -> Alibaba has no configured interval between visits',()=>{
+test('Alibaba -> 1688 -> Alibaba preserves the configured Alibaba interval',()=>{
   const state=initialState(), now=1000000;
   state.queue=parseList('https://a.alibaba.com/\nhttps://b.1688.com/\nhttps://c.alibaba.com/',[],now).jobs;
   const plan=makePlan(state,now);
-  assert.deepEqual(plan.map(job=>job.plannedAt),[now,now+1,now+2]);
+  assert.deepEqual(plan.map(job=>job.plannedAt),[now,now+1,now+420000]);
 });
 test('same-platform interval is measured from the last actual visit even after an error',()=>{
   const state=initialState(), now=1000000;
@@ -90,6 +94,54 @@ test('same-platform interval is measured from the last actual visit even after a
   state.queue=parseList('https://a.alibaba.com/\nhttps://b.alibaba.com/',[],now).jobs;
   assert.equal(dueJob(state,now+1000).at,now+420000);
   assert.equal(dueJob(state,now+500000).at,now+500000);
+});
+test('five 1688 suppliers get distinct times at the configured interval even with intervening marketplaces',()=>{
+  const state=initialState(),now=3000000;state.settings.intervals['1688']=137;
+  state.queue=Array.from({length:15},(_,index)=>({id:String(index),platform:['1688','alibaba','mic'][index%3],url:'https://supplier.1688.com/'+index,status:'pending',requestedAt:now}));
+  const before=structuredClone(state),plan=makePlan(state,now),suppliers=plan.filter(job=>job.platform==='1688');
+  assert.deepEqual(suppliers.map(job=>job.plannedAt),Array.from({length:5},(_,index)=>now+index*137000));
+  const consecutive=makePlan({...state,queue:state.queue.filter(job=>job.platform==='1688')},now);
+  assert.deepEqual(consecutive.map(job=>job.plannedAt),suppliers.map(job=>job.plannedAt));
+  assert.equal(new Set(suppliers.map(job=>localTimestamp(job.plannedAt))).size,5);
+  assert.deepEqual(state,before);
+  // Replay the forecast through the real selection function with durable slots.
+  const actual=structuredClone(state),chronological=[...plan].sort((a,b)=>a.plannedAt-b.plannedAt);
+  for(const planned of chronological) {
+    const due=dueJob(actual,planned.plannedAt);
+    assert.equal(due.job.id,planned.id);assert.equal(due.at,planned.plannedAt);
+    due.job.status='attempted';actual.slots.push({platform:due.job.platform,kind:'visit',at:due.at},{platform:due.job.platform,kind:'send',at:due.at});
+  }
+});
+test('visit interval uses latest platform reservation despite insertion order, clock rollback or queue deletion',()=>{
+  const state=initialState(),now=3000000;
+  state.slots=[{platform:'1688',kind:'visit',at:now+5000},{platform:'mic',kind:'visit',at:now},{platform:'1688',kind:'visit',at:now-20000}];
+  assert.equal(nextAllowed(state,'1688','visit',now),now+5000+180000);
+  state.queue=[];
+  assert.equal(nextAllowed(state,'1688','visit',now+5000),now+5000+180000);
+  assert.equal(nextAllowed(state,'1688','visit',now+185000),now+185000);
+});
+test('a late previous send keeps both new and deferred 1688 jobs waiting while other platforms run',()=>{
+  const state=initialState(),now=3000000;state.settings.intervals['1688']=137;
+  state.slots=[{platform:'1688',kind:'visit',at:now-300000},{platform:'1688',kind:'send',at:now-10000},{platform:'alibaba',kind:'visit',at:now-1000}];
+  const ready={id:'other',platform:'mic',status:'pending',requestedAt:now};
+  for(const status of ['pending','deferred_send']) {
+    state.queue=[{id:'waiting',platform:'1688',status,requestedAt:now},{...ready}];
+    const due=dueJob(state,now),plan=makePlan(state,now);
+    assert.equal(due.job.id,'other');assert.equal(due.at,now);
+    assert.equal(plan[0].plannedAt,now+127000);assert.equal(plan[1].plannedAt,now);
+    assert.match(due.deferred[0].reasons.join(' '),/137 с \(отправки\)/);
+    state.queue[1].status='attempted';
+    assert.equal(dueJob(state,now+126999).at,now+127000);
+    assert.equal(dueJob(state,now+127000).at,now+127000);
+  }
+  // Send eligibility is rechecked against durable send timestamps after a visit.
+  assert.equal(nextAllowed(state,'1688','visit',now),now);
+  assert.equal(nextAllowed(state,'1688','send',now),now+127000);
+});
+test('long configured intervals still apply after the rolling quota window has elapsed',()=>{
+  const state=initialState(),now=3000000;state.settings.intervals.alibaba=86400;
+  state.slots=[{platform:'alibaba',kind:'send',at:now-WINDOW_MS-1000}];
+  assert.equal(nextAllowed(state,'alibaba','send',now),now-WINDOW_MS-1000+86400000);
 });
 test('when every platform waits, the earliest full eligibility wins across interval, quota and scheduled time',()=>{
   const now=3000000;
@@ -142,7 +194,10 @@ test('mixed-platform plan respects rolling quotas for visits and sends through r
  for(let index=1;index<chronological.length;index++) {
    const prior=chronological[index-1],job=chronological[index];
    assert.ok(job.plannedAt>prior.plannedAt);
-   if(job.platform===prior.platform)assert.ok(job.plannedAt-prior.plannedAt>=state.settings.intervals[job.platform]*1000);
+ }
+ for(const platform of ['1688','alibaba','mic']) {
+   const same=chronological.filter(job=>job.platform===platform);
+   for(let index=1;index<same.length;index++)assert.ok(same[index].plannedAt-same[index-1].plannedAt>=state.settings.intervals[platform]*1000);
  }
  for(const [platform,limit] of [['alibaba',3],['1688',7]]) {
    const same=plan.filter(job=>job.platform===platform);
