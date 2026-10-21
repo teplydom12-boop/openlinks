@@ -11,7 +11,16 @@ TRANSPORT="""
 let listener;
 window.openerEvents=[];window.permitOpening=true;
 window.chrome={runtime:{id:'supplier-test',onMessage:{addListener(fn){listener=fn}},sendMessage:async message=>{
-  if(message.type==='CHAT_OPEN_EVENT'){openerEvents.push({...message,time:Date.now()});return {ok:permitOpening};}
+  if(message.type==='CHAT_OPEN_EVENT'){
+    openerEvents.push({...message,time:Date.now()});
+    if(message.phase==='attempt'&&permitOpening){
+      const armed=await controlledContact({action:'arm',pageUrl:location.href});if(!armed.ok)return armed;
+      const contact=await adapter('CONTACT');if(!contact.ok)return contact;
+      return controlledContact({action:'click',pageUrl:contact.pageUrl,token:contact.contactToken});
+    }
+    return {ok:permitOpening};
+  }
+  if(message.type==='OPENLINKS_TEST_SEND_GUARD')return {ok:true,canSend:true};
   return {ok:true};
 }}};
 window.adapter=(type,extra={})=>new Promise(resolve=>listener({type,jobId:'fixture-job',profile:{},message:'Hello supplier',...extra},{id:'supplier-test'},resolve));
@@ -42,6 +51,7 @@ with sync_playwright() as p:
         context.unroute('**/*')
         context.route('**/*',lambda route:route.fulfill(body=html if route.request.url==url else '<!doctype html><title>Local empty resource</title>',content_type='text/html'))
         page.goto(url)
+        page.add_script_tag(content=(ROOT/'extension/lib/outreach-chat-open.js').read_text().replace('export function ','function '))
         for name in ['rules-shared.js','routes-1688-shared.js','supplier-chat.js','content.js']:
             page.add_script_tag(path=str(ROOT/'extension'/name))
     def start(extra=''):
@@ -106,6 +116,44 @@ with sync_playwright() as p:
     load(ALIBABA);page.evaluate('permitOpening=false');start();page.clock.run_for(22000)
     assert page.evaluate('openClicks')==0 and phases()==['attempt']
     passed('worker authorization is required before the native click')
+
+    load(ALIBABA.replace("https://shop.en.alibaba.com/wrong-navigation","/relative-native-route").replace('event.preventDefault();openClicks++;','if(event.defaultPrevented)return;event.preventDefault();openClicks++;'))
+    start();page.clock.run_for(1500)
+    assert page.evaluate('openClicks')==1 and page.url==ALI and phases()==['attempt','opened']
+    passed('relative anchor keeps native handler and its defaultPrevented semantics; wrong fallback URL never navigates')
+
+    capture_url='https://webim.made-in-china.com/super-tm/#/chat/FixtureSeller_123?data=fixture&refer='+MIC.replace(':','%3A').replace('/','%2F')+'&isLiteTM=true&isSAChat=false'
+    def controlled_click():
+        return page.evaluate("async()=>{const marked=await adapter('CONTACT');if(!marked.ok)return marked;return controlledContact({action:'click',pageUrl:marked.pageUrl,token:marked.contactToken});}")
+    for delay in [0,200]:
+        html='''<!doctype html><a class=J-open-tm href=javascript:;>Chat</a><script>
+        window.nativeClicks=0;document.querySelector('a').onclick=event=>{event.preventDefault();nativeClicks++;
+        '''+("setTimeout(()=>window.open("+repr(capture_url)+"),200);" if delay else "window.open("+repr(capture_url)+");window.focus();")+'''};</script>'''
+        load(html,MIC)
+        result=controlled_click()
+        if delay:
+            assert result['urls']==[]
+            page.clock.run_for(250)
+            result=page.evaluate("controlledContact({action:'read',pageUrl:location.href})")
+        assert result['ok'] and result['urls']==[capture_url]
+        assert len(context.pages)==1 and page.url==MIC and page.evaluate('nativeClicks')==1
+        assert controlled_click()['urls']==[capture_url] and page.evaluate('nativeClicks')==1
+        passed(('delayed' if delay else 'synchronous')+' native window.open stays captured; a retry does not erase capture or repeat the click')
+
+    for base in [False,True]:
+        html=('<!doctype html><base target=_blank>' if base else '<!doctype html>')+'<a class=J-open-tm '+('' if base else 'target=_blank ')+'href="'+capture_url+'">Chat</a><script>window.nativeClicks=0;document.querySelector("a").onclick=event=>{if(event.defaultPrevented)throw new Error("native cancellation changed");nativeClicks++;};</script>'
+        load(html,MIC);result=controlled_click()
+        assert result['ok'] and result['urls']==[capture_url]
+        page.clock.run_for(50)
+        assert len(context.pages)==1 and page.url==MIC and page.evaluate('nativeClicks')==1
+        passed(('inherited base target' if base else 'plain target=_blank')+' anchor runs its native handler and captures default navigation without a popup')
+
+    for body in ["window.open('about:blank');", "window.open('https://one.invalid/');window.open('https://two.invalid/');"]:
+        load('<!doctype html><a class=J-open-tm href=javascript:;>Chat</a><script>document.querySelector("a").onclick=()=>{'+body+'};</script>',MIC)
+        result=controlled_click()
+        assert not result['ok'] and result['reason'] in ['empty_popup','ambiguous_popup']
+        assert len(context.pages)==1 and page.url==MIC
+    passed('blank and ambiguous native popup routes fail closed without creating a browser window')
 
     load(ALIBABA+'<button id=wrong>Wrong old action</button>')
     page.evaluate("()=>{window.oldRule={id:'old',platform:'alibaba',field:'contact',selector:'#wrong',tag:'button',scope:{host:'*.en.alibaba.com',path:'/'}};window.wrongClicks=0;document.querySelector('#wrong').onclick=()=>wrongClicks++;}")

@@ -88,14 +88,6 @@
       if(diagnostics.inquiriesIgnored)return {...base,kind:'inquiry',reason:'Найдена форма запроса, а не редактор чата. Жду кнопку чата.'};
       return {...base,kind:'waiting',reason:'Жду штатную кнопку чата Alibaba/Made-in-China.'};
     }
-    function click(found) {
-      if(found.kind!=='contact' || !active(found.contact) || isInquiry(found.contact))return false;
-      // Always invoke the site's handler, including anchors with an HTTPS href.
-      // Native handlers may prevent navigation and pass the current supplier ID.
-      found.contact.scrollIntoView({block:'center'});
-      found.contact.dispatchEvent(new MouseEvent('mouseover',{bubbles:true}));
-      found.contact.click();return true;
-    }
     function stop(token) {
       if(!run || (token && run.token!==token))return;
       clearTimeout(run.timer);run.cancelled=true;run=null;
@@ -119,15 +111,12 @@
           if(found.opened){await end('opened','Окно чата стало видимым. Перехожу к редактору.');return;}
           if(Date.now()-current.at>=TIMEOUT_MS){await end('timeout','За 20 секунд окно чата не открылось. Нужен ваш обучающий клик.');return;}
           if(found.kind==='contact' && current.attempts<MAX_ATTEMPTS && (!current.lastClick || Date.now()-current.lastClick>=RETRY_MS)) {
-            // Worker persists/authorizes each opening attempt. Pause, stale
-            // tabs and lost replies cannot silently start additional clicks.
+            // Worker persists each attempt, rechecks the exact contact and
+            // invokes its native handler with background popup capture armed.
+            // No local fallback click: it could create a foreground popup.
             const permit=await notify('attempt',{attempt:current.attempts+1,selector:found.key,hidden:!visible(found.contact)});
             if(current.cancelled || run!==current || !permit?.ok){stop(current.token);return;}
             current.attempts++;current.lastClick=Date.now();
-            const fresh=inspect(request.profile);
-            if(fresh.obstacle){await end('blocked',fresh.obstacle);return;}
-            if(fresh.opened){await end('opened','Чат открылся до повторного клика.');return;}
-            click(fresh);
           }
           if(!current.cancelled && run===current)current.timer=setTimeout(poll,POLL_MS);
         } catch {await end('error','Не удалось проверить интерфейс открытия чата. Обновите страницу или покажите кнопку.');}
@@ -135,7 +124,7 @@
       current.timer=setTimeout(poll,POLL_MS);
       return {ok:true,opening:status()};
     }
-    return {inspect,click,start,stop,status};
+    return {inspect,start,stop,status};
   }
   globalThis.OpenLinksSupplierChat={ENGINE,POLL_MS,RETRY_MS,TIMEOUT_MS,MAX_ATTEMPTS,supports,isMessenger,create};
 })();

@@ -18,7 +18,7 @@
   const sentOps = new Set();
   const preparedEditors = new WeakMap();
   const previewOperations=new Map(),previewEditors=new WeakMap();
-  let nativeInput=null, pendingClose=null, chatReadiness=null;
+  let nativeInput=null, pendingClose=null, chatReadiness=null, contactMarker=null;
   let picker=null;
   let challenge=null;
   const norm = value => String(value || '').replace(/\r\n/g,'\n').trim();
@@ -533,10 +533,16 @@
     if(request.type==='CONTACT') {
       const found=inspect(profile);
       if(found.kind!=='contact') return {ok:false,reason:found.reason || found.obstacle || 'Контакт изменился'};
-      if(supplierChat)return {ok:supplierChat.click(found),key:found.key};
+      if(found.contact.closest('form')||found.contact.form||found.contact.matches(':disabled')||found.contact.getAttribute('aria-disabled')==='true')return {ok:false,reason:'Кнопка чата недоступна либо находится в форме. Открытие остановлено.'};
       const href=found.contact.getAttribute('href') || '';
-      if(href && !/^(https?:|#|javascript:)/i.test(href)) return {ok:false,reason:'Контакт открывается во внешнем приложении. Откройте веб-чат вручную.'};
-      found.contact.click(); return {ok:true,key:found.key};
+      if(/^[a-z][a-z\d+.-]*:/i.test(href.trim())&&!/^\s*(https?:|javascript:)/i.test(href)) return {ok:false,reason:'Контакт открывается во внешнем приложении. Откройте веб-чат вручную.'};
+      // The worker invokes this exact control in MAIN with popup capture armed.
+      // Never click here: isolated-world window.open overrides do not affect
+      // the marketplace's native handlers.
+      if(contactMarker?.node)contactMarker.node.removeAttribute('data-openlinks-contact');
+      contactMarker={node:found.contact,token:crypto.randomUUID()};
+      found.contact.setAttribute('data-openlinks-contact',contactMarker.token);
+      return {ok:true,key:found.key,contactToken:contactMarker.token,pageUrl:location.href};
     }
     if(request.type==='PREPARE') return prepare(request);
     if(request.type==='DIALOGS_CLEAR_PREVIEW')return clearPreview(request);

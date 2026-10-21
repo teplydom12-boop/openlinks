@@ -219,7 +219,7 @@ export const EVENT_LABELS = {
   chat_close_scheduled:'Закрытие чата назначено',chat_closed:'Вкладка чата закрыта',chat_close_cancelled:'Закрытие чата отменено',
   skip_tab_closed:'Вкладка закрыта при пропуске',skip_tab_kept:'Вкладка не закрыта при пропуске',
   chat_discovered:'Открытый чат распознан',
-  chat_open_attempt:'Штатный клик открытия чата',
+  chat_open_attempt:'Штатный клик открытия чата',chat_open_background:'Чат открыт в фоне',
   chat_loading:'Ожидание готовности чата',job_error:'Ошибка ссылки',retry_scheduled:'Автопроверка назначена',retry_started:'Автоматически проверяю снова',
   draft_replaced:'Старый текст в поле заменён',
 };

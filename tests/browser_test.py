@@ -180,12 +180,33 @@ try:
         context.route('https://test.en.alibaba.com/**', lambda route: route.fulfill(
             body=(ROOT/'tests/fixtures'/('chat.html' if '/chat' in route.request.url else 'store.html')).read_text(), content_type='text/html'))
         supplier = context.new_page()
-        adapter_transport="""
+        contact_source=(ROOT/'extension/lib/outreach-chat-open.js').read_text().replace('export function ', 'function ')
+        adapter_transport=contact_source+"""
           let listener;
           window.lessonMessages=[];
           window.adapterMessages=[];
           window.chrome={runtime:{id:'adapter-test',onMessage:{addListener(fn){listener=fn}},sendMessage:async message=>{adapterMessages.push(message);if(message.type==='OPENLINKS_TEST_SEND_GUARD')return {ok:true,canSend:true};if(message.type==='LEARN_PICK')lessonMessages.push(message);return {ok:true};}}};
-          window.adapter=(type,extra={})=>new Promise(resolve=>listener({type,jobId:'test-job',profile:{},message:'Hello, WeChat: demo',...extra},{id:'adapter-test'},resolve));
+          const rawAdapter=(type,extra={})=>new Promise(resolve=>listener({type,jobId:'test-job',profile:{},message:'Hello, WeChat: demo',...extra},{id:'adapter-test'},resolve));
+          window.adapter=async(type,extra={})=>{
+            if(type!=='CONTACT')return rawAdapter(type,extra);
+            // Match the worker's two-world protocol: arm the MAIN-world guard,
+            // mark one exact contact through content, then invoke its handler.
+            // These fixtures have inline/counter handlers; no captured popup
+            // should be followed or turned into a supplier request by the test.
+            const pageUrl=location.href;
+            const armed=await controlledContact({action:'arm',pageUrl});
+            if(!armed.ok)return armed;
+            const marked=await rawAdapter(type,extra);
+            if(!marked.ok)return marked;
+            if(marked.pageUrl!==pageUrl||!marked.contactToken)throw new Error('Invalid contact marker');
+            const clicked=await controlledContact({action:'click',pageUrl,token:marked.contactToken});
+            if(!clicked.ok)return clicked;
+            const captured=await controlledContact({action:'read',pageUrl});
+            if(!captured.ok)return captured;
+            if(captured.urls.length)throw new Error('Legacy inline fixture unexpectedly requested a popup');
+            if(document.querySelector('[data-openlinks-contact="'+marked.contactToken+'"]'))throw new Error('Contact marker was not consumed');
+            return {...marked,...clicked};
+          };
         """
         supplier.add_init_script(adapter_transport)
         supplier.goto('https://test.en.alibaba.com/')
