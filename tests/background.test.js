@@ -5,6 +5,7 @@ import {initialState,WINDOW_MS} from '../extension/lib/core.js';
 import {initialDialogs,bindDialogTab} from '../extension/lib/dialogs.js';
 import {domReply} from './debugger-harness.js';
 import {cancelAllBackgroundPages} from '../extension/lib/background-page-guard.js';
+import {folderDigest} from '../extension/lib/folder-bridge.js';
 const listener=()=>{const list=[];return {list,addListener(fn){list.push(fn);}};};
 let stored,clicks,contactClicks,commands,requests,beforeClick,probeKind,sendResult,frameUrl,tabCount,opened,missing,obstacle,prepareOk,lookupPages,fetches,probeRoute,updated,probeKey,listedTabs,frameList,tabReplies,frameProbes,deliveries;
 let scheduled,removed,canClose,nativeRequired,debuggerFailure,debuggerCalls,nativeFailure,chatReady;
@@ -33,7 +34,9 @@ globalThis.chrome={runtime,alarms,storage:{local:{get:async keys=>{
   if(data.type==='NATIVE_INPUT' && nativeFailure?.stage===data.stage)return {ok:false,reason:nativeFailure.reason};
   if(data.type==='NATIVE_INPUT' && data.stage==='done')nativeRequired=false;
   if(data.type==='CAN_CLOSE')return {ok:canClose};
-  if(data.type==='SEND'){if(querySendGuard){const guard=await message('OPENLINKS_TEST_SEND_GUARD',{}, {id:'test',tab:{id:tab},url:frameUrl});if(!guard?.canSend)return {clicked:false,reason:'Тестовый режим'};}clicks++;beforeClick=structuredClone(stored);if(sendResult==='disconnect')throw new Error('Disconnected');if(sendResult==='malformed')return {ok:false};return {clicked:sendResult!==false,accepted:sendResult===true,reason:'Кнопка изменилась'};}
+  if(data.type==='SEND'){if(querySendGuard){const guard=await message('OPENLINKS_TEST_SEND_GUARD',{
+   scope:'outreach',jobId:data.jobId,attemptId:data.attemptId,expectedUrl:data.expectedUrl,message:data.message
+  },{id:'test',tab:{id:tab},frameId:options.frameId,url:documentedFrames().find(frame=>frame.frameId===options.frameId)?.url || frameUrl});if(!guard?.canSend)return {clicked:false,reason:'Нет разрешённой попытки отправки'};}clicks++;beforeClick=structuredClone(stored);if(sendResult==='disconnect')throw new Error('Disconnected');if(sendResult==='malformed')return {ok:false};return {clicked:sendResult!==false,accepted:sendResult===true,reason:'Кнопка изменилась'};}
   if(data.type==='CONTACT'){contactClicks++;return {ok:true,key:probeKey,contactToken:'01234567-0123-4567-8901-012345678901',pageUrl:frameList?.find(frame=>frame.frameId===options.frameId)?.url || frameUrl};}
   if(data.type==='DISMISS_CHALLENGE'){if(obstacle?.stuck)return {clicked:true,closed:false};obstacle=null;return {clicked:true,closed:true};}
   return {ok:true};
@@ -1023,28 +1026,87 @@ test('dialogue quota includes prior outreach sends and protects future reservati
 });
 
 
-test('dialog test mode pauses outreach, rejects starts and approvals, and never reserves real quota',async()=>{
- reset();await review();await message('APPROVE');
- extraStorage.openlinksClaudeFolder={test:{enabled:true}};
+test('legacy dialogue test flag cannot block independent primary start, approval or send',async()=>{
+ reset();querySendGuard=true;extraStorage.openlinksClaudeFolder={test:{enabled:true,sessionId:'old-preview',history:[{id:'old-preview'}]}};
+ const preview=structuredClone(extraStorage.openlinksClaudeFolder);
+ await review();assert.equal(stored.queue[0].status,'review');assert.equal(stored.running,true);
+ assert.equal((await message('APPROVE')).ok,true);
  const {pauseOutreachForTest,reserveDialogSendQuota}=await import('../extension/background.js');
- await pauseOutreachForTest();assert.equal(stored.running,false);assert.equal(stored.queue[0].approved,false);
- for(const type of ['START','APPROVE','RECHECK','RETRY_SEND','TEACH']){const result=await message(type,{field:'send'});assert.equal(result.ok,false,type);assert.match(result.error,/тестовый режим/);}
- await tick();assert.equal(clicks,0);assert.equal(stored.slots.filter(s=>s.kind==='send').length,0);
- const quota=await reserveDialogSendQuota({platform:'mic',jobId:crypto.randomUUID(),attemptId:crypto.randomUUID()});assert.equal(quota.ok,false);assert.match(quota.reason,/тестовый режим/);
- extraStorage.openlinksClaudeFolder.test.enabled=false;await tick();assert.equal(stored.running,false);assert.equal(clicks,0);
+ await pauseOutreachForTest();assert.equal(stored.running,true);assert.equal(stored.queue[0].approved,true);
+ await tick();assert.equal(clicks,1);assert.equal(stored.queue[0].status,'attempted');
+ assert.equal(stored.slots.filter(s=>s.kind==='send').length,1);
+ assert.deepEqual(extraStorage.openlinksClaudeFolder,preview);
+ assert.ok(createdTabs.every(tab=>tab.active===false));assert.ok(!allTabUpdates.some(tab=>tab.active));assert.deepEqual(windowUpdates,[]);
+ const quota=await reserveDialogSendQuota({platform:'mic',jobId:crypto.randomUUID(),attemptId:crypto.randomUUID()});
+ assert.equal(quota.ok,false);assert.match(quota.reason,/тестовый режим/);assert.equal(clicks,1);
 });
-test('entering dialog test mode during outreach preparation prevents click and send quota',async()=>{
- reset();await review();await message('APPROVE');afterPrepare=()=>{extraStorage.openlinksClaudeFolder={test:{enabled:true}};};
- await tick();assert.equal(clicks,0);assert.equal(stored.running,false);assert.equal(stored.slots.filter(s=>s.kind==='send').length,0);assert.equal(commands.includes('SEND'),false);
+test('legacy dialogue test flag appearing during primary preparation does not cancel the approved send',async()=>{
+ reset();querySendGuard=true;await review();await message('APPROVE');afterPrepare=()=>{extraStorage.openlinksClaudeFolder={test:{enabled:true}};};
+ await tick();assert.equal(clicks,1);assert.equal(stored.queue[0].status,'attempted');
+ assert.equal(stored.slots.filter(s=>s.kind==='send').length,1);assert.equal(commands.includes('SEND'),true);
 });
-test('content send-mode guard is authenticated, read-only and independent of the outreach lock',async()=>{
- reset();const source={id:'test',tab:{id:7},url:frameUrl};
- assert.deepEqual(await message('OPENLINKS_TEST_SEND_GUARD',{},source),{ok:true,canSend:true});
+test('1688 primary native activation and automatic send work in background despite a stale dialogue preview',async()=>{
+ reset();frameUrl='https://air.1688.com/chat';nativeRequired=true;querySendGuard=true;stored.settings.review=false;
+ extraStorage.openlinksClaudeFolder={test:{enabled:true,sessionId:'old-preview'}};
+ await review('https://a.1688.com/');assert.equal(stored.queue[0].approved,true);
+ assert.equal(debuggerCalls[0].type,'attach');assert.equal(debuggerCalls.at(-1).type,'detach');
+ await tick();assert.equal(clicks,1);assert.equal(stored.queue[0].status,'attempted');
+ assert.equal(stored.slots.filter(slot=>slot.kind==='send').length,1);
+ assert.ok(createdTabs.every(tab=>tab.active===false));assert.ok(!allTabUpdates.some(tab=>tab.active));assert.deepEqual(windowUpdates,[]);
+});
+test('primary permission requires the exact approved sending operation and reserved quota',async()=>{
+ reset();await review();await message('APPROVE');await tick();
+ const sending=structuredClone(beforeClick),job=sending.queue[0];
+ stored=structuredClone(sending);extraStorage.openlinksClaudeFolder={test:{enabled:true}};
+ const source={id:'test',tab:{id:job.tabId},frameId:job.frameId,url:job.reviewUrl};
+ const request={scope:'outreach',jobId:job.id,attemptId:job.attemptId,expectedUrl:job.reviewUrl,message:job.message};
+ const allowed=()=>message('OPENLINKS_TEST_SEND_GUARD',request,source);
+ assert.deepEqual(await allowed(),{ok:true,canSend:true});
+ assert.deepEqual(stored,sending,'The permission check must remain read-only');
+ for(const patch of [{scope:'dialog'},{scope:undefined},{jobId:'old-preview'},{attemptId:'old-preview'},{expectedUrl:'https://b.en.alibaba.com/chat'},{message:'Different message'}]) {
+  assert.deepEqual(await message('OPENLINKS_TEST_SEND_GUARD',{...request,...patch},source),{ok:true,canSend:false});
+ }
+ for(const patch of [{tab:{id:job.tabId+1}},{frameId:99},{url:'https://b.en.alibaba.com/chat'}]) {
+  assert.deepEqual(await message('OPENLINKS_TEST_SEND_GUARD',request,{...source,...patch}),{ok:true,canSend:false});
+ }
+ for(const mutate of [
+  state=>{state.running=false;},state=>{state.activeId=null;},state=>{state.queue[0].status='review';},
+  state=>{state.queue[0].approved=false;},state=>{state.queue[0].attemptId='new-attempt';},
+  state=>{state.slots=[];},state=>{state.slots.find(slot=>slot.kind==='send').jobId='other';},
+  state=>{state.slots.find(slot=>slot.kind==='send').at++;}
+ ]) {
+  stored=structuredClone(sending);mutate(stored);assert.deepEqual(await allowed(),{ok:true,canSend:false});
+ }
+ stored=structuredClone(sending);extraStorage.openlinksDialogs={bindings:{alibaba:{tabId:job.tabId}}};
+ assert.deepEqual(await allowed(),{ok:true,canSend:false});
+});
+test('content send permission is authenticated and independent of the outreach lock',async()=>{
+ reset();const source={id:'test',tab:{id:7},frameId:0,url:frameUrl};
+ assert.deepEqual(await message('OPENLINKS_TEST_SEND_GUARD',{},source),{ok:true,canSend:false});
  for(const invalid of [{...source,id:'foreign'},{...source,url:'https://example.com/'},{id:'test',url:frameUrl}])assert.deepEqual(await message('OPENLINKS_TEST_SEND_GUARD',{},invalid),{ok:false,canSend:false});
- extraStorage.openlinksClaudeFolder={test:{enabled:true}};assert.deepEqual(await message('OPENLINKS_TEST_SEND_GUARD',{},source),{ok:true,canSend:false});
- extraStorage={};await review();await message('APPROVE');querySendGuard=true;
+ await review();await message('APPROVE');querySendGuard=true;extraStorage.openlinksClaudeFolder={test:{enabled:true}};
  let timer;try{await Promise.race([tick(),new Promise((_,reject)=>{timer=setTimeout(()=>reject(new Error('Send guard deadlocked behind outreach command')),1000);})]);}finally{clearTimeout(timer);}
  assert.equal(clicks,1);
+});
+test('legacy reply permission retains preview denial and matches its own bound receipt and message',async()=>{
+ reset();const {reserveDialogSendQuota}=await import('../extension/background.js');
+ const jobId=crypto.randomUUID(),attemptId=crypto.randomUUID(),dialogId='seller-chat';
+ const request={scope:'dialog',jobId:attemptId,attemptId,dialogOperation:attemptId,dialogId,expectedUrl:frameUrl,message:'Reply'};
+ const source={id:'test',tab:{id:7},frameId:0,url:frameUrl};
+ const folder={test:{enabled:false},sendReceipts:[{id:attemptId,jobId,key:'alibaba:'+dialogId,status:'reserved',textHash:await folderDigest(request.message)}]};
+ extraStorage.openlinksDialogs={running:true,settings:{wechatAudit:false},bindings:{alibaba:{tabId:7}}};
+ extraStorage.openlinksClaudeFolder=structuredClone(folder);
+ assert.equal((await reserveDialogSendQuota({platform:'alibaba',jobId,attemptId})).ok,true);
+ const allowed=()=>message('OPENLINKS_TEST_SEND_GUARD',request,source);
+ assert.deepEqual(await allowed(),{ok:true,canSend:true});
+ for(const mutate of [value=>{value.test.enabled=true;},value=>{value.sendReceipts[0].status='sent';},value=>{value.sendReceipts[0].jobId=crypto.randomUUID();},value=>{value.sendReceipts[0].textHash='wrong';}]) {
+  extraStorage.openlinksClaudeFolder=structuredClone(folder);mutate(extraStorage.openlinksClaudeFolder);
+  assert.deepEqual(await allowed(),{ok:true,canSend:false});
+ }
+ extraStorage.openlinksClaudeFolder=structuredClone(folder);
+ assert.deepEqual(await message('OPENLINKS_TEST_SEND_GUARD',{...request,scope:'outreach'},source),{ok:true,canSend:false});
+ assert.deepEqual(await message('OPENLINKS_TEST_SEND_GUARD',{...request,message:'Other reply'},source),{ok:true,canSend:false});
+ extraStorage.openlinksDialogs.settings.wechatAudit=true;assert.deepEqual(await allowed(),{ok:true,canSend:false});
 });
 test('content send-mode guard fails closed when trusted storage is unavailable',async t=>{
  reset();t.mock.method(chrome.storage.local,'get',async()=>{throw new Error('Storage unavailable');});
@@ -1071,19 +1133,19 @@ test('joint start preserves approval and Claude settings and gives ready outreac
   assert.equal(reserved.ok,false);assert.equal(reserved.coordination,true);assert.equal(stored.slots.length,0);
   await tick();assert.equal(createdTabs.length,1);assert.equal(createdTabs[0].active,false);assert.equal(clicks,0);
 });
-test('joint start in test mode changes neither outreach state nor the saved mode',async()=>{
-  reset();await message('IMPORT',{text:'https://a.en.alibaba.com/'});
-  extraStorage.openlinksClaudeFolder={test:{enabled:true}};
-  const previous=structuredClone({stored,extraStorage});
-  await assert.rejects(coordination.startOutreachForJoint(ui),/тестовый режим/);
-  assert.deepEqual({stored,extraStorage},previous);assert.equal(createdTabs.length,0);assert.equal(clicks,0);
+test('joint start ignores the dormant dialogue test flag and preserves its preview evidence',async()=>{
+  reset();extraStorage.openlinksClaudeFolder={test:{enabled:true,sessionId:'old-preview',history:[{id:'old-preview'}]}};
+  const folder=structuredClone(extraStorage.openlinksClaudeFolder),status=await jointQueue();
+  assert.equal(status.phase,'outreach');assert.equal(status.testMode,false);assert.equal(status.allowDialogs,false);
+  assert.equal(stored.running,true);assert.equal(extraStorage.openlinksWorkCoordinator.enabled,true);
+  assert.deepEqual(extraStorage.openlinksClaudeFolder,folder);assert.equal(createdTabs.length,0);assert.equal(clicks,0);
 });
-test('joint start rechecks test mode after Chrome window validation',async t=>{
-  reset();await message('IMPORT',{text:'https://a.en.alibaba.com/'});
-  const before=structuredClone(stored);
+test('joint start tolerates a dormant test flag written during Chrome window validation',async t=>{
+  reset();await message('IMPORT',{text:'https://a.en.alibaba.com/'});extraStorage.openlinksDialogs={running:true};
   t.mock.method(chrome.windows,'getLastFocused',async()=>{extraStorage.openlinksClaudeFolder={test:{enabled:true}};return {id:10,type:'normal'};});
-  await assert.rejects(coordination.startOutreachForJoint(ui),/тестовый режим/);
-  assert.deepEqual(stored,before);assert.equal(extraStorage.openlinksWorkCoordinator,undefined);assert.equal(createdTabs.length,0);
+  const status=await coordination.startOutreachForJoint(ui);
+  assert.equal(status.phase,'outreach');assert.equal(stored.running,true);assert.equal(extraStorage.openlinksWorkCoordinator.enabled,true);
+  assert.equal(extraStorage.openlinksClaudeFolder.test.enabled,true);assert.equal(createdTabs.length,0);
 });
 test('joint start restores previous outreach and coordinator if scheduling fails after commit',async t=>{
   reset();await message('IMPORT',{text:'https://a.en.alibaba.com/'});
@@ -1174,9 +1236,10 @@ test('worker reconstruction respects both saved running flags and browser restar
   runtime.onStartup.list[0]();await message('GET');
   assert.equal(extraStorage.openlinksWorkCoordinator.enabled,false);assert.equal(stored.running,false);
 });
-test('entering test mode disables joint coordination and pauses outreach without new operations',async()=>{
+test('retired preview callback cannot stop joint primary work',async()=>{
   reset();await jointQueue();extraStorage.openlinksClaudeFolder={test:{enabled:true}};
   await coordination.pauseOutreachForTest();
-  assert.equal(extraStorage.openlinksWorkCoordinator.enabled,false);assert.equal(stored.running,false);
-  await tick();assert.equal(createdTabs.length,0);assert.equal(clicks,0);assert.equal(stored.slots.length,0);
+  assert.equal(extraStorage.openlinksWorkCoordinator.enabled,true);assert.equal(stored.running,true);
+  await tick();assert.equal(createdTabs.length,1);assert.equal(createdTabs[0].active,false);
+  assert.equal(clicks,0);assert.equal(stored.slots.filter(slot=>slot.kind==='visit').length,1);
 });

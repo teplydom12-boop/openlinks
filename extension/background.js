@@ -9,6 +9,7 @@ import {localTimestamp} from './lib/time.js';
 import {installDialogMonitor,isMonitoredTab} from './dialog-monitor.js';
 import {withTabOwnership} from './lib/tab-ownership.js';
 import {WORK_COORDINATOR_KEY,normalizeWorkCoordinator,assessWorkCoordination} from './lib/work-coordinator.js';
+import {folderDigest} from './lib/folder-bridge.js';
 const {makeRule,mergeRule}=globalThis.OpenLinksRules;
 const routes1688=globalThis.OpenLinks1688;
 const supplierChat=globalThis.OpenLinksSupplierChat;
@@ -27,9 +28,9 @@ const exclusive = task => {
 async function load() { return migrateState((await chrome.storage.local.get(KEY))[KEY]); }
 async function save(state) { await chrome.storage.local.set({[KEY]:state}); }
 async function readWorkCoordination(state) {
-  const values=await chrome.storage.local.get([WORK_COORDINATOR_KEY,'openlinksDialogs','openlinksClaudeFolder',...(state?[]:[KEY])]);
+  const values=await chrome.storage.local.get([WORK_COORDINATOR_KEY,'openlinksDialogs',...(state?[]:[KEY])]);
   const mode=normalizeWorkCoordinator(values[WORK_COORDINATOR_KEY]);
-  return assessWorkCoordination(state || migrateState(values[KEY]),{enabled:mode.enabled,dialogsRunning:values.openlinksDialogs?.running===true,testMode:values.openlinksClaudeFolder?.test?.enabled===true},Date.now());
+  return assessWorkCoordination(state || migrateState(values[KEY]),{enabled:mode.enabled,dialogsRunning:values.openlinksDialogs?.running===true},Date.now());
 }
 // UI status is a read-only snapshot and may be requested while the monitor
 // owns a tab lock. Waiting for the outreach queue here could deadlock against
@@ -64,7 +65,6 @@ export async function withDialogTurn(task) {
 }
 export function startOutreachForJoint(sender={}) {
   return exclusive(async()=>{
-    if(await dialogTestEnabled())throw new Error(TEST_MODE_MESSAGE);
     if(dialogTurn)throw new Error('Дождитесь завершения текущего действия переписки и повторите совместный запуск.');
     const state=await load(),job=state.queue.find(item=>item.id===state.activeId);
     if(!state.settings.message.trim())throw new Error('Сначала сохраните текст первого сообщения поставщикам.');
@@ -72,9 +72,6 @@ export function startOutreachForJoint(sender={}) {
     const previousState=structuredClone(state);
     const previousMode=normalizeWorkCoordinator((await chrome.storage.local.get(WORK_COORDINATOR_KEY))[WORK_COORDINATOR_KEY]);
     await bindQueueWindow(state,sender,job);
-    // Check again after asynchronous window validation; test mode can be set by
-    // the separate monitor queue while this operation is waiting for Chrome.
-    if(await dialogTestEnabled())throw new Error(TEST_MODE_MESSAGE);
     state.running=true;
     event(state,'joint_started',null,'Совместный режим: сначала первичные обращения. Переписка получает очередь, когда исчерпаны лимиты всех оставшихся площадок или первичная очередь завершена. Общие лимиты отправки сохраняются.','decision');
     try {
@@ -97,22 +94,13 @@ export function pauseOutreachForJoint() {
     return readWorkCoordination(state);
   });
 }
-const TEST_MODE_MESSAGE='Включён тестовый режим диалогов. Настоящая отправка и основная очередь приостановлены.';
+const TEST_MODE_MESSAGE='Сохранённый тестовый режим диалогов запрещает отправку ответа. Первичная очередь работает отдельно.';
 async function dialogTestEnabled() {
   return (await chrome.storage.local.get('openlinksClaudeFolder')).openlinksClaudeFolder?.test?.enabled===true;
 }
-async function pauseForDialogTest(state) {
-  await disableJoint(state,'Совместная работа выключена: включён тестовый режим без отправки.');
-  const job=state.queue.find(item=>item.id===state.activeId);
-  const changed=state.running || state.waiting || state.learning || job?.approved;
-  await stopLearning(state,job);
-  state.running=false;state.waiting=null;
-  if(job)job.approved=false;
-  if(changed){event(state,'test_mode_pause',job,TEST_MODE_MESSAGE,'decision');await save(state);}
-}
-export function pauseOutreachForTest() {
-  return exclusive(async()=>{await pauseForDialogTest(await load());return {ok:true};});
-}
+// Compatibility for an old monitor callback. Preview lifecycle is local to the
+// dialogue module and must never pause or revoke approval of primary outreach.
+export async function pauseOutreachForTest() {return {ok:true,retired:true};}
 // Both outreach and dialogue replies reserve the same rolling quota inside
 // the outreach serializer. A replayed reservation never authorizes another click.
 export function reserveDialogSendQuota({platform,jobId,attemptId}={}) {
@@ -189,10 +177,6 @@ async function call(job, frameId, type, extra = {}, documentId) {
   // safe on a reserved inbox. All queue commands that change it are blocked.
   if(!['PROBE','CHAT_READY','STOP_OPEN_CHAT','PICK_STOP','CAN_CLOSE'].includes(type) &&
     !(type==='NATIVE_INPUT' && extra.stage==='release')) {
-    if(await dialogTestEnabled()) {
-      if(type==='SEND')return {clicked:false,reason:TEST_MODE_MESSAGE};
-      throw new Error(TEST_MODE_MESSAGE);
-    }
     await assertOutreachTab(job.tabId);
   }
   return chrome.tabs.sendMessage(job.tabId, {
@@ -224,11 +208,9 @@ async function useCapturedContact(state,job,replies) {
   const expected=job.platform==='1688'?routes1688.cached(state.chatRoutes,job.url):null;
   if(!target||expected&&routes1688.route(expected)!==routes1688.route(target))return {ok:false,reason:popupReason('unproven_recipient')};
   await assertOutreachTab(job.tabId);
-  if(await dialogTestEnabled())return {ok:false,reason:TEST_MODE_MESSAGE};
   await stopOpening(job);
   const top=(await frames(job)).find(frame=>frame.frameId===0);
   if(!top?.documentId||!job.contactCaptures?.some(frame=>frame.tabId===job.tabId&&frame.frameId===0&&frame.documentId===top.documentId))return {ok:false,reason:popupReason('document_changed')};
-  if(await dialogTestEnabled())return {ok:false,reason:TEST_MODE_MESSAGE};
   // Do not copy this URL into capture metadata/logs: it may contain session
   // bootstrap. Existing job navigation/send state separately tracks page URLs.
   await navigateBackgroundPage(job.tabId,target,chrome);
@@ -239,7 +221,6 @@ async function useCapturedContact(state,job,replies) {
 }
 async function performContact(state,job,frameId) {
   await assertOutreachTab(job.tabId);
-  if(await dialogTestEnabled())return {ok:false,reason:TEST_MODE_MESSAGE};
   const current=await frames(job),frame=current.find(item=>item.frameId===frameId),top=current.find(item=>item.frameId===0);
   if(!frame?.documentId||!top?.documentId)return {ok:false,reason:popupReason('document_unknown')};
   const guarded=[top,...(frameId===0?[]:[frame])];
@@ -549,7 +530,6 @@ async function performSend(state, job) {
     await save(state); return;
   }
   // Persist BEFORE the side effect. Never retry a send after a disconnect/restart.
-  if(await dialogTestEnabled()){await pauseForDialogTest(state);return;}
   job.status = 'sending';
   job.attemptId = crypto.randomUUID();
   job.sendAt = Date.now();
@@ -574,7 +554,6 @@ async function performSend(state, job) {
 }
 async function tick() {
   const state = await load();
-  if(await dialogTestEnabled()){await pauseForDialogTest(state);return;}
   if(dialogTurn){if(state.running)await alarm(Date.now()+1000);return;}
   const coordination=await readWorkCoordination(state);
   if(coordination.enabled&&coordination.phase==='needs_attention'){if(state.running)await alarm();return;}
@@ -669,7 +648,6 @@ async function tick() {
   if (['blocked','uncertain'].includes(job.status)) { state.running=false; await save(state); return; }
   if(job.resumeBackgroundPage) {
     await assertOutreachTab(job.tabId);
-    if(await dialogTestEnabled())throw new Error(TEST_MODE_MESSAGE);
     // Pause may stop the very first navigation before it commits, leaving our
     // tab at about:blank. Resume this same reservation/tab; bootstrap tokens
     // from a captured MIC URL must never be persisted to recover navigation.
@@ -905,7 +883,6 @@ async function dispatch(message, sender) {
     return {ok:true};
   }
   if (!sender.url?.startsWith(chrome.runtime.getURL(''))) throw new Error('Команда доступна только из окна расширения');
-  if(['START','APPROVE','RECHECK','RETRY_SEND','TEACH'].includes(message.type) && await dialogTestEnabled())throw new Error(TEST_MODE_MESSAGE);
   const state = await load();
   const job = state.queue.find(j => j.id === state.activeId);
   switch (message.type) {
@@ -1028,6 +1005,33 @@ async function dispatch(message, sender) {
     default: throw new Error('Неизвестная команда');
   }
 }
+// Read-only and outside the outreach serializer: SEND is waiting for this
+// answer. A legacy preview flag is never permission to stop another module;
+// a permission is tied to an already approved and reserved real operation.
+async function sendPermission(message,sender) {
+  const values=await chrome.storage.local.get([KEY,'openlinksDialogs','openlinksClaudeFolder']);
+  const state=migrateState(values[KEY]),platform=classify(sender.url).platform;
+  if(typeof message.expectedUrl!=='string'||message.expectedUrl!==sender.url)return false;
+  if(message.scope==='outreach') {
+    const job=state.queue.find(item=>item.id===state.activeId);
+    if(!state.running||state.learning||!job||job.status!=='sending'||job.approved!==true||
+      job.id!==message.jobId||job.attemptId!==message.attemptId||!job.attemptId||
+      job.tabId!==sender.tab.id||job.frameId!==sender.frameId||job.platform!==platform||
+      job.reviewUrl!==message.expectedUrl||job.message!==message.message)return false;
+    if(!state.slots.some(slot=>slot.kind==='send'&&slot.jobId===job.id&&slot.platform===platform&&slot.at===job.sendAt))return false;
+    return !await isMonitoredTab(job.tabId);
+  }
+  if(message.scope==='dialog') {
+    const folder=values.openlinksClaudeFolder,dialogs=values.openlinksDialogs;
+    if(folder?.test?.enabled===true||dialogs?.running!==true||dialogs.settings?.wechatAudit===true||
+      dialogs.bindings?.[platform]?.tabId!==sender.tab.id||message.jobId!==message.attemptId||
+      message.dialogOperation!==message.attemptId||typeof message.dialogId!=='string')return false;
+    const receipt=folder?.sendReceipts?.find(item=>item.id===message.attemptId&&item.status==='reserved'&&item.key===platform+':'+message.dialogId);
+    return !!receipt&&typeof message.message==='string'&&receipt.textHash===await folderDigest(message.message)&&
+      state.slots.some(slot=>slot.kind==='send'&&slot.platform===platform&&slot.dialogAttemptId===message.attemptId&&slot.jobId==='dialog:'+receipt.jobId);
+  }
+  return false;
+}
 chrome.runtime.onMessage.addListener((message,sender,respond) => {
   if(message?.type==='OPENLINKS_TEST_SEND_GUARD') {
     // Content scripts cannot read TRUSTED_CONTEXTS storage. Answer outside the
@@ -1035,7 +1039,7 @@ chrome.runtime.onMessage.addListener((message,sender,respond) => {
     let valid=false;
     try {valid=sender.id===chrome.runtime.id && Number.isInteger(sender.tab?.id) && !!classify(sender.url).platform;}catch{}
     if(!valid){respond({ok:false,canSend:false});return;}
-    dialogTestEnabled().then(enabled=>respond({ok:true,canSend:!enabled}),()=>respond({ok:false,canSend:false}));
+    sendPermission(message,sender).then(canSend=>respond({ok:true,canSend}),()=>respond({ok:false,canSend:false}));
     return true;
   }
   if(typeof message?.type==='string' && message.type.startsWith('DIALOGS_'))return;

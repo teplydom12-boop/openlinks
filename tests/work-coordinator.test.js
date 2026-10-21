@@ -19,9 +19,9 @@ test('coordination is explicit opt-in and preserves independent blocks',()=>{
   const result=assessWorkCoordination(queue('alibaba'),{},now);
   assert.equal(result.enabled,false);assert.equal(result.phase,'independent');assert.equal(result.allowDialogs,true);
 });
-test('test status blocks joint startup without blocking independent test cycles',()=>{
+test('dormant dialogue test status never blocks independent primary work',()=>{
   const result=assessWorkCoordination(queue('alibaba'),{testMode:true},now);
-  assert.equal(result.enabled,false);assert.equal(result.testMode,true);assert.equal(result.phase,'test_paused');assert.equal(result.allowDialogs,true);
+  assert.equal(result.enabled,false);assert.equal(result.testMode,false);assert.equal(result.phase,'independent');assert.equal(result.allowDialogs,true);
 });
 test('all remaining platforms must exhaust hard quota before inbox gets its turn',()=>{
   const state=queue('alibaba','alibaba','1688');exhaust(state,'alibaba');
@@ -84,13 +84,13 @@ test('completed queue leaves inbox working, including after its running flag is 
   assert.equal(assessWorkCoordination(state,joint,now).phase,'dialogs_queue_complete');
   assert.equal(assessWorkCoordination(state,joint,now).allowDialogs,true);
 });
-test('test mode always stops a persisted joint run and deferred sends use send quota only',()=>{
+test('legacy test flag does not alter joint coordination and deferred sends use send quota only',()=>{
   const state=queue('alibaba');exhaust(state,'alibaba','visit');state.queue[0].status='deferred_send';
   assert.equal(assessWorkCoordination(state,joint,now).phase,'outreach');
   exhaust(state,'alibaba');
   assert.equal(assessWorkCoordination(state,joint,now).phase,'dialogs_quota_wait');
-  assert.equal(assessWorkCoordination(state,{...joint,testMode:true},now).phase,'test_paused');
-  assert.equal(assessWorkCoordination(state,{...joint,testMode:true},now).allowDialogs,false);
+  assert.equal(assessWorkCoordination(state,{...joint,testMode:true},now).phase,'dialogs_quota_wait');
+  assert.equal(assessWorkCoordination(state,{...joint,testMode:true},now).allowDialogs,true);
 });
 test('unclaimed unfinished row and unsupported platform fail closed',()=>{
   const state=queue('alibaba');state.queue[0].status='contacting';

@@ -8,11 +8,10 @@ export function normalizeWorkCoordinator(value) {
 // A scheduled visit or the interval between neighbouring shops is not a quota
 // wait. Only exhausted rolling quotas on every remaining platform give the
 // inbox a turn; a ready Made-in-China row therefore keeps outreach priority.
-export function assessWorkCoordination(state,{enabled=false,testMode=false,dialogsRunning=false}={},now=Date.now()) {
+export function assessWorkCoordination(state,{enabled=false,dialogsRunning=false}={},now=Date.now()) {
   const remaining=state.queue.filter(job=>!FINAL.has(job.status));
-  const result={enabled:enabled===true,testMode:testMode===true,phase:testMode?'test_paused':'independent',allowDialogs:true,detail:testMode?'Тестовый режим без отправки. Совместный запуск недоступен; отдельные тестовые циклы диалогов работают.':'Блоки работают раздельно.',nextAt:null,pending:remaining.length,quotaPlatforms:[]};
+  const result={enabled:enabled===true,testMode:false,phase:'independent',allowDialogs:true,detail:'Блоки работают раздельно.',nextAt:null,pending:remaining.length,quotaPlatforms:[]};
   if(!enabled)return result;
-  if(testMode)return {...result,phase:'test_paused',allowDialogs:false,detail:'Тестовый режим: совместная работа остановлена, настоящая отправка запрещена.'};
   if(!dialogsRunning)return {...result,phase:'needs_attention',allowDialogs:false,detail:'Переписка приостановлена. Для совместной работы запустите оба блока снова.'};
   const active=state.queue.find(job=>job.id===state.activeId&&!FINAL.has(job.status));
   if(!remaining.length&&!active)return {...result,phase:'dialogs_queue_complete',detail:'Первичная очередь завершена. Продолжается переписка с поставщиками.'};
